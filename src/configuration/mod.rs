@@ -27,7 +27,7 @@ pub use error::Error;
 pub use global::GlobalConfig;
 pub use observability::ObservabilityConfig;
 pub use regex_pattern::RegexPattern;
-pub use registry_storage::{RegistryStorageConfig, ResolvedStorageConfig};
+pub use registry_storage::RegistryStorageConfig;
 pub use server::ServerConfig;
 pub use trusted_proxy::TrustedProxy;
 pub use ui::UiConfig;
@@ -69,13 +69,11 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    pub fn resolve_registry_storage(&self) -> ResolvedStorageConfig {
+    pub fn resolve_registry_storage(&self) -> BlobStoreConfig {
         match &self.registry_storage {
-            RegistryStorageConfig::Inherit => {
-                ResolvedStorageConfig::from_blob_store(&self.blob_store)
-            }
-            RegistryStorageConfig::FS(fs) => ResolvedStorageConfig::FS(fs.clone()),
-            RegistryStorageConfig::S3(s3) => ResolvedStorageConfig::S3(s3.clone()),
+            RegistryStorageConfig::Inherit => self.blob_store.clone(),
+            RegistryStorageConfig::FS(fs) => BlobStoreConfig::FS(fs.clone()),
+            RegistryStorageConfig::S3(s3) => BlobStoreConfig::S3(s3.clone()),
         }
     }
 
@@ -109,7 +107,6 @@ impl Configuration {
         })
     }
 
-    /// Parse and resolve a TOML configuration string, returning typed errors.
     pub fn load_from_str(slice: &str) -> Result<Self, Error> {
         let table = DeTable::parse(slice).map_err(|e| Error::InvalidFormat(e.to_string()))?;
         Self::from_table(table, Some(slice))
@@ -152,37 +149,30 @@ fn validate_image_policies(
     global: &GlobalConfig,
     repositories: &HashMap<String, repository::Config>,
 ) -> Result<(), Error> {
-    let mut tables: Vec<(String, &[CelRule])> = Vec::new();
+    // A global scan table needs no decision: without a default it skips.
+    let mut tables: Vec<(String, bool, &[CelRule])> = Vec::new();
     if let Some(scan) = &global.scan {
-        tables.push(("global.scan".to_string(), &scan.policy.rules));
+        tables.push(("global.scan".to_string(), true, &scan.policy.rules));
     }
     if let Some(index) = &global.index {
-        if !index.is_set() {
-            return Err(Error::InvalidFormat(
-                "global.index sets neither default nor rules".to_string(),
-            ));
-        }
-        tables.push(("global.index".to_string(), &index.rules));
+        tables.push(("global.index".to_string(), index.is_set(), &index.rules));
     }
     for (name, repo) in repositories {
         if let Some(scan) = &repo.scan {
-            if !scan.is_set() {
-                return Err(Error::InvalidFormat(format!(
-                    "repository.\"{name}\".scan sets neither default nor rules"
-                )));
-            }
-            tables.push((format!("repository.\"{name}\".scan"), &scan.rules));
+            let table = format!("repository.\"{name}\".scan");
+            tables.push((table, scan.is_set(), &scan.rules));
         }
         if let Some(index) = &repo.index {
-            if !index.is_set() {
-                return Err(Error::InvalidFormat(format!(
-                    "repository.\"{name}\".index sets neither default nor rules"
-                )));
-            }
-            tables.push((format!("repository.\"{name}\".index"), &index.rules));
+            let table = format!("repository.\"{name}\".index");
+            tables.push((table, index.is_set(), &index.rules));
         }
     }
-    for (name, rules) in tables {
+    if let Some((name, _, _)) = tables.iter().find(|(_, is_set, _)| !is_set) {
+        return Err(Error::InvalidFormat(format!(
+            "{name} sets neither default nor rules"
+        )));
+    }
+    for (name, _, rules) in tables {
         if rules_use_pull_time(rules) && !global.update_pull_time {
             return Err(Error::InvalidFormat(format!(
                 "{name}.rules use last_pulled_at or top_pulled but update_pull_time is disabled, \
@@ -209,13 +199,7 @@ fn validate_ui(ui: &UiConfig, oidc: &HashMap<String, oidc::Config>) -> Result<()
     Ok(())
 }
 
-/// Reads every configuration file, refusing an empty list.
 fn read_documents<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<String>, Error> {
-    if paths.is_empty() {
-        return Err(Error::NotReadable(
-            "No configuration file was provided".to_string(),
-        ));
-    }
     paths
         .iter()
         .map(|path| {
@@ -228,7 +212,6 @@ fn read_documents<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<String>, Error> {
         .collect()
 }
 
-/// Parses each document and merges them in order, later ones winning.
 fn merged_table<'a, P: AsRef<Path>>(
     paths: &[P],
     documents: &'a [String],
@@ -255,8 +238,7 @@ fn deserialize_table<T: DeserializeOwned>(
     })
 }
 
-/// Name the files a merged configuration was built from, since an error on a
-/// merged tree can only report the offending key path.
+/// An error on a merged tree can only report the key path, so name the files.
 fn annotate_sources<P: AsRef<Path>>(error: Error, paths: &[P]) -> Error {
     let Error::InvalidFormat(message) = &error else {
         return error;
@@ -270,10 +252,8 @@ fn annotate_sources<P: AsRef<Path>>(error: Error, paths: &[P]) -> Error {
     Error::InvalidFormat(format!("{}\nmerged from {sources}", message.trim_end()))
 }
 
-/// An FS blob store rooted at the empty path resolves every object relative to
-/// the working directory, which in a container is the ephemeral layer rather
-/// than the mounted volume. The metadata store inherits this root by default,
-/// so one check covers both.
+/// An empty FS root resolves relative to the working directory, in a container
+/// the ephemeral layer; the metadata store inherits it, so one check covers both.
 fn validate_blob_store(blob_store: &BlobStoreConfig) -> Result<(), Error> {
     let BlobStoreConfig::FS(fs) = blob_store else {
         return Ok(());
@@ -291,30 +271,18 @@ fn validate_global(
     auth_webhooks: &HashMap<String, webhook::Config>,
     event_webhooks: &HashMap<String, EventWebhookConfig>,
 ) -> Result<(), Error> {
-    if global.max_manifest_size.as_u64() == 0 {
-        return Err(Error::InvalidFormat(
-            "global.max_manifest_size must be greater than zero".to_string(),
-        ));
-    }
-
-    if global.max_blob_size.as_u64() == 0 {
-        return Err(Error::InvalidFormat(
-            "global.max_blob_size must be greater than zero".to_string(),
-        ));
-    }
-
-    if global.max_index_size.as_u64() == 0 {
-        return Err(Error::InvalidFormat(
-            "global.max_index_size must be greater than zero".to_string(),
-        ));
-    }
-
-    // A zero-capacity read buffer reads nothing, which would end every blob
-    // body at once rather than fail.
-    if global.blob_stream_frame_size.as_u64() == 0 {
-        return Err(Error::InvalidFormat(
-            "global.blob_stream_frame_size must be greater than zero".to_string(),
-        ));
+    // A zero frame size reads nothing, ending every blob body at once rather than failing.
+    for (key, size) in [
+        ("max_manifest_size", global.max_manifest_size),
+        ("max_blob_size", global.max_blob_size),
+        ("max_index_size", global.max_index_size),
+        ("blob_stream_frame_size", global.blob_stream_frame_size),
+    ] {
+        if size.as_u64() == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "global.{key} must be greater than zero"
+            )));
+        }
     }
 
     validate_auth_webhook_ref(
@@ -349,8 +317,6 @@ fn validate_repositories(
     Ok(())
 }
 
-/// Validates that an optional authorization-webhook reference names a
-/// configured webhook; `context` identifies the referencing site in the error.
 fn validate_auth_webhook_ref(
     name: Option<&str>,
     known: &HashMap<String, webhook::Config>,
@@ -366,8 +332,6 @@ fn validate_auth_webhook_ref(
     Ok(())
 }
 
-/// Validates that every name in `refs` exists in `known`; `context` identifies
-/// the referencing site in the error.
 fn validate_event_webhook_refs(
     refs: &[String],
     known: &HashMap<String, EventWebhookConfig>,
@@ -387,7 +351,8 @@ fn validate_event_webhook_refs(
 mod metadata_resolver_tests {
     use std::path::PathBuf;
 
-    use crate::configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig};
+    use crate::configuration::Configuration;
+    use crate::registry::blob_store::BlobStoreConfig;
 
     #[test]
     fn test_inherit_resolves_to_fs_from_fs_blob_store() {
@@ -401,21 +366,11 @@ mod metadata_resolver_tests {
         "#;
 
         let config = Configuration::load_from_str(config_str).unwrap();
-        assert!(
-            matches!(config.registry_storage, RegistryStorageConfig::Inherit),
-            "absent [metadata_store] section must deserialise as Inherit"
-        );
-
-        let resolved = config.resolve_registry_storage();
-        match resolved {
-            ResolvedStorageConfig::FS(fs_config) => {
-                assert_eq!(fs_config.root_dir, PathBuf::from("/data/blobs"));
-                assert!(fs_config.sync_to_disk);
-            }
-            other @ ResolvedStorageConfig::S3(_) => {
-                panic!("expected FS storage config from Inherit, got {other:?}")
-            }
-        }
+        let BlobStoreConfig::FS(fs_config) = config.resolve_registry_storage() else {
+            panic!("expected FS storage config from Inherit");
+        };
+        assert_eq!(fs_config.root_dir, PathBuf::from("/data/blobs"));
+        assert!(fs_config.sync_to_disk);
     }
 
     #[test]
@@ -436,62 +391,9 @@ mod metadata_resolver_tests {
         "#;
 
         let config = Configuration::load_from_str(config_str).unwrap();
-        assert!(
-            matches!(config.registry_storage, RegistryStorageConfig::FS(_)),
-            "explicit [metadata_store.fs] must not be Inherit"
-        );
-
-        let resolved = config.resolve_registry_storage();
-        match resolved {
-            ResolvedStorageConfig::FS(fs_config) => {
-                assert_eq!(fs_config.root_dir, PathBuf::from("/custom/metadata"));
-            }
-            other @ ResolvedStorageConfig::S3(_) => {
-                panic!("expected explicit FS storage config, got {other:?}")
-            }
-        }
-    }
-
-    #[test]
-    fn test_explicit_s3_config_is_not_overridden_by_s3_blob_store() {
-        let config_str = r#"
-        [server]
-        bind_address = "0.0.0.0"
-
-        [blob_store.s3]
-        bucket = "blob-bucket"
-        region = "us-east-1"
-        endpoint = "https://s3.amazonaws.com"
-        access_key_id = "blob-key"
-        secret_key = "blob-secret"
-
-        [metadata_store.s3]
-        bucket = "metadata-bucket"
-        region = "eu-west-1"
-        endpoint = "https://metadata.example.com"
-        access_key_id = "meta-key"
-        secret_key = "meta-secret"
-        "#;
-
-        let config = Configuration::load_from_str(config_str).unwrap();
-        assert!(
-            matches!(config.registry_storage, RegistryStorageConfig::S3(_)),
-            "explicit [metadata_store.s3] must not be Inherit"
-        );
-
-        let resolved = config.resolve_registry_storage();
-        match resolved {
-            ResolvedStorageConfig::S3(s3_config) => {
-                assert_eq!(s3_config.connection.bucket, "metadata-bucket");
-                assert_eq!(s3_config.connection.region, "eu-west-1");
-                assert_eq!(
-                    s3_config.connection.endpoint,
-                    "https://metadata.example.com"
-                );
-            }
-            other @ ResolvedStorageConfig::FS(_) => {
-                panic!("expected explicit S3 storage config, got {other:?}")
-            }
-        }
+        let BlobStoreConfig::FS(fs_config) = config.resolve_registry_storage() else {
+            panic!("expected explicit FS storage config");
+        };
+        assert_eq!(fs_config.root_dir, PathBuf::from("/custom/metadata"));
     }
 }

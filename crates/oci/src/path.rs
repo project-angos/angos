@@ -1,8 +1,5 @@
-//! The path grammar of the distribution API, spelled once. [`crate::client`]
-//! builds request URLs from these and [`crate::server`] takes them apart, so
-//! neither end can drift from the other.
+//! The path grammar of the distribution API, shared so neither end can drift.
 
-/// Prefix every endpoint of the API sits under.
 pub const API_PREFIX: &str = "/v2/";
 
 pub const MANIFESTS: &str = "/manifests/";

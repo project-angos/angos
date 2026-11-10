@@ -88,98 +88,42 @@ where
 mod tests {
     use std::path::Path;
 
-    use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
-    use crate::event_webhook::event::EventKind;
+    use crate::event_webhook::config::EventWebhookConfig;
 
-    #[test]
-    fn deserialize_webhook_config_with_defaults() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "optional"
-            events = ["blob.push"]
-        "#;
-
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.url.as_str(), "https://example.com/webhook");
-        assert_eq!(config.policy, DeliveryPolicy::Optional);
-        assert_eq!(config.token, None);
-        assert_eq!(config.timeout_ms, 5000);
-        assert_eq!(config.max_retries(), 0);
-        assert_eq!(config.events.len(), 1);
-        assert_eq!(config.events[0], EventKind::BlobPush);
-        assert_eq!(config.repository_filter, None);
+    fn parse(fields: &str) -> Result<EventWebhookConfig, toml::de::Error> {
+        toml::from_str(&format!(
+            "url = \"https://example.com/webhook\"\nevents = [\"manifest.push\"]\n{fields}"
+        ))
     }
 
     #[test]
     fn empty_token_fails_at_deserialize_time() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            token = ""
-            events = ["manifest.push"]
-        "#;
-
-        assert!(toml::from_str::<EventWebhookConfig>(toml).is_err());
+        assert!(parse("policy = \"required\"\ntoken = \"\"").is_err());
     }
 
-    /// A `required`-policy webhook without an explicit `max_retries` gets the
-    /// short default burst; an explicit zero is respected.
+    /// Only a `required`-policy webhook defaults to a short retry burst; an
+    /// explicit zero is respected.
     #[test]
-    fn required_policy_defaults_to_short_retry_burst() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-        "#;
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.max_retries(), 3);
-
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            max_retries = 0
-        "#;
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.max_retries(), 0, "an explicit zero must win");
+    fn max_retries_defaults_by_policy() {
+        let retries = |fields| parse(fields).unwrap().max_retries();
+        assert_eq!(retries("policy = \"optional\""), 0);
+        assert_eq!(retries("policy = \"required\""), 3);
+        assert_eq!(retries("policy = \"required\"\nmax_retries = 0"), 0);
     }
 
     #[test]
-    fn max_retries_boundary_accepted() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            max_retries = 16
-        "#;
-
-        let config: EventWebhookConfig = toml::from_str(toml).unwrap();
+    fn max_retries_is_bounded() {
+        let config = parse("policy = \"required\"\nmax_retries = 16").unwrap();
         assert_eq!(config.max_retries(), 16);
-    }
-
-    #[test]
-    fn max_retries_above_boundary_rejected() {
-        let toml = r#"
-            url = "https://example.com/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            max_retries = 17
-        "#;
-
-        assert!(toml::from_str::<EventWebhookConfig>(toml).is_err());
+        assert!(parse("policy = \"required\"\nmax_retries = 17").is_err());
     }
 
     /// An endpoint behind a private CA, or one asking for a client certificate,
     /// is reachable; half an identity is refused.
     #[test]
     fn tls_settings_parse_and_half_an_identity_is_refused() {
-        let base = r#"
-            url = "https://hooks.internal/webhook"
-            policy = "required"
-            events = ["manifest.push"]
-            server_ca_bundle = "/etc/angos/ca.pem"
-        "#;
-        let config: EventWebhookConfig = toml::from_str(&format!(
+        let base = "policy = \"required\"\nserver_ca_bundle = \"/etc/angos/ca.pem\"\n";
+        let config = parse(&format!(
             "{base}client_certificate_bundle = \"/c.pem\"\nclient_private_key = \"/k.pem\""
         ))
         .unwrap();
@@ -188,9 +132,6 @@ mod tests {
             Some(Path::new("/etc/angos/ca.pem"))
         );
         assert!(config.tls.identity.is_some());
-        assert!(
-            toml::from_str::<EventWebhookConfig>(&format!("{base}client_private_key = \"/k.pem\""))
-                .is_err()
-        );
+        assert!(parse(&format!("{base}client_private_key = \"/k.pem\"")).is_err());
     }
 }

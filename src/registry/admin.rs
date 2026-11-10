@@ -26,6 +26,7 @@ use angos_oci::{
     UploadSessionId, namespace_belongs_to,
 };
 use angos_oci_service::NoContent;
+use angos_storage::Page;
 
 use crate::configuration::RegexPattern;
 use crate::configuration::global::NamespaceCounts;
@@ -62,16 +63,6 @@ struct DockerReferrerCandidate {
     info: ReferrerInfo,
 }
 
-/// The Docker-style referrer `descriptor` carries, or `None` when it has no
-/// reference digest annotation or the annotation does not parse as a digest.
-fn extract_docker_referrer(descriptor: &Descriptor) -> Option<DockerReferrerCandidate> {
-    Some(DockerReferrerCandidate {
-        subject: descriptor.docker_reference_subject()?,
-        child_digest: descriptor.digest.clone(),
-        info: descriptor.into(),
-    })
-}
-
 /// What the revisions listing gathers over the whole namespace, in three
 /// walks and one cached analysis per revision, to place every revision
 /// before it reads anything for the entries it serves.
@@ -84,13 +75,6 @@ struct ListingInputs {
     analyses: HashMap<Digest, Arc<ManifestAnalysis>>,
 }
 
-/// One subject's referrers as the listing serves them: the descriptors of
-/// one page, and the cursor to the rest.
-struct SubjectReferrers {
-    descriptors: Vec<Descriptor>,
-    next: Option<String>,
-}
-
 /// The children an index body lists, none for any other manifest. A digest
 /// fixes its body, so an analysis never goes stale.
 pub struct ManifestAnalysis {
@@ -100,16 +84,19 @@ pub struct ManifestAnalysis {
 }
 
 /// Partitions an index's child descriptors into parent-links and Docker-style
-/// referrer candidates.
+/// referrer candidates, the children whose reference digest annotation parses.
 fn analyze_manifest(manifest: &Manifest) -> ManifestAnalysis {
     let mut parent_links = Vec::new();
     let mut referrer_candidates = Vec::new();
     if let Content::Index { manifests } = &manifest.content {
         for child in manifests {
-            if let Some(referrer) = extract_docker_referrer(child) {
-                referrer_candidates.push(referrer);
-            } else {
-                parent_links.push((child.digest.clone(), child.platform.clone()));
+            match child.docker_reference_subject() {
+                Some(subject) => referrer_candidates.push(DockerReferrerCandidate {
+                    subject,
+                    child_digest: child.digest.clone(),
+                    info: child.into(),
+                }),
+                None => parent_links.push((child.digest.clone(), child.platform.clone())),
             }
         }
     }
@@ -306,11 +293,8 @@ impl Registry {
                 .iter()
                 .filter(|ns| namespace_belongs_to(ns, name) && visibility(ns))
                 .count();
-            // Content the caller may see is the whole criterion, so a repository
-            // that does not exist, holds nothing, or holds nothing visible are
-            // one answer. Testing the repository's name instead would read a
-            // policy written about its namespaces against a name that is none of
-            // them, and hide a repository whose content the caller can read.
+            // Visible content is the whole criterion: testing the repository's
+            // own name would read a namespace policy against a name that is none.
             if namespace_count == 0 {
                 continue;
             }
@@ -352,17 +336,15 @@ impl Registry {
         if !namespace_belongs_to(scope.as_ref(), repository) {
             return Err(Error::NameUnknown);
         }
-        let namespace_names = self
-            .list_repository_namespaces(repository, scope.as_ref())
-            .await?;
+        if !self.resolver.contains_key(repository) {
+            return Err(Error::NameUnknown);
+        }
+        let namespace_names = self.collect_namespaces(Some(scope.as_ref())).await?;
 
-        // A directory whose name is not a valid namespace is a storage artifact
-        // scrub removes; dropping it keeps one bad name from failing the listing.
-        // Filtering here rather than after the counts keeps a namespace the
-        // caller may not see from costing three reads.
+        // Filtering before the counts keeps a namespace the caller may not see
+        // from costing three reads.
         let mut visible: Vec<Namespace> = namespace_names
             .into_iter()
-            .filter_map(|name| Namespace::new(&name).ok())
             .filter(|name| visibility(name))
             .collect();
 
@@ -500,7 +482,7 @@ impl Registry {
             })
             .collect();
 
-        let history = self.metadata_store.pull_history;
+        let history = self.metadata_store.settings.pull_history;
         Ok(PullsBody {
             target: reference.to_string(),
             max_pulls: history.max_pulls.get(),
@@ -813,11 +795,17 @@ impl Registry {
         }
 
         let enriched: Vec<(Digest, ReferrerInfo)> = stream::iter(candidates)
-            .map(|candidate| async move {
-                let info = self
-                    .enrich_referrer_with_predicate(candidate.info, &candidate.child_digest)
-                    .await;
-                (candidate.subject, info)
+            .map(|mut candidate| async move {
+                if let Ok(Some(child)) =
+                    read_manifest(&self.blob_store, &candidate.child_digest).await
+                    && let Some(predicate) = child.in_toto_predicate_type()
+                {
+                    candidate
+                        .info
+                        .annotations
+                        .insert(IN_TOTO_PREDICATE_TYPE.to_string(), predicate.to_string());
+                }
+                (candidate.subject, candidate.info)
             })
             .buffered(self.config.listing_read_concurrency.get())
             .collect()
@@ -827,22 +815,6 @@ impl Registry {
             docker_referrers.entry(subject).or_default().push(info);
         }
         (child_to_parents, docker_referrers)
-    }
-
-    /// Enriches `info` with the child manifest's in-toto predicate type
-    /// annotation, when it carries one.
-    async fn enrich_referrer_with_predicate(
-        &self,
-        mut info: ReferrerInfo,
-        child_digest: &Digest,
-    ) -> ReferrerInfo {
-        if let Ok(Some(child_manifest)) = read_manifest(&self.blob_store, child_digest).await
-            && let Some(predicate) = child_manifest.in_toto_predicate_type()
-        {
-            info.annotations
-                .insert(IN_TOTO_PREDICATE_TYPE.to_string(), predicate.to_string());
-        }
-        info
     }
 
     /// The entries at `served` in `inputs.revisions`, with the reads they alone
@@ -905,14 +877,14 @@ impl Registry {
                 let mut referrers_next = None;
                 if let Some(listed) = subject_referrers.remove(&digest) {
                     let listed_infos: Vec<ReferrerInfo> =
-                        listed.descriptors.iter().map(ReferrerInfo::from).collect();
+                        listed.items.iter().map(ReferrerInfo::from).collect();
                     referrers.retain(|candidate| {
                         !listed_infos
                             .iter()
                             .any(|info| info.digest == candidate.digest)
                     });
                     referrers.extend(listed_infos);
-                    referrers_next = listed.next;
+                    referrers_next = listed.next_token;
                 }
                 let entry = ManifestEntry {
                     digest: digest.to_string(),
@@ -951,18 +923,10 @@ impl Registry {
                         .ok()
                         .flatten()
                 };
-                // A pull naming a tag stamps that tag alone, never the
-                // revision it resolves to, so a manifest only ever fetched
-                // by tag has no revision atime at all. Folding its tags in
-                // is what makes the reported time the manifest's last pull
-                // rather than its last pull by digest.
-                //
-                // A tag that later moves to another manifest carries its
-                // pull history to the new target, which then reports a pull
-                // that happened against the old one. Acceptable for an
-                // advisory timestamp, and the alternative is stamping the
-                // revision on every tag pull, doubling writes on the
-                // hottest path.
+                // A tag pull stamps the tag alone, never its revision, so the
+                // tags are folded in. A moved tag carries its history to the
+                // new target: acceptable for an advisory timestamp, and cheaper
+                // than stamping the revision on every tag pull.
                 entry.last_pulled_at = entry
                     .tags
                     .iter()
@@ -987,10 +951,9 @@ impl Registry {
         subjects: Vec<Digest>,
         referrers_by_subject: &HashMap<Digest, Vec<Digest>>,
         tag_names: &HashSet<Tag>,
-    ) -> HashMap<Digest, SubjectReferrers> {
+    ) -> HashMap<Digest, Page<Descriptor>> {
         let upstream = self
             .repository_for_namespace(namespace)
-            .ok()
             .filter(|repository| repository.is_pull_through());
         stream::iter(subjects)
             .map(|subject| async move {
@@ -1003,7 +966,7 @@ impl Registry {
                 {
                     recorded.sort();
                     let subject = &subject;
-                    let descriptors: Vec<Descriptor> = stream::iter(recorded)
+                    let items: Vec<Descriptor> = stream::iter(recorded)
                         .map(|referrer| async move {
                             self.resolve_referrer_descriptor(namespace, subject, referrer, None)
                                 .await
@@ -1012,9 +975,9 @@ impl Registry {
                         .filter_map(|descriptor| async move { descriptor })
                         .collect()
                         .await;
-                    SubjectReferrers {
-                        descriptors,
-                        next: None,
+                    Page {
+                        items,
+                        next_token: None,
                     }
                 } else {
                     let listing = GetReferrersRequest {
@@ -1023,16 +986,12 @@ impl Registry {
                         artifact_type: None,
                         last: None,
                     };
-                    match self.list_referrers(upstream, &listing).await {
-                        Ok(page) => SubjectReferrers {
-                            descriptors: page.items,
-                            next: page.next_token,
-                        },
-                        Err(_) => SubjectReferrers {
-                            descriptors: Vec::new(),
-                            next: None,
-                        },
-                    }
+                    self.list_referrers(upstream, &listing)
+                        .await
+                        .unwrap_or(Page {
+                            items: Vec::new(),
+                            next_token: None,
+                        })
                 };
                 (subject, listed)
             })
@@ -1086,19 +1045,6 @@ impl Registry {
             }))
     }
 
-    /// The namespaces under `scope`, which lies in `repository`.
-    async fn list_repository_namespaces(
-        &self,
-        repository: &str,
-        scope: &str,
-    ) -> Result<Vec<Namespace>, Error> {
-        if !self.resolver.contains_key(repository) {
-            return Err(Error::NameUnknown);
-        }
-
-        self.collect_namespaces(Some(scope)).await
-    }
-
     /// Every namespace across both stores, sorted and deduplicated; `scope`
     /// restricts the listing to one repository's key range. The blob store's
     /// `_uploads` listing is merged to surface a namespace holding only
@@ -1143,29 +1089,29 @@ mod tests {
         SortOrder,
     };
     use angos_oci::{
-        DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE,
-        Platform, Reference, Tag, UploadSessionId,
+        Content, DOCKER_REFERENCE_DIGEST, Descriptor, Digest, Manifest, Namespace,
+        OCI_INDEX_MEDIA_TYPE, Platform, Reference, Tag, UploadSessionId,
     };
     use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
     use angos_storage::{Error as StorageError, ObjectStore};
 
     use crate::configuration::global::NamespaceCounts;
     use crate::registry::admin::{
-        ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest,
-        extract_docker_referrer, parent_refs_for, select_revisions,
+        ListPullsRequest, ListingInputs, ManifestAnalysis, analyze_manifest, parent_refs_for,
+        select_revisions,
     };
     use crate::registry::blob_store::BlobStore;
     use crate::registry::content_discovery::DEFAULT_PAGE_SIZE;
-    use crate::registry::keys::NamespaceExt;
+    use crate::registry::keys::{CAT_ROOT, NamespaceExt};
     use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
-    use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore};
+    use crate::registry::metadata_store::{LinkKind, MetadataStore};
     use crate::registry::repository::{Config as RepositoryConfig, Repository};
     use crate::registry::repository_resolver::RepositoryResolver;
     use crate::registry::test_utils::{
         FSRegistryTestCase, FsTestStack, RegistryTestCase, create_test_blob, create_test_registry,
         create_test_registry_recording_pulls, create_test_repositories, for_each_backend,
-        fs_test_stack, media_type, metadata_store_over, put_blob_direct, response_json, seed_links,
-        single_repo_resolver, test_job_store,
+        fs_test_stack, media_type, metadata_store_over, put_access_entry_at, put_blob_direct,
+        response_json, seed_links, single_repo_resolver, test_job_store,
     };
     use crate::registry::{Error as RegistryError, Registry, RegistryConfig};
     use crate::test_fixtures::client::test_client_config;
@@ -1200,33 +1146,18 @@ mod tests {
         overlapped: Arc<AtomicBool>,
     }
 
-    impl OverlapProbe {
-        /// The counter for the side `prefix` belongs to, if any. Tags and
-        /// revisions live under disjoint key prefixes.
-        fn side(&self, prefix: &str) -> Option<&Arc<AtomicUsize>> {
-            if prefix.contains("!tag") {
-                Some(&self.tags_in_flight)
-            } else if prefix.contains("!rev") || prefix.contains("_manifests/revisions") {
-                Some(&self.revisions_in_flight)
-            } else {
-                None
-            }
-        }
-    }
-
     #[async_trait]
     impl StoreHook for OverlapProbe {
         async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
             let (StoreOp::List { prefix } | StoreOp::ListChildren { prefix }) = op else {
                 return Ok(());
             };
-            let Some(side) = self.side(prefix) else {
-                return Ok(());
-            };
-            let other = if Arc::ptr_eq(side, &self.tags_in_flight) {
-                &self.revisions_in_flight
+            let (side, other) = if prefix.contains("!tag") {
+                (&self.tags_in_flight, &self.revisions_in_flight)
+            } else if prefix.contains("!rev") {
+                (&self.revisions_in_flight, &self.tags_in_flight)
             } else {
-                &self.tags_in_flight
+                return Ok(());
             };
 
             side.fetch_add(1, Ordering::SeqCst);
@@ -1278,44 +1209,6 @@ mod tests {
         format!("sha256:{padded}").parse().unwrap()
     }
 
-    fn descriptor_with_annotations(annotations: HashMap<String, String>) -> Descriptor {
-        Descriptor {
-            media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
-            digest: digest("abc1"),
-            size: 0,
-            annotations,
-            artifact_type: None,
-            platform: None,
-        }
-    }
-
-    #[test]
-    fn extract_docker_referrer_returns_candidate_with_parsed_subject() {
-        let subject = digest("beef");
-        let child = digest("cafe");
-        let mut descriptor = descriptor_with_annotations(HashMap::from([(
-            DOCKER_REFERENCE_DIGEST.to_string(),
-            subject.to_string(),
-        )]));
-        descriptor.digest = child.clone();
-        descriptor.artifact_type = Some(media_type(
-            "application/vnd.dev.cosign.artifact.sig.v1+json",
-        ));
-
-        let candidate = extract_docker_referrer(&descriptor).expect("should return Some");
-        assert_eq!(candidate.subject, subject);
-        assert_eq!(candidate.child_digest, child);
-        assert_eq!(candidate.info.digest, child.to_string());
-        assert_eq!(
-            candidate.info.artifact_type.as_deref(),
-            Some("application/vnd.dev.cosign.artifact.sig.v1+json")
-        );
-        assert_eq!(
-            candidate.info.annotations.get(DOCKER_REFERENCE_DIGEST),
-            Some(&subject.to_string())
-        );
-    }
-
     #[test]
     fn analyze_manifest_partitions_mixed_children_correctly() {
         let subject = digest("beef");
@@ -1341,7 +1234,12 @@ mod tests {
             artifact_type: None,
             platform: None,
         };
-        let manifest = Manifest::index(vec![referrer_child, index_child]);
+        let manifest = Manifest {
+            content: Content::Index {
+                manifests: vec![referrer_child, index_child],
+            },
+            ..Manifest::default()
+        };
 
         let analysis = analyze_manifest(&manifest);
         assert_eq!(analysis.parent_links.len(), 1);
@@ -1354,63 +1252,38 @@ mod tests {
         );
     }
 
+    /// Each parent carries its tags and the platform it lists the child under,
+    /// in the order the parents were recorded.
     #[test]
-    fn parent_refs_for_returns_empty_when_digest_not_in_parent_map() {
-        let child_to_parents: HashMap<Digest, Vec<(Digest, Option<Platform>)>> = HashMap::new();
-        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
-        let result = parent_refs_for(&digest("cccc"), &child_to_parents, &digest_to_tags);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn parent_refs_for_single_parent_with_tags() {
-        let child = digest("eeee");
-        let parent = digest("ffff");
-        let child_to_parents = HashMap::from([(child.clone(), vec![(parent.clone(), None)])]);
-        let digest_to_tags = HashMap::from([(parent.clone(), vec![Tag::new("v2").unwrap()])]);
-
-        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].tags, vec![Tag::new("v2").unwrap()]);
-    }
-
-    #[test]
-    fn parent_refs_for_multiple_parents_emitted_in_order() {
+    fn parent_refs_for_keeps_each_parent_in_order() {
         let child = digest("1234");
-        let parent_a = digest("aaaa");
-        let parent_b = digest("bbbb");
+        let (parent_a, parent_b) = (digest("aaaa"), digest("bbbb"));
         let platform = Platform {
             os: "linux".to_string(),
             architecture: "arm64".to_string(),
-            variant: Some("v8".to_string()),
             ..Platform::default()
         };
         let child_to_parents = HashMap::from([(
             child.clone(),
             vec![
-                (parent_a.clone(), None),
                 (parent_b.clone(), Some(platform.clone())),
+                (parent_a.clone(), None),
             ],
         )]);
-        let digest_to_tags: HashMap<Digest, Vec<Tag>> = HashMap::new();
+        let digest_to_tags = HashMap::from([(parent_a.clone(), vec![Tag::new("v2").unwrap()])]);
 
-        let result = parent_refs_for(&child, &child_to_parents, &digest_to_tags);
-        assert_eq!(result.len(), 2);
-
-        let ref_a = result
-            .iter()
-            .find(|r| r.digest == parent_a.to_string())
-            .unwrap();
-        assert!(ref_a.platform.is_none());
-
-        let ref_b = result
-            .iter()
-            .find(|r| r.digest == parent_b.to_string())
-            .unwrap();
-        let p = ref_b.platform.as_ref().unwrap();
-        assert_eq!(p.os, "linux");
-        assert_eq!(p.architecture, "arm64");
-        assert_eq!(p.variant.as_deref(), Some("v8"));
+        let parents: Vec<(String, Vec<Tag>, Option<Platform>)> =
+            parent_refs_for(&child, &child_to_parents, &digest_to_tags)
+                .into_iter()
+                .map(|parent| (parent.digest, parent.tags, parent.platform))
+                .collect();
+        assert_eq!(
+            parents,
+            [
+                (parent_b.to_string(), Vec::new(), Some(platform)),
+                (parent_a.to_string(), vec![Tag::new("v2").unwrap()], None),
+            ]
+        );
     }
 
     /// A namespace holding only an in-progress upload has no `_manifests`
@@ -1982,25 +1855,22 @@ mod tests {
         .await;
     }
 
-    /// A directory whose name is not a valid namespace must not take the whole
-    /// listing down with it.
+    /// An index key whose name is not a valid namespace must not take the
+    /// whole listing down with it.
     #[tokio::test]
-    async fn namespaces_info_skips_an_invalid_namespace_directory() {
+    async fn namespaces_info_skips_an_invalid_namespace_key() {
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
 
         let valid = Namespace::new("test-repo/valid").unwrap();
         create_test_blob(registry, &valid, b"valid content").await;
 
-        // Uppercase is outside the namespace grammar, so this directory can
-        // only have arrived from outside the write paths.
+        // Uppercase is outside the namespace grammar, so this key can only
+        // have arrived from outside the write paths.
         test_case
             .metadata_store()
             .object_store()
-            .put(
-                "v2/repositories/test-repo/BAD/_manifests/tags/v1/current/link",
-                Bytes::from_static(b"{}"),
-            )
+            .put(&format!("{CAT_ROOT}/test-repo/BAD!"), Bytes::new())
             .await
             .unwrap();
 
@@ -2021,31 +1891,6 @@ mod tests {
         assert_eq!(names, ["test-repo/valid"]);
     }
 
-    /// Plant one access entry at `at`, the shape a stamped pull writes.
-    async fn put_pull_entry(
-        metadata_store: &MetadataStore,
-        namespace: &Namespace,
-        link: &LinkKind,
-        client: &str,
-        at: DateTime<Utc>,
-    ) {
-        let body = serde_json::to_vec(&AccessEntry {
-            client: client.to_string(),
-            client_ip: None,
-            method: None,
-            at,
-        })
-        .unwrap();
-        metadata_store
-            .object_store()
-            .put(
-                &namespace.atime_entry_path(link, at, client).unwrap(),
-                Bytes::from(body),
-            )
-            .await
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn pull_history_lists_a_tag_newest_first_with_the_configured_limit() {
         for_each_backend(async |test_case| {
@@ -2056,8 +1901,8 @@ mod tests {
             let link = LinkKind::Tag(tag.clone());
 
             let now = Utc::now();
-            put_pull_entry(&metadata_store, &namespace, &link, "alice", now).await;
-            put_pull_entry(
+            put_access_entry_at(&metadata_store, &namespace, &link, "alice", now).await;
+            put_access_entry_at(
                 &metadata_store,
                 &namespace,
                 &link,
@@ -2348,161 +2193,64 @@ mod tests {
             .clone()
     }
 
-    /// A kubelet re-resolving `:main` sends only `HEAD .../manifests/main`,
-    /// which stamps the tag and never the revision it resolves to. The listing
-    /// must still report that pull.
+    /// A tag pull stamps only the tag (a kubelet re-resolving `:main` sends
+    /// just `HEAD .../manifests/main`), so a revision's last pull is the newest
+    /// across its tags and its own entries.
     #[tokio::test]
-    async fn last_pulled_at_reports_a_pull_that_only_named_the_tag() {
+    async fn last_pulled_at_takes_the_newest_pull_naming_the_revision() {
         for_each_backend(async |test_case| {
             // Pull times are listed only while pulls are recorded.
-            let stores = test_case.registry();
             let registry = create_test_registry_recording_pulls(
-                stores.blob_store.clone(),
-                stores.metadata_store.clone(),
+                test_case.blob_store(),
+                test_case.metadata_store(),
             );
-            let registry = registry.as_ref();
             let metadata_store = test_case.metadata_store();
-            let namespace = Namespace::new("test-repo/tag-pulled").unwrap();
-            let target = digest("da61");
-            seed_tagged_revision(&metadata_store, &namespace, &target, &["main"]).await;
+            let namespace = Namespace::new("test-repo/pulled").unwrap();
+            let (tagged, untagged, unpulled) = (digest("da61"), digest("da62"), digest("da63"));
+            seed_tagged_revision(&metadata_store, &namespace, &tagged, &["old", "new"]).await;
+            seed_tagged_revision(&metadata_store, &namespace, &untagged, &[]).await;
+            seed_tagged_revision(&metadata_store, &namespace, &unpulled, &["quiet"]).await;
 
-            assert_eq!(
-                last_pulled_of(registry, &namespace, &target).await,
-                Value::Null,
-                "nothing has been pulled yet"
-            );
-
-            let pulled_at = pulled_ago(ChronoDuration::minutes(5));
-            put_pull_entry(
-                &metadata_store,
-                &namespace,
-                &LinkKind::Tag(Tag::new("main").unwrap()),
-                "kubelet",
-                pulled_at,
-            )
-            .await;
-
-            let reported = last_pulled_of(registry, &namespace, &target).await;
-            assert_eq!(
-                reported
-                    .as_str()
-                    .map(|at| at.parse::<DateTime<Utc>>().unwrap()),
-                Some(pulled_at),
-                "a tag-only pull must surface as the manifest's last pull; got {reported}"
-            );
-        })
-        .await;
-    }
-
-    /// The manifest's last pull is the newest across everything that names it,
-    /// not whichever tag happens to be read first.
-    #[tokio::test]
-    async fn last_pulled_at_takes_the_newest_of_several_tags() {
-        for_each_backend(async |test_case| {
-            // Pull times are listed only while pulls are recorded.
-            let stores = test_case.registry();
-            let registry = create_test_registry_recording_pulls(
-                stores.blob_store.clone(),
-                stores.metadata_store.clone(),
-            );
-            let registry = registry.as_ref();
-            let metadata_store = test_case.metadata_store();
-            let namespace = Namespace::new("test-repo/many-tags").unwrap();
-            let target = digest("da62");
-            seed_tagged_revision(&metadata_store, &namespace, &target, &["old", "new"]).await;
-
-            let older = pulled_ago(ChronoDuration::hours(6));
             let newest = pulled_ago(ChronoDuration::minutes(1));
-            put_pull_entry(
-                &metadata_store,
-                &namespace,
-                &LinkKind::Tag(Tag::new("old").unwrap()),
-                "alice",
-                older,
-            )
-            .await;
-            put_pull_entry(
-                &metadata_store,
-                &namespace,
-                &LinkKind::Tag(Tag::new("new").unwrap()),
-                "bob",
-                newest,
-            )
-            .await;
+            let by_digest = pulled_ago(ChronoDuration::minutes(2));
+            for (link, client, at) in [
+                (
+                    LinkKind::Tag(Tag::new("old").unwrap()),
+                    "alice",
+                    pulled_ago(ChronoDuration::hours(6)),
+                ),
+                (LinkKind::Tag(Tag::new("new").unwrap()), "bob", newest),
+                (LinkKind::Digest(untagged.clone()), "carol", by_digest),
+            ] {
+                put_access_entry_at(&metadata_store, &namespace, &link, client, at).await;
+            }
 
-            let reported = last_pulled_of(registry, &namespace, &target).await;
-            assert_eq!(
-                reported
-                    .as_str()
-                    .map(|at| at.parse::<DateTime<Utc>>().unwrap()),
-                Some(newest),
-                "the freshest tag pull must win; got {reported}"
-            );
-        })
-        .await;
-    }
-
-    /// Folding tags in must not disturb a manifest that has none: its revision
-    /// atime is still the only thing that can report a pull.
-    #[tokio::test]
-    async fn last_pulled_at_of_an_untagged_manifest_stays_revision_only() {
-        for_each_backend(async |test_case| {
-            // Pull times are listed only while pulls are recorded.
-            let stores = test_case.registry();
-            let registry = create_test_registry_recording_pulls(
-                stores.blob_store.clone(),
-                stores.metadata_store.clone(),
-            );
-            let registry = registry.as_ref();
-            let metadata_store = test_case.metadata_store();
-            let namespace = Namespace::new("test-repo/untagged").unwrap();
-            let target = digest("da63");
-            seed_tagged_revision(&metadata_store, &namespace, &target, &[]).await;
-
-            assert_eq!(
-                last_pulled_of(registry, &namespace, &target).await,
-                Value::Null,
-                "an untagged, unpulled manifest reports no pull"
-            );
-
-            let pulled_at = pulled_ago(ChronoDuration::minutes(2));
-            put_pull_entry(
-                &metadata_store,
-                &namespace,
-                &LinkKind::Digest(target.clone()),
-                "carol",
-                pulled_at,
-            )
-            .await;
-
-            let reported = last_pulled_of(registry, &namespace, &target).await;
-            assert_eq!(
-                reported
-                    .as_str()
-                    .map(|at| at.parse::<DateTime<Utc>>().unwrap()),
-                Some(pulled_at),
-                "a by-digest pull must still be reported; got {reported}"
-            );
+            for (target, expected) in [
+                (&tagged, Some(newest)),
+                (&untagged, Some(by_digest)),
+                (&unpulled, None),
+            ] {
+                let reported = last_pulled_of(&registry, &namespace, target).await;
+                assert_eq!(
+                    reported
+                        .as_str()
+                        .map(|at| at.parse::<DateTime<Utc>>().unwrap()),
+                    expected,
+                    "{target}: got {reported}"
+                );
+            }
         })
         .await;
     }
 
     #[tokio::test]
-    async fn pull_history_lists_a_revision_through_the_stamping_path() {
+    async fn pull_history_lists_a_revision() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let metadata_store = test_case.metadata_store();
             let namespace = Namespace::new("test-repo/pulls-rev").unwrap();
             let target = digest("beef1");
-            let link = LinkKind::Digest(target.clone());
-            seed_links(
-                &metadata_store,
-                &namespace,
-                &[(link.clone(), target.clone())],
-            )
-            .await
-            .unwrap();
-            put_pull_entry(
+            put_access_entry_at(
                 &metadata_store,
                 &namespace,
                 &LinkKind::Digest(target.clone()),

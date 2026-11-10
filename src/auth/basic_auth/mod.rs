@@ -6,14 +6,13 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHash as Argon2PasswordHash, PasswordVerifier};
-use async_trait::async_trait;
 use http::request::Parts;
 use serde::{Deserialize, Deserializer, de};
 use tokio::time::sleep;
 use tracing::{debug, instrument};
 
 use crate::auth::authorization::basic_credentials;
-use crate::auth::{AuthMiddleware, AuthResult, Error};
+use crate::auth::{AuthResult, Error};
 use crate::identity::ClientIdentity;
 
 /// An Argon2 password hash string, validated at deserialize time.
@@ -60,26 +59,17 @@ pub struct BasicAuthValidator {
     timing_guard: PasswordHash,
 }
 
-/// A fixed hash carrying `Argon2::default()`'s cost parameters, for a registry
-/// with no identity configured to borrow one from; the password it encodes
-/// never matches, only its verification cost matters.
+/// A hash with `Argon2::default()`'s cost, for a registry with no identity to
+/// borrow one from; only its verification cost matters.
 const TIMING_GUARD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$YW5nb3MtdGltaW5nLWd1YXJk$FCScuxFhlmRU1Dn23hjKGjIaNsd/kD4tKsHrHAQU5VQ";
 
-/// Wall time a rejected credential takes whatever the reason, so an unknown
-/// username and a wrong password are indistinguishable however the configured
-/// hashes are costed, and a guessing loop gets one attempt a second per
-/// connection.
-#[cfg(not(test))]
+/// Wall time every rejection takes, so an unknown username and a wrong password
+/// are indistinguishable whatever the hashes cost, and guessing is throttled.
 const REJECTION_FLOOR: Duration = Duration::from_secs(1);
-/// Tests assert that the floor holds, not that it is slow.
-#[cfg(test)]
-const REJECTION_FLOOR: Duration = Duration::from_millis(20);
 
-/// Maps identities to a username-keyed lookup table, rejecting duplicate
-/// usernames: two `[auth.identity.*]` entries sharing a username would
-/// otherwise collapse into whichever the map iterates last, making the
-/// winning identity id (used by CEL rules and webhooks) change across
-/// restarts.
+/// Keys identities by username, rejecting duplicates: they would otherwise
+/// collapse into whichever the map iterates last, changing the identity id
+/// across restarts.
 fn build_users(identities: &HashMap<String, Config>) -> Result<HashMap<String, User>, Error> {
     let mut users = HashMap::with_capacity(identities.len());
     for (id, config) in identities {
@@ -122,9 +112,8 @@ impl BasicAuthValidator {
         })
     }
 
-    #[must_use]
     #[instrument(skip(self, password))]
-    pub fn validate_credentials(&self, username: &str, password: &str) -> Option<String> {
+    fn validate_credentials(&self, username: &str, password: &str) -> Option<String> {
         let Some(user) = self.users.get(username) else {
             // Burn the same Argon2 work as a real verification so response
             // timing cannot reveal whether the username exists.
@@ -144,11 +133,8 @@ impl BasicAuthValidator {
             }
         }
     }
-}
 
-#[async_trait]
-impl AuthMiddleware for BasicAuthValidator {
-    async fn authenticate(
+    pub async fn authenticate(
         &self,
         parts: &Parts,
         identity: &mut ClientIdentity,
@@ -164,9 +150,8 @@ impl AuthMiddleware for BasicAuthValidator {
             return Ok(AuthResult::Authenticated);
         }
 
-        // Held to the floor rather than delayed by it: the wait is what the
-        // verification did not spend, so every rejection answers at the same
-        // moment.
+        // Held to the floor rather than delayed by it, so every rejection
+        // answers at the same moment.
         sleep(REJECTION_FLOOR.saturating_sub(started.elapsed())).await;
         Err(Error::Unauthorized(
             "Invalid basic auth credentials".to_string(),

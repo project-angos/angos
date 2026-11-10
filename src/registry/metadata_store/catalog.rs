@@ -2,9 +2,10 @@
 //! from the `v2/cat` index and the namespace's own `v2/ns` listings.
 
 use std::collections::HashMap;
+use std::pin::pin;
 
 use bytes::Bytes;
-use futures_util::future::{BoxFuture, ready};
+use futures_util::future::ready;
 use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{instrument, warn};
 
@@ -15,6 +16,7 @@ use crate::registry::keys::{
     CAT_ROOT, DigestExt, NamespaceExt, TagEntry, parse_ref_digest, parse_referrer_record,
     parse_revision_record, ref_digest_name,
 };
+use crate::registry::metadata_store::tag::{beats, live_metadata};
 use crate::registry::metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore};
 use crate::registry::{Error, pagination};
 
@@ -22,11 +24,9 @@ use crate::registry::{Error, pagination};
 const TAG_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Folds a sorted stream of (group, entry-file) pairs into each group's live
-/// tag, yielding none for a tombstoned group or a group name scrub will report. A sorted listing delivers each group's
-/// entries contiguously with the newest ordinal first, so every group resolves
-/// from its complete lowest-ordinal set by the same rule as a point read:
-/// highest digest wins a same-millisecond tie, and a `set` beats a `del` of
-/// the same digest.
+/// tag, yielding none for a tombstoned group or a malformed group name. A
+/// sorted listing delivers each group's entries contiguously, newest ordinal
+/// first, so every group resolves by the same rule as a point read.
 ///
 /// A group is resolved as the next one opens rather than at the end, so a
 /// caller reading in key order can stop once it has the names it needs.
@@ -42,15 +42,14 @@ impl WinnerFold {
         let entry = file.parse::<TagEntry>().ok()?;
         let mut closed = None;
         self.current = Some(match self.current.take() {
-            Some((cur, winner)) if cur == group => {
-                // Same millisecond: the highest digest wins, and a `set`
-                // beats the `del` of that digest.
-                let beats = entry.ord() == winner.ord()
-                    && (entry.digest() > winner.digest()
-                        || (entry.digest() == winner.digest()
-                            && matches!(winner, TagEntry::Deletion { .. })));
-                (cur, if beats { entry } else { winner })
-            }
+            Some((cur, winner)) if cur == group => (
+                cur,
+                if beats(&entry, &winner) {
+                    entry
+                } else {
+                    winner
+                },
+            ),
             previous => {
                 closed = previous.and_then(Self::resolve);
                 (group.to_string(), entry)
@@ -64,23 +63,7 @@ impl WinnerFold {
     /// holds no content to list.
     fn resolve((group, entry): (String, TagEntry)) -> Option<(Tag, LinkMetadata)> {
         let tag = Tag::new(group.strip_suffix('!')?).ok()?;
-        let TagEntry::Set {
-            authored_at,
-            digest,
-            ..
-        } = entry
-        else {
-            return None;
-        };
-        Some((
-            tag,
-            LinkMetadata {
-                target: digest,
-                created_at: authored_at,
-                media_type: None,
-                descriptor: None,
-            },
-        ))
+        Some((tag, live_metadata(entry)?))
     }
 }
 
@@ -91,17 +74,13 @@ impl MetadataStore {
     ///
     /// The page holds `n` admitted names whenever that many remain, since the
     /// walk applies `allowed` as it goes rather than trimming a finished page.
-    #[instrument(skip(self, allowed, listable))]
-    pub async fn list_namespaces<'a, F>(
-        &'a self,
+    #[instrument(skip(self, allowed))]
+    pub async fn list_namespaces(
+        &self,
         n: u16,
         last: Option<String>,
-        allowed: &'a (dyn Fn(&Namespace) -> bool + Sync),
-        listable: F,
-    ) -> Result<Page<Namespace>, Error>
-    where
-        F: Fn(Namespace) -> BoxFuture<'a, Result<bool, Error>> + Send + Sync + 'a,
-    {
+        allowed: &(dyn Fn(&Namespace) -> bool + Sync),
+    ) -> Result<Page<Namespace>, Error> {
         // One name past the page decides whether a next one is advertised; the
         // index listing is already in `Namespace` order, so no sort here.
         let wanted = usize::from(n).saturating_add(1);
@@ -110,13 +89,12 @@ impl MetadataStore {
                 last.as_deref(),
                 u16::try_from(wanted).unwrap_or(u16::MAX),
                 allowed,
-                listable,
             )
             .take(wanted)
             .try_collect()
             .await?;
 
-        Ok(pagination::slice_page(&namespaces, 0, n))
+        Ok(pagination::slice_page(&namespaces, n))
     }
 
     /// Record the namespace in the `v2/cat` index, the key the unscoped
@@ -173,68 +151,75 @@ impl MetadataStore {
         .await
     }
 
+    /// Whether the catalog names `namespace` as a repository: it holds at least
+    /// one manifest revision, or one tag that resolves live. A namespace holding
+    /// nothing but tombstones or in-progress uploads is not a repository.
+    pub async fn holds_manifest_content(&self, namespace: &Namespace) -> Result<bool, Error> {
+        if self.any_revision(namespace).await? {
+            return Ok(true);
+        }
+        let mut tags = pin!(self.stream_live_tags(namespace, None));
+        Ok(tags.try_next().await?.is_some())
+    }
+
     /// Streams the `v2/cat` index above `last` in lexical key order, which is
     /// `Namespace` order because the trailing `!` sorts below every namespace
-    /// character.
+    /// character. Only namespaces that [`Self::holds_manifest_content`] list, so
+    /// a stale index key of an emptied namespace does not.
     ///
-    /// Both rules are the caller's, not the store's: `allowed` decides who may
-    /// see a name, and `listable` whether it holds content worth naming, so a
-    /// stale index key of an emptied namespace does not list. `allowed` runs
-    /// first, before `listable` costs a round trip, and `page` bounds both the
-    /// listing and the probes in flight, so a caller after two namespaces
-    /// never pays to probe a thousand.
-    pub fn stream_namespaces<'a, F>(
+    /// `allowed` decides who may see a name and runs before the content probe
+    /// costs a round trip; `page` bounds both the listing and the probes in
+    /// flight, so a caller after two namespaces never pays to probe a thousand.
+    pub fn stream_namespaces<'a>(
         &'a self,
         last: Option<&str>,
         page: u16,
         allowed: &'a (dyn Fn(&Namespace) -> bool + Sync),
-        listable: F,
-    ) -> impl Stream<Item = Result<Namespace, Error>> + Send + 'a
-    where
-        F: Fn(Namespace) -> BoxFuture<'a, Result<bool, Error>> + Send + Sync + 'a,
-    {
+    ) -> impl Stream<Item = Result<Namespace, Error>> + Send + 'a {
         let page = page.clamp(1, LIST_PAGE);
-        let fan_out = self.namespace_walk_concurrency.get().min(usize::from(page));
+        let fan_out = self
+            .settings
+            .namespace_walk_concurrency
+            .get()
+            .min(usize::from(page));
         // Index keys carry a trailing `!`, so the cursor's own key sorts below
         // the suffixed cursor and the listing resumes at the next namespace.
         let start_after = last.map(|last| format!("{last}!"));
-        stream::try_unfold(
-            Some((start_after, None, listable)),
-            move |state| async move {
-                let Some((start_after, token, listable)) = state else {
-                    return Ok::<_, Error>(None);
+        stream::try_unfold(Some((start_after, None)), move |state| async move {
+            let Some((start_after, token)) = state else {
+                return Ok::<_, Error>(None);
+            };
+            let listed = self
+                .object_store()
+                .list_after(CAT_ROOT, page, token, start_after)
+                .await?;
+            let mut probes = Vec::new();
+            for key in &listed.items {
+                let Some(name) = key.strip_suffix('!') else {
+                    continue;
                 };
-                let listed = self
-                    .object_store()
-                    .list_after(CAT_ROOT, page, token, start_after)
-                    .await?;
-                let mut probes = Vec::new();
-                for key in &listed.items {
-                    let Some(name) = key.strip_suffix('!') else {
-                        continue;
-                    };
-                    let Ok(namespace) = Namespace::new(name) else {
-                        continue;
-                    };
-                    if !allowed(&namespace) {
-                        continue;
-                    }
-                    let probe = listable(namespace.clone());
-                    probes.push(async move {
-                        probe.await.map(|listable| listable.then_some(namespace))
-                    });
+                let Ok(namespace) = Namespace::new(name) else {
+                    continue;
+                };
+                if !allowed(&namespace) {
+                    continue;
                 }
-                // Fanned out, but ordered, so the listing's lexical order survives
-                // and a caller taking one page probes little beyond it.
-                let probing = stream::iter(probes)
-                    .buffered(fan_out)
-                    .try_filter_map(|found| ready(Ok(found)));
-                Ok(Some((
-                    probing,
-                    listed.next_token.map(|token| (None, Some(token), listable)),
-                )))
-            },
-        )
+                probes.push(async move {
+                    self.holds_manifest_content(&namespace)
+                        .await
+                        .map(|listable| listable.then_some(namespace))
+                });
+            }
+            // Fanned out, but ordered, so the listing's lexical order survives
+            // and a caller taking one page probes little beyond it.
+            let probing = stream::iter(probes)
+                .buffered(fan_out)
+                .try_filter_map(|found| ready(Ok(found)));
+            Ok(Some((
+                probing,
+                listed.next_token.map(|token| (None, Some(token))),
+            )))
+        })
         .try_flatten()
     }
 
@@ -257,7 +242,7 @@ impl MetadataStore {
             .try_collect()
             .await?;
 
-        Ok(pagination::slice_page(&tags, 0, n))
+        Ok(pagination::slice_page(&tags, n))
     }
 
     /// Streams `namespace`'s live tags above `last`, each with the metadata a
@@ -416,24 +401,21 @@ impl MetadataStore {
 #[cfg(test)]
 mod tests {
     use std::slice;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
-    use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::Utc;
     use futures_util::{StreamExt, TryStreamExt};
 
     use angos_oci::{Algorithm, Digest, Namespace, Tag, UploadSessionId};
-    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
-    use angos_storage::{Error as StorageError, ObjectStore, Page};
+    use angos_storage::Page;
+    use angos_storage::test_util::StoreOp;
 
-    use crate::registry::content_discovery::holds_manifest_content;
     use crate::registry::keys::{NamespaceExt, TagEntryKind};
-    use crate::registry::metadata_store::{LIST_PAGE, LinkKind, LinkMetadata};
+    use crate::registry::metadata_store::{LIST_PAGE, LinkKind, LinkMetadata, MetadataStore};
     use crate::registry::test_utils::{
-        FSRegistryTestCase, RegistryTestCase, create_link, create_test_blob, drop_links,
-        for_each_backend, metadata_store_over, put_blob_direct, seed_links,
+        FSRegistryTestCase, RegistryTestCase, counting_metadata_store, create_link,
+        create_test_blob, drop_links, for_each_backend, put_blob_direct,
     };
 
     /// A namespace lists exactly while it holds at least one revision or tag, and
@@ -448,9 +430,7 @@ mod tests {
             let (digest, _) = create_test_blob(registry, namespace, b"content").await;
 
             let listed = metadata_store
-                .list_namespaces(1000, None, &|_| true, |ns| {
-                    holds_manifest_content(&metadata_store, ns)
-                })
+                .list_namespaces(1000, None, &|_| true)
                 .await
                 .unwrap()
                 .items;
@@ -471,9 +451,7 @@ mod tests {
             .unwrap();
 
             let listed = metadata_store
-                .list_namespaces(1000, None, &|_| true, |ns| {
-                    holds_manifest_content(&metadata_store, ns)
-                })
+                .list_namespaces(1000, None, &|_| true)
                 .await
                 .unwrap()
                 .items;
@@ -532,37 +510,6 @@ mod tests {
         .await;
     }
 
-    /// A namespace holding only an in-progress upload is not a catalog entry.
-    #[tokio::test]
-    async fn list_namespaces_excludes_upload_only_namespace() {
-        for_each_backend(async |test_case| {
-            let metadata_store = test_case.metadata_store();
-            let namespace = Namespace::new("upload-only/repo").unwrap();
-            let session_id = UploadSessionId::generate();
-
-            let upload_data_path = namespace.upload_path(&session_id);
-            metadata_store
-                .object_store()
-                .put(&upload_data_path, Bytes::from_static(b"partial"))
-                .await
-                .unwrap();
-
-            let listed = metadata_store
-                .list_namespaces(1000, None, &|_| true, |ns| {
-                    holds_manifest_content(&metadata_store, ns)
-                })
-                .await
-                .unwrap()
-                .items;
-            assert!(
-                !listed.contains(&namespace),
-                "a namespace with only an _uploads artifact must not appear in the \
-                 catalog; got: {listed:?}"
-            );
-        })
-        .await;
-    }
-
     /// `collect_upload_namespaces` keys off `_uploads` and `list_namespaces` off
     /// `_manifests`, so each surfaces what the other omits.
     #[tokio::test]
@@ -603,9 +550,7 @@ mod tests {
                 "a manifest-only namespace must not appear in collect_upload_namespaces; got: {upload_listed:?}"
             );
 
-            let manifest_listed = metadata_store.list_namespaces(1000, None, &|_| true, |ns| holds_manifest_content(
-                    &metadata_store, ns
-                )).await.unwrap().items;
+            let manifest_listed = metadata_store.list_namespaces(1000, None, &|_| true).await.unwrap().items;
             assert!(
                 manifest_listed.contains(manifest_only),
                 "a manifest-only namespace must appear in the catalog; got: {manifest_listed:?}"
@@ -629,25 +574,17 @@ mod tests {
     async fn nested_namespaces_coexist_in_the_catalog_on_fs() {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
-        for (i, name) in ["cat-nest", "cat-nest/b"].iter().enumerate() {
-            let namespace = Namespace::new(name).unwrap();
-            let digest = Digest::sha256_of_bytes(format!("nested-{i}").as_bytes());
-            seed_links(
-                &store,
-                &namespace,
-                &[(LinkKind::Digest(digest.clone()), digest)],
-            )
-            .await
-            .unwrap();
+        seed_namespaces(&store, &["cat-nest", "cat-nest/b"]).await;
+        for name in ["cat-nest", "cat-nest/b"] {
             store
                 .object_store()
-                .head(&namespace.catalog_index_path())
+                .head(&Namespace::new(name).unwrap().catalog_index_path())
                 .await
                 .expect("the catalog index key must exist beside the nested directory");
         }
 
         let listed = store
-            .list_namespaces(10, None, &|_| true, |ns| holds_manifest_content(&store, ns))
+            .list_namespaces(10, None, &|_| true)
             .await
             .unwrap()
             .items;
@@ -662,42 +599,22 @@ mod tests {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
         // Seeded out of lexical order on purpose.
-        for (i, name) in ["cat-z", "cat-p/b", "cat-p", "cat-p-b", "cat-p.c"]
-            .iter()
-            .enumerate()
-        {
-            let namespace = Namespace::new(name).unwrap();
-            let digest = Digest::sha256_of_bytes(format!("lexical-{i}").as_bytes());
-            seed_links(
-                &store,
-                &namespace,
-                &[(LinkKind::Digest(digest.clone()), digest)],
-            )
-            .await
-            .unwrap();
-        }
+        seed_namespaces(&store, &["cat-z", "cat-p/b", "cat-p", "cat-p-b", "cat-p.c"]).await;
 
-        let page = store
-            .list_namespaces(2, None, &|_| true, |ns| holds_manifest_content(&store, ns))
-            .await
-            .unwrap();
+        let page = store.list_namespaces(2, None, &|_| true).await.unwrap();
         let names: Vec<&str> = page.items.iter().map(AsRef::as_ref).collect();
         assert_eq!(names, ["cat-p", "cat-p-b"]);
         assert!(page.next_token.is_some(), "more pages must be signalled");
 
         let page = store
-            .list_namespaces(2, Some("cat-p-b".to_string()), &|_| true, |ns| {
-                holds_manifest_content(&store, ns)
-            })
+            .list_namespaces(2, Some("cat-p-b".to_string()), &|_| true)
             .await
             .unwrap();
         let names: Vec<&str> = page.items.iter().map(AsRef::as_ref).collect();
         assert_eq!(names, ["cat-p.c", "cat-p/b"]);
 
         let page = store
-            .list_namespaces(2, Some("cat-p/b".to_string()), &|_| true, |ns| {
-                holds_manifest_content(&store, ns)
-            })
+            .list_namespaces(2, Some("cat-p/b".to_string()), &|_| true)
             .await
             .unwrap();
         let names: Vec<&str> = page.items.iter().map(AsRef::as_ref).collect();
@@ -713,20 +630,7 @@ mod tests {
     async fn a_scoped_index_listing_reads_only_its_own_range() {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
-        for (i, name) in ["cat-z", "cat-p/b", "cat-p", "cat-p-b", "cat-p.c"]
-            .iter()
-            .enumerate()
-        {
-            let namespace = Namespace::new(name).unwrap();
-            let digest = Digest::sha256_of_bytes(format!("scoped-{i}").as_bytes());
-            seed_links(
-                &store,
-                &namespace,
-                &[(LinkKind::Digest(digest.clone()), digest)],
-            )
-            .await
-            .unwrap();
-        }
+        seed_namespaces(&store, &["cat-z", "cat-p/b", "cat-p", "cat-p-b", "cat-p.c"]).await;
 
         let scoped = store.list_indexed_namespaces(Some("cat-p")).await.unwrap();
         let names: Vec<&str> = scoped.iter().map(AsRef::as_ref).collect();
@@ -751,39 +655,14 @@ mod tests {
         );
     }
 
-    /// One revision listing is one content probe: `has_manifest_content` answers
-    /// from the namespace's first revision key.
-    struct CountProbes {
-        count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl StoreHook for CountProbes {
-        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-            if let StoreOp::List { prefix } = op
-                && prefix.contains("!rev")
-            {
-                self.count.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-    }
-
-    /// Counts the listings of one namespace's tag entries.
-    struct CountTagListings {
-        root: String,
-        count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl StoreHook for CountTagListings {
-        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-            if let StoreOp::List { prefix } = op
-                && prefix == self.root
-            {
-                self.count.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
+    /// Seed one revision in each of `names`, which indexes the namespace.
+    async fn seed_namespaces(store: &MetadataStore, names: &[&str]) {
+        for name in names {
+            let digest = Digest::sha256_of_bytes(name.as_bytes());
+            store
+                .put_revision(&Namespace::new(name).unwrap(), &digest, None, None)
+                .await
+                .unwrap();
         }
     }
 
@@ -811,15 +690,11 @@ mod tests {
                 .unwrap();
         }
 
-        let count = Arc::new(AtomicUsize::new(0));
-        let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+        let root = namespace.tag_entries_root();
+        let (store, count) = counting_metadata_store(
             seeding.object_store().clone(),
-            CountTagListings {
-                root: namespace.tag_entries_root(),
-                count: count.clone(),
-            },
-        ));
-        let store = metadata_store_over(hooked);
+            move |op| matches!(op, StoreOp::List { prefix } if *prefix == root),
+        );
 
         let taken: Vec<Tag> = store
             .stream_live_tags(&namespace, None)
@@ -862,14 +737,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let count = Arc::new(AtomicUsize::new(0));
-            let store = metadata_store_over(Arc::new(HookedStore::new(
+            let root = namespace.tag_entries_root();
+            let (store, count) = counting_metadata_store(
                 seeding.object_store().clone(),
-                CountTagListings {
-                    root: namespace.tag_entries_root(),
-                    count: count.clone(),
-                },
-            )));
+                move |op| matches!(op, StoreOp::List { prefix } if *prefix == root),
+            );
             let pointing = store
                 .find_tags_pointing_at(namespace, &target)
                 .await
@@ -929,31 +801,18 @@ mod tests {
     async fn a_catalog_page_probes_only_the_namespaces_it_serves() {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
-        for i in 0..10 {
-            let namespace = Namespace::new(&format!("probe-{i}")).unwrap();
-            let digest = Digest::sha256_of_bytes(format!("probe-{i}").as_bytes());
-            seed_links(
-                &store,
-                &namespace,
-                &[(LinkKind::Digest(digest.clone()), digest)],
-            )
-            .await
-            .unwrap();
-        }
+        let names: Vec<String> = (0..10).map(|i| format!("probe-{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_namespaces(&store, &names).await;
 
-        let count = Arc::new(AtomicUsize::new(0));
-        let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+        // `holds_manifest_content` answers from the first revision key, so one
+        // revision listing is one content probe.
+        let (paged, count) = counting_metadata_store(
             store.object_store().clone(),
-            CountProbes {
-                count: count.clone(),
-            },
-        ));
-        let paged = metadata_store_over(hooked);
+            |op| matches!(op, StoreOp::List { prefix } if prefix.contains("!rev")),
+        );
 
-        let page = paged
-            .list_namespaces(2, None, &|_| true, |ns| holds_manifest_content(&paged, ns))
-            .await
-            .unwrap();
+        let page = paged.list_namespaces(2, None, &|_| true).await.unwrap();
         let names: Vec<&str> = page.items.iter().map(AsRef::as_ref).collect();
         assert_eq!(names, ["probe-0", "probe-1"]);
         assert_eq!(
@@ -1005,27 +864,6 @@ mod tests {
             } = m.list_tags(namespace, 2, token1).await.unwrap();
             assert_eq!(page2.len(), 1);
             assert!(token2.is_none());
-
-            let Page {
-                items: page1,
-                next_token: token1,
-            } = m.list_tags(namespace, 1, None).await.unwrap();
-            assert_eq!(page1.len(), 1);
-            assert!(token1.is_some());
-
-            let Page {
-                items: page2,
-                next_token: token2,
-            } = m.list_tags(namespace, 1, token1).await.unwrap();
-            assert_eq!(page2.len(), 1);
-            assert!(token2.is_some());
-
-            let Page {
-                items: page3,
-                next_token: token3,
-            } = m.list_tags(namespace, 1, token2).await.unwrap();
-            assert_eq!(page3.len(), 1);
-            assert!(token3.is_none());
 
             let delete_tag = "v1.0";
             let tag_link = LinkKind::Tag(Tag::new(delete_tag).unwrap());

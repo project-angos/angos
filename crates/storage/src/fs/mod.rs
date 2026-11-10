@@ -1,17 +1,6 @@
-//! Filesystem-backed [`ObjectStore`], including the upload-session methods.
-//!
-//! Maps the storage trait surface onto a directory tree rooted at `root_dir`:
-//! every object key becomes a relative path under the root. Writes are atomic
-//! (temp-file + rename) and `delete_prefix` walks the subtree, then prunes any
-//! ancestor directories it leaves empty, an FS-only concern (S3 has no
-//! directories) that stays internal to this backend. Listings sort
-//! lexicographically because `read_dir` returns entries in arbitrary order.
-//!
-//! Uploads use an append-mode file at the upload `key`: no staging artifacts,
-//! no multipart protocol, no caller-held session. `complete_upload` is a no-op
-//! because the data is already at `key`; `promote_upload` copies the verified
-//! bytes to the canonical location, since an append that is still in flight
-//! keeps writing to the file it opened.
+//! Filesystem [`ObjectStore`]: each key is a path under the root, writes are
+//! temp-file plus rename, and deletes prune the directories they empty, as S3
+//! has none. An upload is an append-mode file at its key.
 
 use std::fs::{File, FileType, hard_link};
 use std::io::{self, ErrorKind, Read, SeekFrom, Write};
@@ -27,52 +16,20 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt, copy as async_copy};
 use tokio::task::{spawn_blocking, yield_now};
 use tokio_util::io::StreamReader;
 
-use crate::object::{dir_prefix, verified_move};
+use crate::object::verified_move;
 use crate::{
     BoxedReader, ByteStream, Children, ChildrenPage, Error, KeyStream, ObjectMeta, ObjectStore,
     Page,
 };
 
-/// Filename prefix for the temp files [`atomic_write`] creates next to their
-/// target before the rename. These are an implementation detail of atomic
-/// writes and must never be surfaced as objects: a concurrent listing+read
-/// could otherwise observe a freshly-created, still-empty temp file and, for a
-/// JSON object key, fail to parse it. Listings skip any entry with this prefix.
+/// Prefix of in-flight write temporaries, which listings skip: a reader would
+/// otherwise see a still-empty object.
 const ATOMIC_WRITE_TMP_PREFIX: &str = ".angos-write.";
 
-/// How many times [`ensure_parent`] retries a racing `create_dir_all`. On
-/// macOS/APFS a contended intermediate `mkdir` can transiently return EINVAL
-/// instead of EEXIST, failing the recursive create even though the directory
-/// is about to exist.
+/// Retries of a racing `create_dir_all`: on macOS/APFS a contended `mkdir` can
+/// return EINVAL instead of EEXIST.
 const ENSURE_PARENT_RETRIES: u32 = 5;
 
-/// Builder for [`Backend`]. The root directory is required and supplied to
-/// [`Backend::builder`]; `sync_to_disk` is an optional fluent setter.
-pub struct Builder {
-    root: PathBuf,
-    sync_to_disk: bool,
-}
-
-impl Builder {
-    /// When `true`, every write `fsync`s before the temp-file rename. Adds
-    /// durability at the cost of a syscall per write.
-    #[must_use]
-    pub fn sync_to_disk(mut self, sync: bool) -> Self {
-        self.sync_to_disk = sync;
-        self
-    }
-
-    /// Consume the builder and produce the [`Backend`].
-    #[must_use]
-    pub fn build(self) -> Backend {
-        Backend {
-            root: self.root,
-            sync_to_disk: self.sync_to_disk,
-        }
-    }
-}
-
-/// Filesystem [`ObjectStore`] implementation.
 #[derive(Clone, Debug)]
 pub struct Backend {
     root: PathBuf,
@@ -80,14 +37,12 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Return a builder for a filesystem backend rooted at `root`, under which
-    /// all object keys are resolved. Other settings are optional fluent setters
-    /// on the returned builder.
+    /// With `sync_to_disk`, every write is `fsync`ed before it becomes visible.
     #[must_use]
-    pub fn builder(root: &Path) -> Builder {
-        Builder {
+    pub fn new(root: &Path, sync_to_disk: bool) -> Self {
+        Self {
             root: root.to_path_buf(),
-            sync_to_disk: false,
+            sync_to_disk,
         }
     }
 
@@ -95,56 +50,24 @@ impl Backend {
         self.root.join(key)
     }
 
-    /// Open `key` for writing in append mode (`O_APPEND`), creating the file
-    /// and its parent directory if they do not exist.
-    ///
-    /// Returns the open file handle and the file's size **before** the open,
-    /// so the upload can report its new total size without a separate `head`
-    /// call.
-    ///
-    /// # Errors
-    /// Returns [`Error::Backend`] when the file cannot be opened.
-    async fn open_for_append(&self, key: &str) -> Result<(fs::File, u64), Error> {
-        let path = self.full_path(key);
-        ensure_parent(&path).await?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|e| backend_error("open", &path, &e))?;
-        let size = file.metadata().await?.len();
-        Ok((file, size))
-    }
-
-    /// Best-effort cleanup of empty ancestor directories after a leaf
-    /// deletion. Walks parents upward until it reaches the first non-empty
-    /// parent or `root_dir` (exclusive). The store root is the only ceiling.
-    /// Errors are suppressed.
+    /// Best-effort removal of the empty ancestors of `key`, up to but never
+    /// including the root.
     async fn prune_empty_ancestors(&self, key: &str) {
-        // Lexically resolve `.`/`..` BEFORE touching the filesystem. `full_path`
-        // does a bare `root.join(key)`, and `Path::starts_with` is purely
-        // lexical: it does not collapse `..`. Without normalization a key like
-        // `a/../../x` yields ancestor paths that still contain `..`, slip past a
-        // `starts_with(root)` guard, and resolve at syscall time to a directory
-        // *above* the configured root, where `remove_dir` could delete it.
+        // `starts_with` is lexical, so an unnormalized `a/../../x` would pass
+        // the root guard and resolve above the root at syscall time.
         let root = normalize_lexical(&self.root);
         let start = normalize_lexical(&self.full_path(key));
-        // Refuse to touch anything that does not lie strictly under the root.
         if !start.starts_with(&root) || start == root {
             return;
         }
         let mut current = start.parent();
         while let Some(parent) = current {
-            // The store root is the ceiling: never remove it or anything above.
-            // Both paths are normalized, so this comparison is `..`-proof.
             if parent == root || !parent.starts_with(&root) {
                 break;
             }
             let Ok(mut entries) = fs::read_dir(parent).await else {
                 break;
             };
-            // Stop at the first non-empty parent (or any read error).
             match entries.next_entry().await {
                 Ok(Some(_)) | Err(_) => break,
                 Ok(None) => {}
@@ -157,22 +80,13 @@ impl Backend {
     }
 }
 
-/// Resolve `.` and `..` components purely lexically, with no I/O.
-///
-/// Unlike [`Path::canonicalize`] this performs no syscalls, follows no
-/// symlinks, and does not require the path to exist: it is a pure string-level
-/// collapse used to make ancestor pruning escape-proof. `Prefix`/`RootDir`
-/// components are preserved, `.` is dropped, `..` pops the last `Normal`
-/// component (but never the leading prefix/root), and `Normal` components are
-/// pushed. A `..` that would climb above the prefix/root is simply ignored, so
-/// the result can never lexically escape the path's own anchor.
+/// Resolves `.` and `..` without syscalls; a `..` never climbs past the anchor.
 fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
-            // Pop only a real path segment; never climb past the prefix/root anchor.
             Component::ParentDir => {
                 if matches!(out.components().next_back(), Some(Component::Normal(_))) {
                     out.pop();
@@ -184,14 +98,12 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// Create all parent directories of `path`.
 async fn ensure_parent(path: &Path) -> Result<(), Error> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    // Retry only race error kinds: EINVAL (macOS/APFS, see
-    // ENSURE_PARENT_RETRIES), EEXIST, and ENOENT from a racing remove; other
-    // errors are deterministic and surface immediately.
+    // Retry only the race kinds: EINVAL (APFS), EEXIST, and ENOENT from a
+    // racing prune.
     let mut attempt = 0;
     loop {
         match fs::create_dir_all(parent).await {
@@ -214,8 +126,6 @@ async fn ensure_parent(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Map an io error to an [`Error`] carrying the operation and path for
-/// diagnosability. Preserves the `NotFound` classification.
 fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
     if error.kind() == ErrorKind::NotFound {
         Error::NotFound
@@ -224,8 +134,6 @@ fn backend_error(op: &str, path: &Path, error: &io::Error) -> Error {
     }
 }
 
-/// A temp file beside the objects of `parent`, filled by `fill` and synced
-/// when asked, ready to be persisted or linked into place.
 fn staged_file(
     parent: &Path,
     sync: bool,
@@ -241,9 +149,8 @@ fn staged_file(
     Ok(temp)
 }
 
-/// Stream `src` into a temp file and rename it onto `dst`; `std::io::copy`
-/// buffers little, so a multi-GB blob never sits in memory. `exact` copies
-/// that many bytes and refuses to publish fewer.
+/// Streams `src` into a temp file renamed onto `dst`. `exact` copies that many
+/// bytes and refuses to publish fewer.
 async fn copy_into_place(
     src: PathBuf,
     dst: PathBuf,
@@ -252,7 +159,7 @@ async fn copy_into_place(
 ) -> Result<u64, Error> {
     ensure_parent(&dst).await?;
     let parent = dst.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-    match spawn_blocking(move || -> Result<u64, Error> {
+    spawn_blocking(move || -> Result<u64, Error> {
         let reader = File::open(&src).map_err(|e| backend_error("copy from", &src, &e))?;
         let mut copied = 0;
         let temp = staged_file(&parent, sync, |file| {
@@ -273,18 +180,11 @@ async fn copy_into_place(
         Ok(copied)
     })
     .await
-    {
-        Ok(result) => result,
-        Err(e) => Err(Error::Backend(format!("copy task panicked: {e}"))),
-    }
+    .map_err(|e| Error::Backend(format!("copy task panicked: {e}")))?
 }
 
-/// Run `write`, which stages a temp file in `target`'s parent and puts it in
-/// place, on a blocking thread. A concurrent `delete` can prune the parent
-/// between `ensure_parent` and the temp file's creation (see
-/// `prune_empty_ancestors`); once the temp file exists the directory is
-/// non-empty and safe from the sweep, so only creation races, and the racy
-/// error kinds re-create the parent and retry, bounded as `ensure_parent` is.
+/// Runs `write` on a blocking thread, retrying when a concurrent prune removes
+/// the parent before the temp file lands in it.
 async fn write_beside<T, F>(target: &Path, op: &str, write: F) -> Result<T, Error>
 where
     T: Send + 'static,
@@ -312,18 +212,6 @@ where
     }
 }
 
-async fn atomic_write(target: &Path, data: Bytes, sync: bool) -> Result<(), Error> {
-    let final_path = target.to_owned();
-    write_beside(target, "atomic_write", move |parent| {
-        staged_file(parent, sync, |file| file.write_all(&data))?
-            .persist(&final_path)
-            .map_err(|e| e.error)?;
-        Ok(())
-    })
-    .await
-}
-
-/// Split directory entries into sub-prefixes and objects by file type.
 fn partition_entries(entries: impl IntoIterator<Item = (String, FileType)>) -> Children {
     let (dirs, files): (Vec<_>, Vec<_>) = entries
         .into_iter()
@@ -336,7 +224,7 @@ fn partition_entries(entries: impl IntoIterator<Item = (String, FileType)>) -> C
     }
 }
 
-/// Sorted list of immediate entries; missing dir yields an empty vector.
+/// Missing directory yields no entries.
 async fn read_dir_sorted(path: &Path) -> Result<Vec<(String, FileType)>, Error> {
     let mut reader = match fs::read_dir(path).await {
         Ok(r) => r,
@@ -348,8 +236,6 @@ async fn read_dir_sorted(path: &Path) -> Result<Vec<(String, FileType)>, Error> 
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        // Never surface in-flight atomic-write temporaries as objects: a
-        // concurrent writer may have just created an empty temp file here.
         if name.starts_with(ATOMIC_WRITE_TMP_PREFIX) {
             continue;
         }
@@ -360,12 +246,9 @@ async fn read_dir_sorted(path: &Path) -> Result<Vec<(String, FileType)>, Error> 
     Ok(entries)
 }
 
-/// Every regular-file key under `root` strictly above `after`, relative to
-/// `root` and in lexical order, as the S3 backend lists them. A directory
-/// sorts as its name plus `/`, where its keys fall (`a.txt` < `a/x` < `a0`),
-/// so one wholly at or below `after` is never read, and directories are read
-/// only as the stream is polled. Only the pending siblings along one path are
-/// held, so a whole-store scan does not materialise the tree.
+/// Every key under `root` strictly above `after`, in S3's lexical order: a
+/// directory sorts as its name plus `/` (`a.txt` < `a/x` < `a0`), so one at or
+/// below `after` is never read. Holds only the pending siblings along one path.
 fn walk_sorted(
     root: PathBuf,
     after: Option<String>,
@@ -425,7 +308,16 @@ impl ObjectStore for Backend {
     }
 
     async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
-        atomic_write(&self.full_path(key), data, self.sync_to_disk).await
+        let target = self.full_path(key);
+        let final_path = target.clone();
+        let sync = self.sync_to_disk;
+        write_beside(&target, "atomic_write", move |parent| {
+            staged_file(parent, sync, |file| file.write_all(&data))?
+                .persist(&final_path)
+                .map_err(|e| e.error)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
@@ -451,21 +343,16 @@ impl ObjectStore for Backend {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        // On S3 a prefix vanishes with its last object; mirror that here so
-        // directory-based listings never surface hollow scaffolding (e.g. a
-        // deleted tag's empty directory read back as a live tag).
+        // Else an empty tag directory would list as a live tag.
         self.prune_empty_ancestors(key).await;
         Ok(())
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-        // An empty prefix is a no-op (see `dir_prefix`): it must not be
-        // resolved to the store root and recursively wipe every object.
-        if dir_prefix(prefix).is_empty() {
+        if prefix.is_empty() {
             return Ok(());
         }
         let path = self.full_path(prefix);
-        // Directory → recursive remove; file → unlink; missing → success.
         match fs::metadata(&path).await {
             Ok(meta) if meta.is_dir() => match fs::remove_dir_all(&path).await {
                 Ok(()) => {}
@@ -476,10 +363,6 @@ impl ObjectStore for Backend {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        // Removing the subtree may have emptied its parent shard directories;
-        // tidy them up to the store root so deletions don't leave hollow
-        // scaffolding behind. This is an FS-only concern, kept internal to the
-        // backend.
         self.prune_empty_ancestors(prefix).await;
         Ok(())
     }
@@ -501,9 +384,7 @@ impl ObjectStore for Backend {
         start_after: Option<String>,
     ) -> Result<Page<String>, Error> {
         let n = usize::from(n);
-        // Listings sort, so a token and a start-after bound resume the same
-        // way, from the first key strictly above the cursor. The one key past
-        // the page only tells whether more remain.
+        // The one key past the page only tells whether more remain.
         let mut items: Vec<String> = walk_sorted(self.full_path(prefix), token.or(start_after))
             .take(n + 1)
             .try_collect()
@@ -514,8 +395,7 @@ impl ObjectStore for Backend {
         Ok(Page { items, next_token })
     }
 
-    /// One walk, where draining pages would read the directories on each
-    /// page's cursor path again.
+    /// One walk, rather than re-reading each page's cursor path.
     fn list_in_order<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
         Box::pin(walk_sorted(self.full_path(prefix), None))
     }
@@ -529,8 +409,6 @@ impl ObjectStore for Backend {
     ) -> Result<ChildrenPage, Error> {
         let entries = read_dir_sorted(&self.full_path(prefix)).await?;
 
-        // Token wins over start_after when both are set: token is what the
-        // backend itself emitted, start_after is caller-supplied.
         let cursor = token.as_deref().or(start_after.as_deref());
         let lower = cursor.map_or(0, |t| {
             entries
@@ -557,8 +435,6 @@ impl ObjectStore for Backend {
         })
     }
 
-    /// One directory read instead of the default page drain, which re-reads
-    /// the directory once per page.
     async fn list_all_children(&self, prefix: &str) -> Result<Children, Error> {
         let entries = read_dir_sorted(&self.full_path(prefix)).await?;
         Ok(partition_entries(entries))
@@ -578,17 +454,11 @@ impl ObjectStore for Backend {
         let src = self.full_path(source);
         let dst = self.full_path(destination);
         ensure_parent(&dst).await?;
-        // Same-filesystem rename is atomic and O(1) in memory: the staging
-        // upload and its canonical blob-data location live under the same root,
-        // so this is the common path and avoids copying the bytes at all.
         if fs::rename(&src, &dst).await.is_ok() {
-            // The rename may have emptied the source's parent chain; sweep it
-            // like `delete` does so no hollow directories survive the move.
             self.prune_empty_ancestors(source).await;
             return Ok(());
         }
-        // Rename can fail across filesystems (`EXDEV`) or transiently; fall back
-        // to the (streamed) copy + delete that the trait default would do.
+        // A rename across filesystems (`EXDEV`) falls back to copy and delete.
         verified_move(self, source, destination).await
     }
 
@@ -598,7 +468,15 @@ impl ObjectStore for Backend {
         body: ByteStream,
         len: Option<u64>,
     ) -> Result<u64, Error> {
-        let (mut file, current) = self.open_for_append(key).await?;
+        let path = self.full_path(key);
+        ensure_parent(&path).await?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| backend_error("open", &path, &e))?;
+        let current = file.metadata().await?.len();
         if len == Some(0) {
             return Ok(current);
         }
@@ -623,9 +501,8 @@ impl ObjectStore for Backend {
     }
 
     async fn complete_upload(&self, key: &str) -> Result<(), Error> {
-        // Ensure the staging file exists (an upload completed with no writes
-        // still produces an empty object at `key`), then no-op: the data already
-        // lives at `key` until `promote_upload` publishes it.
+        // The data is already at `key`; only an upload with no writes needs
+        // its empty object created.
         match self.head(key).await {
             Ok(_) => Ok(()),
             Err(Error::NotFound) => self.put(key, Bytes::new()).await,
@@ -647,13 +524,8 @@ impl ObjectStore for Backend {
     }
 
     async fn abort_upload(&self, key: &str) -> Result<(), Error> {
-        // The staging file at `key` is the only artifact; deleting it is
-        // idempotent (missing file counts as success).
         self.delete(key).await
     }
-
-    // `list_multipart_uploads` uses the trait's empty default: FS has no
-    // multipart protocol.
 }
 
 #[cfg(test)]

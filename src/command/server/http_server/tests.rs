@@ -3,12 +3,11 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use http_body_util::BodyExt;
 use hyper::header::{
-    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE,
+    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE,
 };
 use hyper::{Method, Request, StatusCode};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
-use serde_json::{Value, from_slice};
 use tracing::info_span;
 use tracing::subscriber::with_default;
 use tracing_opentelemetry::layer as otel_layer;
@@ -17,107 +16,18 @@ use tracing_subscriber::registry::Registry as TracingRegistry;
 
 use angos_transport::ResponseBody;
 
-use crate::auth::PeerCertificate;
 use crate::command::server::ServerContext;
 use crate::command::server::error::Error;
 use crate::command::server::handlers::{handle_get_token, handle_healthz, handle_metrics};
-use crate::command::server::http_server::connection::{
-    current_trace_id, inject_peer_certificate, method_label,
-};
+use crate::command::server::http_server::connection::{current_trace_id, method_label};
 use crate::command::server::http_server::dispatch::{
     authenticate_and_authorize, handle_unknown_route,
 };
 use crate::command::server::http_server::error_response::error_to_response;
-use crate::command::server::server_context::tests::{
-    TestConfigOptions, create_test_server_context_from_config, create_test_server_context_with,
-};
+use crate::command::server::server_context::tests::create_test_server_context_from_config;
 use crate::identity::{Action, ClientIdentity};
-use crate::policy::{AccessMode, PolicyConfig};
+use crate::metrics_provider;
 use crate::test_fixtures::configuration::load_config;
-use crate::{metrics_provider, registry};
-
-#[test]
-fn test_error_to_response_unauthorized_with_request_id() {
-    let error = Error::Unauthorized("Invalid credentials".to_string());
-    let request_id = Some("req-123".to_string());
-
-    let response = error_to_response(&error, request_id.as_deref(), None);
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert_eq!(
-        response.headers().get(WWW_AUTHENTICATE).unwrap(),
-        r#"Basic realm="Angos", charset="UTF-8""#
-    );
-}
-
-#[tokio::test]
-async fn test_error_to_response_from_registry_error() {
-    let registry_error = registry::Error::BlobUnknown;
-    let error: Error = registry_error.into();
-    let request_id = Some("req-blob".to_string());
-
-    let response = error_to_response(&error, request_id.as_deref(), None);
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-
-    let (_, body) = response.into_parts();
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
-    };
-    let json: Value = from_slice(&body_bytes).unwrap();
-    assert_eq!(json["errors"][0]["code"], "BLOB_UNKNOWN");
-}
-
-/// The collector's writer backoff clears in about a second, so the refusal
-/// tells the client when to come back instead of leaving it to guess.
-#[test]
-fn reclamation_in_progress_answers_503_with_retry_after() {
-    let error: Error = registry::Error::ReclamationInProgress("reclaiming".to_string()).into();
-
-    let response = error_to_response(&error, None, None);
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
-}
-
-/// Only the reclamation refusal is retryable on a schedule, so no other error
-/// may advertise one.
-#[test]
-fn other_errors_carry_no_retry_after() {
-    let error: Error = registry::Error::Conflict("locked".to_string()).into();
-
-    let response = error_to_response(&error, None, None);
-
-    assert!(response.headers().get(RETRY_AFTER).is_none());
-}
-
-#[test]
-fn test_error_to_response_custom_error() {
-    let error = Error::Custom {
-        status_code: StatusCode::BAD_GATEWAY,
-        code: "UPSTREAM_ERROR".to_string(),
-        msg: Some("Failed to connect".to_string()),
-    };
-    let request_id = Some("req-custom".to_string());
-
-    let response = error_to_response(&error, request_id.as_deref(), None);
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
-}
 
 /// A 401 relayed from a pull-through upstream is that registry's refusal, so
 /// answering it with our own realm costs the client a token round trip that
@@ -145,29 +55,20 @@ fn only_our_own_denial_carries_the_bearer_challenge() {
     assert_eq!(ours.headers().get(WWW_AUTHENTICATE), Some(&challenge));
 }
 
-#[test]
-fn test_handle_healthz_success() {
+#[tokio::test]
+async fn test_handle_healthz_body_content() {
     let response = handle_healthz().unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(CONTENT_TYPE).unwrap(),
         "application/json"
     );
-}
 
-#[tokio::test]
-async fn test_handle_healthz_body_content() {
-    let response = handle_healthz().unwrap();
-    let (_, body) = response.into_parts();
-
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
+    let ResponseBody::Fixed(body) = response.into_body() else {
+        panic!("Expected Fixed body");
     };
-
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert_eq!(body_str, r#"{"status":"ok"}"#);
+    let body_bytes = body.collect().await.unwrap().to_bytes();
+    assert_eq!(body_bytes.as_ref(), br#"{"status":"ok"}"#);
 }
 
 #[tokio::test]
@@ -179,70 +80,11 @@ async fn test_handle_metrics_contains_metric_data() {
     let content_type = parts.headers.get(CONTENT_TYPE).unwrap().to_str().unwrap();
     assert!(content_type.contains("text/plain") || content_type.contains("application/json"));
 
-    let body_bytes = match body {
-        ResponseBody::Fixed(b) => b.collect().await.unwrap().to_bytes(),
-        _ => panic!("Expected Fixed body"),
+    let ResponseBody::Fixed(body) = body else {
+        panic!("Expected Fixed body");
     };
-
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert!(!body_str.is_empty(), "the response body is empty");
-}
-
-#[test]
-fn test_error_to_response_all_error_types() {
-    let errors = vec![
-        (
-            Error::Unauthorized("msg".to_string()),
-            StatusCode::UNAUTHORIZED,
-            true,
-        ),
-        (
-            Error::NotFound("msg".to_string()),
-            StatusCode::NOT_FOUND,
-            false,
-        ),
-        (
-            Error::BadRequest("msg".to_string()),
-            StatusCode::BAD_REQUEST,
-            false,
-        ),
-        (
-            Error::Internal("msg".to_string()),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            false,
-        ),
-        (
-            Error::RangeNotSatisfiable("msg".to_string()),
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            false,
-        ),
-        (
-            Error::Initialization("msg".to_string()),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            false,
-        ),
-        (
-            Error::Execution("msg".to_string()),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            false,
-        ),
-    ];
-
-    for (error, expected_status, should_have_www_authenticate) in errors {
-        let response = error_to_response(&error, None, None);
-
-        assert_eq!(response.status(), expected_status);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).unwrap(),
-            "application/json"
-        );
-
-        if should_have_www_authenticate {
-            assert!(response.headers().get(WWW_AUTHENTICATE).is_some());
-        } else {
-            assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
-        }
-    }
+    let body_bytes = body.collect().await.unwrap().to_bytes();
+    assert!(!body_bytes.is_empty(), "the response body is empty");
 }
 
 /// An unmatched path is answered before authentication, so an anonymous client
@@ -275,143 +117,94 @@ fn the_method_label_holds_to_the_served_methods() {
 
 /// The router reports a malformed reference and a path it does not serve as the
 /// same `None`, so the method decides the status: a read missed, a write was
-/// malformed. OCI conformance fails the registry when a manifest `PUT` carrying
-/// an unparseable reference answers anything but `400`.
+/// malformed, which OCI conformance requires of a manifest `PUT` carrying an
+/// unparseable reference. Two exceptions: the referrers API answers an invalid
+/// digest or filter `400` (a bad namespace stays a miss), and `/token` answers an
+/// unserved method `405`, since containerd probes `POST /token` first and falls
+/// back to `GET` only on 401, 404 or 405.
 #[test]
-fn unknown_route_status_follows_the_method() {
-    for (method, expected_not_found) in [
-        (Method::GET, true),
-        (Method::HEAD, true),
-        (Method::PUT, false),
-        (Method::POST, false),
-        (Method::DELETE, false),
-    ] {
-        let request = Request::builder()
-            .method(method.clone())
-            .uri("/v2/conformance/test/manifests/sha256:not-a-digest")
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
-
-        let Err(error) = handle_unknown_route(&parts) else {
-            panic!("{method} on an unmatched path must be rejected, not served");
-        };
-        assert_eq!(
-            matches!(error, Error::NotFound(_)),
-            expected_not_found,
-            "{method} on an unmatched path returned the wrong status: {error:?}"
-        );
-    }
-}
-
-/// containerd probes the `OAuth2` form of the token endpoint, `POST /token`,
-/// before the plain `GET /token` angos serves, and falls back to the plain form
-/// only on 401, 404 or 405. The catch-all answers 400 for a non-read method, so
-/// without this the probe ends the exchange and every `buildctl` push fails with
-/// `unsupported: unsupported route: POST /token`.
-#[test]
-fn token_endpoint_refuses_an_unserved_method_with_405() {
-    for method in [Method::POST, Method::PUT, Method::DELETE] {
-        let request = Request::builder()
-            .method(method.clone())
-            .uri("/token")
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
-
-        let Err(error) = handle_unknown_route(&parts) else {
-            panic!("{method} /token must be rejected, not served");
-        };
-        assert_eq!(
-            error.status_code(),
-            StatusCode::METHOD_NOT_ALLOWED,
-            "{method} /token must be a method-not-allowed, got {error:?}"
-        );
-
-        // The status alone is what containerd reads, but a 405 has to name the
-        // method that would work.
-        let response = error_to_response(&error, None, None);
-        assert_eq!(
-            response.headers().get(ALLOW).unwrap(),
-            "GET",
-            "a 405 must advertise the method the path serves"
-        );
-    }
-}
-
-/// The 405 above is the token endpoint's alone: every other unserved write path
-/// keeps the 400 conformance requires of a malformed manifest `PUT`.
-#[test]
-fn the_405_does_not_leak_to_other_unserved_write_paths() {
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/tokens")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let Err(error) = handle_unknown_route(&parts) else {
-        panic!("an unmatched path must be rejected, not served");
-    };
-    assert_eq!(
-        error.status_code(),
-        StatusCode::BAD_REQUEST,
-        "only /token answers 405, got {error:?}"
-    );
-}
-
-/// A registry serving the referrers API must answer an invalid request with
-/// `400` and never with the `404` an unserved read path gets, whichever part of
-/// the request is malformed.
-#[test]
-fn unknown_referrers_route_is_a_bad_request() {
+fn unknown_route_status_follows_the_method_and_path() {
     let digest = format!("sha256:{}", "a".repeat(64));
-    for uri in [
-        "/v2/conformance/test/referrers/not-a-digest".to_string(),
-        format!("/v2/conformance/test/referrers/{digest}?artifactType=not-a-media-type"),
-        format!("/v2/conformance/test/referrers/{digest}?n=abc"),
+    let manifest = "/v2/conformance/test/manifests/sha256:not-a-digest";
+    for (method, uri, expected) in [
+        (Method::GET, manifest.to_string(), StatusCode::NOT_FOUND),
+        (Method::HEAD, manifest.to_string(), StatusCode::NOT_FOUND),
+        (Method::PUT, manifest.to_string(), StatusCode::BAD_REQUEST),
+        (Method::POST, manifest.to_string(), StatusCode::BAD_REQUEST),
+        (
+            Method::DELETE,
+            manifest.to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::GET,
+            "/v2/conformance/test/referrers/not-a-digest".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::GET,
+            format!("/v2/conformance/test/referrers/{digest}?artifactType=not-a-media-type"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::GET,
+            format!("/v2/conformance/test/referrers/{digest}?n=abc"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::GET,
+            "/v2/BAD-NAMESPACE/referrers/not-a-digest".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/token".to_string(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::PUT,
+            "/token".to_string(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::DELETE,
+            "/token".to_string(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (Method::POST, "/tokens".to_string(), StatusCode::BAD_REQUEST),
     ] {
         let request = Request::builder()
-            .method(Method::GET)
+            .method(method.clone())
             .uri(&uri)
             .body(())
             .unwrap();
         let (parts, ()) = request.into_parts();
 
         let Err(error) = handle_unknown_route(&parts) else {
-            panic!("{uri} must be rejected, not served");
+            panic!("{method} {uri} must be rejected, not served");
         };
-        assert_eq!(
-            error.status_code(),
-            StatusCode::BAD_REQUEST,
-            "{uri} must be a bad request, got {error:?}"
-        );
+        let response = error_to_response(&error, None, None);
+        assert_eq!(response.status(), expected, "{method} {uri}: {error:?}");
+        if expected == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(
+                response.headers().get(ALLOW).unwrap(),
+                "GET",
+                "a 405 must advertise the method the path serves"
+            );
+        }
     }
-}
-
-/// A namespace that does not parse is a miss on every route, referrers
-/// included: only the digest and the filter carry the `400`.
-#[test]
-fn unknown_referrers_route_with_a_bad_namespace_stays_a_miss() {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/v2/BAD-NAMESPACE/referrers/not-a-digest")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let Err(error) = handle_unknown_route(&parts) else {
-        panic!("an unmatched path must be rejected, not served");
-    };
-    assert!(
-        matches!(error, Error::NotFound(_)),
-        "an invalid namespace must stay a miss, got {error:?}"
-    );
 }
 
 #[tokio::test]
 async fn test_authenticate_and_authorize_returns_client_identity() {
-    let context = create_test_context_with_allow_policy().await;
+    let config = load_config(
+        r#"
+        [global.access_policy]
+        default = "allow"
+        rules = []
+    "#,
+    );
+    let context = create_test_server_context_from_config(&config).await;
 
     let request = Request::builder().uri("/v2/").body(()).unwrap();
     let (parts, ()) = request.into_parts();
@@ -539,17 +332,6 @@ async fn an_issued_token_is_never_cached() {
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
 }
 
-async fn create_test_context_with_allow_policy() -> ServerContext {
-    create_test_server_context_with(TestConfigOptions {
-        access_policy: Some(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            ..PolicyConfig::default()
-        }),
-        ..TestConfigOptions::default()
-    })
-    .await
-}
-
 #[test]
 fn current_trace_id_returns_none_without_otel_layer() {
     // Active tracing subscriber without any OpenTelemetry layer: span has no
@@ -585,23 +367,4 @@ fn current_trace_id_returns_hex_id_with_otel_layer() {
         trace_id.chars().all(|c| c.is_ascii_hexdigit()),
         "trace ID must be lowercase hex, got {trace_id:?}"
     );
-}
-
-#[test]
-fn inject_peer_certificate_skips_extension_when_cert_is_none() {
-    let mut request = Request::builder().uri("/").body(()).unwrap();
-    inject_peer_certificate(&mut request, None);
-    assert!(request.extensions().get::<PeerCertificate>().is_none());
-}
-
-#[test]
-fn inject_peer_certificate_inserts_extension_for_valid_cert() {
-    let cert = b"-----BEGIN CERTIFICATE-----\nMIIBIjANBgkq\n-----END CERTIFICATE-----\n".as_slice();
-    let mut request = Request::builder().uri("/").body(()).unwrap();
-    inject_peer_certificate(&mut request, Some(cert));
-    let stored = request
-        .extensions()
-        .get::<PeerCertificate>()
-        .expect("PeerCertificate extension must be present");
-    assert_eq!(stored.0.as_ref(), cert);
 }

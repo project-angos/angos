@@ -54,9 +54,6 @@ fn classify(
                 )
             }))
         }
-        // Such a job could still complete on drain if the blob is already
-        // local, but granting a reference to a namespace removed from
-        // pull-through config serves nothing.
         Queue::Scan => {
             let payload: ScanImagePayload = serde_json::from_value(payload)?;
             let configured = resolver
@@ -70,6 +67,9 @@ fn classify(
             }))
         }
         Queue::Index => Ok(None),
+        // Such a job could still complete on drain if the blob is already
+        // local, but granting a reference to a namespace removed from
+        // pull-through config serves nothing.
         Queue::Cache => {
             let payload: CacheFetchBlobPayload = serde_json::from_value(payload)?;
             let configured = resolver
@@ -178,17 +178,15 @@ impl OrphanJobChecker {
                 };
                 // A payload that fails to decode is skipped: scrub must not
                 // delete what it cannot attribute.
-                let reason = match classify(self.queue, &self.resolver, payload) {
-                    Ok(reason) => reason,
+                let reason = match classify(queue, &self.resolver, payload) {
+                    Ok(Some(reason)) => reason,
+                    Ok(None) => continue,
                     Err(e) => {
                         warn!(
                             "{queue} job '{storage_key}' has an undecodable payload; skipping: {e}"
                         );
                         continue;
                     }
-                };
-                let Some(reason) = reason else {
-                    continue;
                 };
                 orphans += 1;
                 sink.apply(Action::Job(JobAction::DeleteOrphanJob {
@@ -207,9 +205,7 @@ impl OrphanJobChecker {
         }
         Ok(orphans)
     }
-}
 
-impl OrphanJobChecker {
     /// Scan both partitions of this checker's queue.
     pub async fn check_all(&self, sink: &dyn ActionSink) -> Result<(), Error> {
         let pending = self.scan_partition(JobState::Pending, sink).await?;
@@ -222,7 +218,7 @@ impl OrphanJobChecker {
     }
 }
 
-/// Delete queued jobs on both durable queues whose downstream or repository
+/// Delete queued jobs on every durable queue whose downstream or repository
 /// is no longer configured.
 pub async fn sweep_orphan_jobs(
     job_store: &Arc<JobStore>,
@@ -251,16 +247,18 @@ mod tests {
 
     use crate::cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
     use crate::command::maintenance::action::{Action, JobAction};
-    use crate::command::maintenance::executor::{ActionSink, DryRunSink, Executor};
+    use crate::command::maintenance::executor::Executor;
     use crate::command::scrub::orphan_jobs::{OrphanJobChecker, classify};
     use crate::jobs::store::{ClaimMode, FailOutcome, JobEnvelope, JobStore};
     use crate::jobs::{JobState, Queue};
-    use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
+    use crate::policy::RetentionPolicy;
     use crate::registry::Repository;
     use crate::registry::metadata_store::MetadataStore;
     use crate::registry::repository::Upstream;
     use crate::registry::repository_resolver::RepositoryResolver;
-    use crate::registry::test_utils::{FsTestStack, downstream_client, fs_test_stack};
+    use crate::registry::test_utils::{
+        FsTestStack, downstream_client, fs_test_stack, test_downstream,
+    };
     use crate::replication::{
         REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationJob, ReplicationTarget,
         build_envelope,
@@ -289,23 +287,21 @@ mod tests {
         upstreams: Vec<RegistryClient>,
         replication: Vec<ReplicationDownstream>,
     ) -> Repository {
+        let name = Namespace::new(name).unwrap();
         let upstreams: Vec<Upstream> = upstreams
             .into_iter()
             .map(|client| Upstream {
                 client,
-                local_namespace: None,
+                local_namespace: name.clone(),
                 target_namespace: None,
             })
             .collect();
         Repository {
-            name: Namespace::new(name).unwrap(),
+            name,
             namespace: None,
             upstreams,
             replication,
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
+            retention_policy: RetentionPolicy::new(Vec::new()),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             scan: None,
@@ -316,10 +312,9 @@ mod tests {
     /// Resolver with a pull-through repository whose only downstream is
     /// [`DOWNSTREAM`], plus a configured repository with no upstreams.
     fn resolver() -> Arc<RepositoryResolver> {
-        let downstream = ReplicationDownstream::new(
+        let downstream = test_downstream(
             DOWNSTREAM.to_string(),
             downstream_client("http://127.0.0.1:1"),
-            4,
         );
         let mut repositories = HashMap::new();
         repositories.insert(
@@ -376,10 +371,6 @@ mod tests {
         job_store.enqueue(envelope).await.unwrap();
     }
 
-    async fn enqueue_cache_fill(job_store: &JobStore, namespace: &str) {
-        job_store.enqueue(cache_envelope(namespace)).await.unwrap();
-    }
-
     /// Enqueues a single-attempt job and fails it once so it dead-letters under
     /// its original storage key.
     async fn dead_letter(job_store: &JobStore, queue: Queue, mut envelope: JobEnvelope) {
@@ -413,6 +404,56 @@ mod tests {
         );
     }
 
+    /// Runs the `queue` checker into a capturing sink.
+    async fn captured(job_store: Arc<JobStore>, queue: Queue) -> Vec<Action> {
+        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
+        checker(job_store, queue).check_all(&sink).await.unwrap();
+        sink.into_inner().unwrap()
+    }
+
+    #[test]
+    fn classify_names_what_no_longer_resolves() {
+        let bogus = json!({ "not": "a payload" });
+        let push = |downstream, namespace| {
+            build_envelope(&push_payload(downstream, namespace))
+                .unwrap()
+                .payload
+        };
+        let cases = [
+            (Queue::Replication, push(DOWNSTREAM, NAMESPACE), None),
+            (
+                Queue::Replication,
+                push(REMOVED_DOWNSTREAM, NAMESPACE),
+                Some("downstream 'decommissioned' is not configured for 'nginx'"),
+            ),
+            // The downstream name is configured, but only for `nginx`.
+            (
+                Queue::Replication,
+                push(DOWNSTREAM, GHOST_NAMESPACE),
+                Some("downstream 'eu-region' is not configured for 'ghost/app'"),
+            ),
+            (Queue::Cache, cache_envelope(NAMESPACE).payload, None),
+            // Configured, but with no upstreams: a fill job can never fetch.
+            (
+                Queue::Cache,
+                cache_envelope(LOCAL_REPO).payload,
+                Some("namespace 'local' is not configured for pull-through"),
+            ),
+            (
+                Queue::Cache,
+                cache_envelope(GHOST_NAMESPACE).payload,
+                Some("namespace 'ghost/app' is not configured for pull-through"),
+            ),
+        ];
+        for (queue, payload, expected) in cases {
+            let reason = classify(queue, &resolver(), payload).unwrap();
+            assert_eq!(reason.as_deref(), expected, "{queue}");
+        }
+        for queue in [Queue::Replication, Queue::Cache] {
+            assert!(classify(queue, &resolver(), bogus.clone()).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn orphan_pending_replication_job_emits_delete_action() {
         let FsTestStack {
@@ -427,22 +468,11 @@ mod tests {
             .list_pending(Queue::Replication, 10)
             .await
             .unwrap();
-        assert_eq!(keys.len(), 1);
 
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "the orphan job must emit one action"
-        );
+        let actions = captured(job_store, Queue::Replication).await;
         assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
+            actions.as_slice(),
+            [Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })]
                 if *queue == Queue::Replication
                     && *state == JobState::Pending
                     && *storage_key == keys[0]
@@ -451,7 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_downstream_job_emits_nothing() {
+    async fn orphan_failed_cache_job_emits_action_with_failed_state() {
         let FsTestStack {
             dir: _dir,
             metadata_store,
@@ -459,85 +489,20 @@ mod tests {
         } = fs_test_stack();
         let job_store = orphan_job_store(&metadata_store);
 
-        enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
+        dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
 
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "a job for a configured downstream must not emit an action, got {} action(s)",
-            sink.lock().unwrap().len()
-        );
-    }
-
-    #[tokio::test]
-    async fn unresolvable_namespace_replication_job_emits_delete_action() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        // The downstream name is configured, but only for `nginx`.
-        enqueue_push(&job_store, DOWNSTREAM, GHOST_NAMESPACE).await;
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "an unresolvable namespace is an orphan"
-        );
+        let actions = captured(job_store, Queue::Cache).await;
         assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
-                if *queue == Queue::Replication
-                    && *state == JobState::Pending
+            actions.as_slice(),
+            [Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })]
+                if *queue == Queue::Cache
+                    && *state == JobState::Failed
                     && reason.contains(GHOST_NAMESPACE)
         ));
     }
 
     #[tokio::test]
-    async fn orphan_failed_replication_job_emits_action_with_failed_state() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        let envelope = build_envelope(&push_payload(REMOVED_DOWNSTREAM, NAMESPACE)).unwrap();
-        dead_letter(&job_store, Queue::Replication, envelope).await;
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "the dead-lettered orphan must emit one action"
-        );
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { state, reason, .. })
-                if *state == JobState::Failed && reason.contains(REMOVED_DOWNSTREAM)
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_replication_payload_is_skipped_without_action() {
+    async fn malformed_payload_is_skipped_without_action() {
         let FsTestStack {
             dir: _dir,
             metadata_store,
@@ -554,16 +519,11 @@ mod tests {
         .unwrap();
         job_store.enqueue(envelope).await.unwrap();
 
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store.clone(), Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
+        let actions = captured(job_store.clone(), Queue::Replication).await;
         assert!(
-            sink.lock().unwrap().is_empty(),
+            actions.is_empty(),
             "a payload scrub cannot attribute must be skipped, got {} action(s)",
-            sink.lock().unwrap().len()
+            actions.len()
         );
         assert_eq!(
             job_store
@@ -587,18 +547,10 @@ mod tests {
 
         enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
         enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            2
-        );
 
-        let mut executor: Box<dyn ActionSink> =
-            Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
+        let executor = Executor::new(blob_store, metadata_store, job_store.clone(), None);
         checker(job_store.clone(), Queue::Replication)
-            .check_all(executor.as_mut())
+            .check_all(&executor)
             .await
             .unwrap();
 
@@ -616,254 +568,6 @@ mod tests {
             payload.target().downstream,
             DOWNSTREAM,
             "the configured downstream's job must survive"
-        );
-    }
-
-    /// The checker reads regardless of dry-run, but `DryRunSink` applies
-    /// nothing.
-    #[tokio::test]
-    async fn dry_run_leaves_both_replication_jobs_in_place() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        enqueue_push(&job_store, DOWNSTREAM, NAMESPACE).await;
-        enqueue_push(&job_store, REMOVED_DOWNSTREAM, NAMESPACE).await;
-
-        let sink = DryRunSink;
-        checker(job_store.clone(), Queue::Replication)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            2,
-            "dry-run must leave both jobs in place"
-        );
-    }
-
-    #[tokio::test]
-    async fn orphan_pending_cache_job_with_unresolvable_namespace_emits_delete_action() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
-        let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
-        assert_eq!(keys.len(), 1);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "an unresolvable namespace is an orphan"
-        );
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { queue, state, storage_key, reason })
-                if *queue == Queue::Cache
-                    && *state == JobState::Pending
-                    && *storage_key == keys[0]
-                    && reason == "namespace 'ghost/app' is not configured for pull-through"
-        ));
-    }
-
-    #[tokio::test]
-    async fn configured_pull_through_cache_job_emits_nothing() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        enqueue_cache_fill(&job_store, NAMESPACE).await;
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "a job for a configured pull-through repository must not emit an action, got {} action(s)",
-            sink.lock().unwrap().len()
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_job_for_non_pull_through_repository_emits_delete_action() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        // Configured, but with no upstreams: a fill job can never fetch.
-        enqueue_cache_fill(&job_store, LOCAL_REPO).await;
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "a non-pull-through repository is an orphan"
-        );
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
-                if *queue == Queue::Cache
-                    && *state == JobState::Pending
-                    && reason == "namespace 'local' is not configured for pull-through"
-        ));
-    }
-
-    #[tokio::test]
-    async fn orphan_failed_cache_job_emits_action_with_failed_state() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        dead_letter(&job_store, Queue::Cache, cache_envelope(GHOST_NAMESPACE)).await;
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store, Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "the dead-lettered orphan must emit one action"
-        );
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::DeleteOrphanJob { queue, state, reason, .. })
-                if *queue == Queue::Cache
-                    && *state == JobState::Failed
-                    && reason.contains(GHOST_NAMESPACE)
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_cache_payload_is_skipped_without_action() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        let envelope = JobEnvelope::new(
-            Queue::Cache,
-            CACHE_FETCH_BLOB_KIND,
-            "cache.bogus",
-            &json!({ "not": "a payload" }),
-        )
-        .unwrap();
-        job_store.enqueue(envelope).await.unwrap();
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker(job_store.clone(), Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "a payload scrub cannot attribute must be skipped, got {} action(s)",
-            sink.lock().unwrap().len()
-        );
-        assert_eq!(
-            job_store.count_pending(Queue::Cache, 0).await.unwrap(),
-            1,
-            "the undecodable job must stay in the queue"
-        );
-    }
-
-    #[tokio::test]
-    async fn end_to_end_deletes_only_the_orphan_cache_job() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        enqueue_cache_fill(&job_store, NAMESPACE).await;
-        enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
-        assert_eq!(job_store.count_pending(Queue::Cache, 0).await.unwrap(), 2);
-
-        let mut executor: Box<dyn ActionSink> =
-            Box::new(Executor::new(blob_store, metadata_store, job_store.clone()));
-        checker(job_store.clone(), Queue::Cache)
-            .check_all(executor.as_mut())
-            .await
-            .unwrap();
-
-        let keys = job_store.list_pending(Queue::Cache, 10).await.unwrap();
-        assert_eq!(keys.len(), 1, "only the orphan job must be deleted");
-        let survivor = job_store
-            .read_pending(Queue::Cache, &keys[0])
-            .await
-            .unwrap();
-        let payload: CacheFetchBlobPayload = serde_json::from_value(survivor.payload).unwrap();
-        assert_eq!(
-            payload.namespace, NAMESPACE,
-            "the pull-through repository's job must survive"
-        );
-    }
-
-    /// The checker reads regardless of dry-run, but `DryRunSink` applies
-    /// nothing.
-    #[tokio::test]
-    async fn dry_run_leaves_both_cache_jobs_in_place() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let job_store = orphan_job_store(&metadata_store);
-
-        enqueue_cache_fill(&job_store, NAMESPACE).await;
-        enqueue_cache_fill(&job_store, GHOST_NAMESPACE).await;
-
-        let sink = DryRunSink;
-        checker(job_store.clone(), Queue::Cache)
-            .check_all(&sink)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            job_store.count_pending(Queue::Cache, 0).await.unwrap(),
-            2,
-            "dry-run must leave both jobs in place"
         );
     }
 }

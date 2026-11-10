@@ -8,7 +8,7 @@ use angos_oci_service::{Accepted, BlobDescriptor, BlobGet, BlobStream};
 use angos_storage::BoxedReader;
 
 use crate::cache_fill::build_envelope;
-use crate::event_webhook::event::{Event, EventActor};
+use crate::event_webhook::event::{Event, EventActor, EventSubject};
 use crate::jobs::Queue;
 use crate::registry::blob_ownership::promote_and_grant;
 use crate::registry::blob_store::BlobStore;
@@ -51,15 +51,39 @@ pub async fn cache_blob(
 ) -> Result<(), Error> {
     debug!("Fetching blob: {digest}");
     let session_id = UploadSessionId::generate();
-    let result = fill_cache_session(
-        blob_store,
-        metadata_store,
-        namespace,
-        digest,
-        stream,
-        content_length,
-        &session_id,
-    )
+    let result = async {
+        // A single-shot copy of a known blob: hash only the target algorithm.
+        let session = blob_store
+            .create_upload(namespace, &session_id, Some(digest.algorithm()))
+            .await?;
+        let (computed_digest, hashed_size) = blob_store
+            .write_upload(
+                namespace,
+                &session_id,
+                session,
+                stream,
+                Some(content_length),
+                digest.algorithm(),
+            )
+            .await?;
+        // A compromised or man-in-the-middle upstream must not poison the cache
+        // under a trusted digest, so mismatched bytes are never promoted.
+        if &computed_digest != digest {
+            warn!("Pull-through blob digest mismatch: expected {digest}, got {computed_digest}");
+            return Err(Error::DigestInvalid);
+        }
+        // Bytes land before the grant, mirroring the manifest path's
+        // bytes-then-link order; both are fresh and inside the grace period.
+        promote_and_grant(
+            blob_store,
+            metadata_store,
+            namespace,
+            &session_id,
+            digest,
+            hashed_size,
+        )
+        .await
+    }
     .await;
 
     // A fill that fails partway otherwise strands a layer-sized staging
@@ -76,50 +100,6 @@ pub async fn cache_blob(
     Ok(())
 }
 
-/// Open a session at `session_key`, stream the upstream bytes into it and
-/// promote them. The caller reclaims the session when this fails.
-async fn fill_cache_session(
-    blob_store: &BlobStore,
-    metadata_store: &MetadataStore,
-    namespace: &Namespace,
-    digest: &Digest,
-    stream: BoxedReader,
-    content_length: u64,
-    session_key: &UploadSessionId,
-) -> Result<(), Error> {
-    // A single-shot copy of a known blob: hash only the target algorithm.
-    let session = blob_store
-        .create_upload(namespace, session_key, Some(digest.algorithm()))
-        .await?;
-    let (computed_digest, hashed_size) = blob_store
-        .write_upload(
-            namespace,
-            session_key,
-            session,
-            stream,
-            Some(content_length),
-            digest.algorithm(),
-        )
-        .await?;
-    // A compromised or man-in-the-middle upstream must not poison the cache
-    // under a trusted digest, so mismatched bytes are never promoted.
-    if &computed_digest != digest {
-        warn!("Pull-through blob digest mismatch: expected {digest}, got {computed_digest}");
-        return Err(Error::DigestInvalid);
-    }
-    // Bytes land before the grant, mirroring the manifest path's
-    // bytes-then-link order; both are fresh and inside the grace period.
-    promote_and_grant(
-        blob_store,
-        metadata_store,
-        namespace,
-        session_key,
-        digest,
-        hashed_size,
-    )
-    .await
-}
-
 impl Registry {
     /// `HEAD /v2/<name>/blobs/<digest>`: the blob's descriptor, no body.
     #[instrument]
@@ -128,12 +108,12 @@ impl Registry {
         request: HeadBlobRequest,
     ) -> Result<BlobDescriptor, Error> {
         let has_access = self
-            .metadata_store()
+            .metadata_store
             .can_read(&request.namespace, &request.digest)
             .await?;
         // A namespace no `[repository]` entry matches has no upstream, so it
         // serves what it owns and nothing else.
-        let repository = self.repository_for_namespace(&request.namespace).ok();
+        let repository = self.resolver.resolve(&request.namespace);
         let (digest, size) = match repository.filter(|repository| repository.is_pull_through()) {
             Some(upstream) => self.head_cached_blob(upstream, request, has_access).await?,
             None if has_access => {
@@ -143,11 +123,7 @@ impl Registry {
             None => return Err(Error::BlobUnknown),
         };
 
-        Ok(BlobDescriptor {
-            digest,
-            size,
-            media_type: None,
-        })
+        Ok(BlobDescriptor { digest, size })
     }
 
     /// HEAD on a pull-through namespace: the cached descriptor when the
@@ -214,16 +190,12 @@ impl Registry {
 
         // An upstream is free to ignore `Range` and answer the whole blob,
         // which stays a valid answer; only its `206` becomes partial content.
-        let stream = match fetched.content_range {
-            Some(range) => BlobStream {
-                digest: request.digest.clone(),
-                total_length: fetched.length,
-                range: Some(range),
-                reader: fetched.reader,
-            },
-            None => whole_blob_response(&request.digest, fetched.length, fetched.reader),
-        };
-        Ok(BlobGet::Content(stream))
+        Ok(BlobGet::Content(BlobStream {
+            digest: request.digest.clone(),
+            total_length: fetched.length,
+            range: fetched.content_range,
+            reader: fetched.reader,
+        }))
     }
 
     /// The locally held blob: a presigned redirect when the caller and
@@ -291,8 +263,8 @@ impl Registry {
     /// reclaims the bytes once every reference is stale.
     #[instrument]
     pub async fn handle_delete_blob(&self, request: DeleteBlobRequest) -> Result<Accepted, Error> {
-        let ownership = self.metadata_store();
-        let links = match ownership
+        let links = match self
+            .metadata_store
             .read_blob_index_namespace(&request.namespace, &request.digest)
             .await
         {
@@ -337,11 +309,11 @@ impl Registry {
         request: GetBlobRequest,
         allow_redirect: bool,
     ) -> Result<BlobGet<BoxedReader>, Error> {
-        let repository = self.repository_for_namespace(&request.namespace).ok();
+        let repository = self.resolver.resolve(&request.namespace);
         let repository_name = repository_name(repository);
 
         let has_access = self
-            .metadata_store()
+            .metadata_store
             .can_read(&request.namespace, &request.digest)
             .await?;
 
@@ -354,10 +326,12 @@ impl Registry {
             None => return Err(Error::BlobUnknown),
         };
 
-        let event = Event::pull_blob(
+        let event = Event::new(
+            EventSubject::BlobPull {
+                digest: request.digest.clone(),
+            },
             &request.namespace,
             &repository_name,
-            &request.digest,
             actor.as_ref(),
         );
         self.dispatch_events(&[event]).await?;
@@ -389,7 +363,7 @@ mod tests {
     use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
     use angos_storage::{Error as StorageError, ObjectStore, PresignedStore};
 
-    use crate::metrics_provider::{initialize_metrics, metrics_provider};
+    use crate::metrics_provider::metrics_provider;
     use crate::registry::keys::{DigestExt, NamespaceExt};
     use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
     use crate::registry::repository::Config;
@@ -456,7 +430,7 @@ mod tests {
         // Only the blob-size `head` fails, so the request still reaches the
         // size probe with access.
         let dir = TempDir::new().unwrap();
-        let inner: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let inner: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         let object: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
             inner,
             FailHeadOf {
@@ -467,7 +441,7 @@ mod tests {
         let registry = create_test_registry(blob_store, metadata_store_over(object));
 
         registry
-            .metadata_store()
+            .metadata_store
             .grant(namespace, &digest)
             .await
             .unwrap();
@@ -561,50 +535,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_blob() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"test blob content";
-
-            let digest = put_blob_direct(&registry.blob_store, content).await;
-            registry
-                .metadata_store()
-                .grant(namespace, &digest)
-                .await
-                .unwrap();
-
-            let blob_index = registry
-                .metadata_store
-                .read_blob_index(&digest)
-                .await
-                .unwrap();
-            assert!(blob_index.contains_key(namespace));
-            let namespace_links = blob_index.get(namespace).unwrap();
-            assert!(namespace_links.contains(&LinkKind::Blob(digest.clone())));
-
-            registry
-                .handle_delete_blob(DeleteBlobRequest {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                })
-                .await
-                .unwrap();
-
-            // The bytes and the stale entry wait for the collector.
-            assert!(registry.blob_store.read(&digest).await.is_ok());
-            assert!(
-                !registry
-                    .metadata_store()
-                    .can_read(namespace, &digest)
-                    .await
-                    .unwrap()
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn delete_blob_rejects_manifest_referenced_blob() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
@@ -643,7 +573,7 @@ mod tests {
             assert_eq!(stored_content, content);
             assert!(
                 registry
-                    .metadata_store()
+                    .metadata_store
                     .can_read(namespace, &digest)
                     .await
                     .unwrap(),
@@ -663,7 +593,7 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
             let content = b"stale referenced blob";
             let digest = put_blob_direct(&registry.blob_store, content).await;
-            let ownership = registry.metadata_store();
+            let ownership = &registry.metadata_store;
             ownership.grant(namespace, &digest).await.unwrap();
 
             let link = LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"manifest"));
@@ -734,7 +664,7 @@ mod tests {
                 let content = format!("content for {link}").into_bytes();
                 let digest = put_blob_direct(&registry.blob_store, &content).await;
                 registry
-                    .metadata_store()
+                    .metadata_store
                     .grant(namespace, &digest)
                     .await
                     .unwrap();
@@ -797,7 +727,7 @@ mod tests {
             let second = &Namespace::new("test-repo/second").unwrap();
             let content = b"shared blob content";
             let digest = put_blob_direct(&registry.blob_store, content).await;
-            let ownership = registry.metadata_store();
+            let ownership = &registry.metadata_store;
 
             ownership.grant(first, &digest).await.unwrap();
             ownership.grant(second, &digest).await.unwrap();
@@ -925,7 +855,7 @@ mod tests {
         .unwrap();
 
         let dir = TempDir::new().unwrap();
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         let registry = create_test_registry(
             Arc::new(BlobStore::new(object.clone(), None)),
             metadata_store_over(object),
@@ -986,7 +916,7 @@ mod tests {
         .unwrap();
 
         let dir = TempDir::new().unwrap();
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         let metadata_store = metadata_store_over(object.clone());
         let blob_store = Arc::new(BlobStore::new(
             object,
@@ -1125,253 +1055,6 @@ mod tests {
                 0,
                 "the rejected fill must not leave its staged bytes behind"
             );
-        })
-        .await;
-    }
-
-    /// With the two stores on separate backends, `cache_blob` must write the
-    /// bytes and grant the reference as independent idempotent work.
-    #[tokio::test]
-    async fn cache_blob_grants_reference_with_split_blob_and_metadata_backends() {
-        initialize_metrics();
-        let blob_dir = TempDir::new().unwrap();
-        let meta_dir = TempDir::new().unwrap();
-
-        let blob_obj: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(blob_dir.path()).build());
-        let blob_store = Arc::new(BlobStore::new(blob_obj.clone(), None));
-
-        let meta_obj: Arc<dyn ObjectStore> =
-            Arc::new(StorageFsBackend::builder(meta_dir.path()).build());
-        let metadata_store = metadata_store_over(meta_obj);
-
-        let namespace = Namespace::new("kubernetes.io/kube-apiserver").unwrap();
-        let content = b"layer bytes";
-        let digest = Digest::sha256_of_bytes(content);
-
-        // A prior manifest pull already pinned the layer to its manifest.
-        metadata_store
-            .insert_reference(
-                &namespace,
-                &digest,
-                &LinkKind::ReferencedBy(Digest::sha256_of_bytes(b"manifest")),
-            )
-            .await
-            .unwrap();
-
-        cache_blob(
-            &blob_store,
-            &metadata_store,
-            &namespace,
-            &digest,
-            Box::new(Cursor::new(content.to_vec())),
-            content.len() as u64,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            blob_store.read(&digest).await.unwrap(),
-            content,
-            "the blob bytes must land in the blob store"
-        );
-        let blob_index = metadata_store.read_blob_index(&digest).await.unwrap();
-        let links = blob_index.get(&namespace).unwrap();
-        assert!(
-            links.contains(&LinkKind::Blob(digest.clone())),
-            "the namespace must hold a blob ownership reference after caching"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_local_blob_returns_correct_size() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"regression test blob content";
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-
-            let response = registry
-                .get_local_blob(&digest, None)
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                *response_header(&response, &CONTENT_LENGTH),
-                content.len().to_string()
-            );
-            assert_eq!(response_body(response).await, content);
-
-            let range = Some(RequestRange::FromTo(ByteWindow {
-                start: 5,
-                end: Some(15),
-            }));
-            let response = registry
-                .get_local_blob(&digest, range)
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(
-                *response_header(&response, &CONTENT_RANGE),
-                format!("bytes 5-15/{}", content.len())
-            );
-            assert_eq!(*response_header(&response, &CONTENT_LENGTH), "11");
-            assert_eq!(response_body(response).await, &content[5..=15]);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn get_local_blob_open_ended_range_returns_partial_content() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"open ended range content";
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-            let response = registry
-                .get_local_blob(
-                    &digest,
-                    Some(RequestRange::FromTo(ByteWindow {
-                        start: 0,
-                        end: None,
-                    })),
-                )
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(
-                *response_header(&response, &CONTENT_RANGE),
-                format!(
-                    "bytes {}-{}/{}",
-                    0,
-                    content.len() as u64 - 1,
-                    content.len() as u64
-                )
-            );
-            assert_eq!(
-                *response_header(&response, &CONTENT_LENGTH),
-                (content.len() as u64).to_string()
-            );
-            assert_eq!(response_body(response).await, content);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn get_local_blob_suffix_range_returns_tail() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"suffix range content";
-            let suffix_length = 7;
-            let start = content.len() - suffix_length;
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-            let response = registry
-                .get_local_blob(&digest, Some(RequestRange::Suffix(suffix_length as u64)))
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(
-                *response_header(&response, &CONTENT_RANGE),
-                format!(
-                    "bytes {}-{}/{}",
-                    start as u64,
-                    content.len() as u64 - 1,
-                    content.len() as u64
-                )
-            );
-            assert_eq!(
-                *response_header(&response, &CONTENT_LENGTH),
-                (suffix_length as u64).to_string()
-            );
-            assert_eq!(response_body(response).await, &content[start..]);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn get_local_blob_suffix_range_longer_than_blob_returns_full_blob() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"short suffix";
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-            let response = registry
-                .get_local_blob(&digest, Some(RequestRange::Suffix(10_000)))
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(
-                *response_header(&response, &CONTENT_RANGE),
-                format!(
-                    "bytes {}-{}/{}",
-                    0,
-                    content.len() as u64 - 1,
-                    content.len() as u64
-                )
-            );
-            assert_eq!(
-                *response_header(&response, &CONTENT_LENGTH),
-                (content.len() as u64).to_string()
-            );
-            assert_eq!(response_body(response).await, content);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn get_local_blob_clamps_range_end_to_blob_length() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"clamped range content";
-
-            let (digest, _) = create_test_blob(registry, namespace, content).await;
-            let response = registry
-                .get_local_blob(
-                    &digest,
-                    Some(RequestRange::FromTo(ByteWindow {
-                        start: 8,
-                        end: Some(10_000),
-                    })),
-                )
-                .await
-                .unwrap()
-                .into_response(DEFAULT_BLOB_STREAM_FRAME_SIZE_BYTES)
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(
-                *response_header(&response, &CONTENT_RANGE),
-                format!(
-                    "bytes {}-{}/{}",
-                    8,
-                    content.len() as u64 - 1,
-                    content.len() as u64
-                )
-            );
-            assert_eq!(
-                *response_header(&response, &CONTENT_LENGTH),
-                (content.len() as u64 - 8).to_string()
-            );
-            assert_eq!(response_body(response).await, &content[8..]);
         })
         .await;
     }

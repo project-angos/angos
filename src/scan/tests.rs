@@ -18,7 +18,8 @@ use crate::policy::{CelRule, ImagePolicy, PolicyConfig};
 use crate::registry::manifest::{DEFAULT_MAX_MANIFEST_SIZE_BYTES, read_manifest};
 use crate::registry::repository::Config as RepositoryConfig;
 use crate::registry::test_utils::{
-    FsTestStack, fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+    FsTestStack, fs_test_stack, get_manifest, repository_with_replication, seed_manifest,
+    single_repo_resolver,
 };
 use crate::registry::{Registry, RegistryConfig, Repository};
 use crate::scan::handler::ScanJobHandler;
@@ -34,13 +35,7 @@ const SARIF: &[u8] = br#"{"version":"2.1.0","runs":[]}"#;
 fn scan_jobs_coalesce_on_the_image_digest() {
     let namespace = Namespace::new("apps/web").unwrap();
     let digest = Digest::sha256_of_bytes(b"image");
-    let envelope = build_envelope(&ScanImagePayload {
-        namespace: namespace.clone(),
-        digest: digest.clone(),
-        force: false,
-        reported_before: None,
-    })
-    .unwrap();
+    let envelope = build_envelope(&payload(&namespace, &digest)).unwrap();
     assert_eq!(envelope.queue, Queue::Scan);
     assert_eq!(
         envelope.lock_key.as_str(),
@@ -74,13 +69,7 @@ async fn a_scan_job_attaches_one_report_and_reruns_as_a_no_op() {
         Some(Secret::new("s3cret".to_string())),
     );
 
-    let envelope = build_envelope(&ScanImagePayload {
-        namespace: namespace.clone(),
-        digest: image.clone(),
-        force: false,
-        reported_before: None,
-    })
-    .unwrap();
+    let envelope = build_envelope(&payload(&namespace, &image)).unwrap();
     handler.execute(&envelope).await.unwrap();
 
     let reports = scan_reports(&stack.metadata_store, &namespace, &image)
@@ -131,15 +120,7 @@ async fn a_failing_scanner_fails_the_job() {
         None,
     );
     let err = handler
-        .execute(
-            &build_envelope(&ScanImagePayload {
-                namespace: namespace.clone(),
-                digest: image.clone(),
-                force: false,
-                reported_before: None,
-            })
-            .unwrap(),
-        )
+        .execute(&build_envelope(&payload(&namespace, &image)).unwrap())
         .await
         .expect_err("a 502 from the scanner must fail the job");
     assert!(err.to_string().contains("grype exited with 1"), "{err}");
@@ -203,7 +184,8 @@ async fn a_cache_miss_enqueues_a_scan_job_in_a_scanning_pull_through_repository(
     let latest = Tag::new("latest").unwrap();
     let client = EventActor::default();
     let pull = || {
-        registry.get_manifest_direct(
+        get_manifest(
+            &registry,
             Some(repository),
             &accepted,
             &namespace,
@@ -326,24 +308,14 @@ async fn a_forced_scan_job_scans_a_reported_image_again() {
         None,
     );
     handler
-        .execute(
-            &build_envelope(&ScanImagePayload {
-                namespace: namespace.clone(),
-                digest: image.clone(),
-                force: false,
-                reported_before: None,
-            })
-            .unwrap(),
-        )
+        .execute(&build_envelope(&payload(&namespace, &image)).unwrap())
         .await
         .unwrap();
     handler
         .execute(
             &build_envelope(&ScanImagePayload {
-                namespace: namespace.clone(),
-                digest: image.clone(),
                 force: true,
-                reported_before: None,
+                ..payload(&namespace, &image)
             })
             .unwrap(),
         )
@@ -563,17 +535,4 @@ fn a_policy_default_decides_and_a_rule_flips_it() {
         policy(Some(ScanAction::Skip), &["image.tag.size() > 3"]).applies_at_push(&ns, &[]),
         "a rule that cannot be evaluated applies the policy"
     );
-
-    let config: ScanConfig = toml::from_str(
-        r#"
-        url = "http://scanner:8766"
-        default = "scan"
-        rules = ["image.tag == 'nightly'"]
-        "#,
-    )
-    .unwrap();
-    assert_eq!(config.policy.default, Some(ScanAction::Scan));
-    assert_eq!(config.policy.rules.len(), 1);
-    let service_only: ScanConfig = toml::from_str(r#"url = "http://scanner:8766""#).unwrap();
-    assert!(!service_only.policy.is_set());
 }

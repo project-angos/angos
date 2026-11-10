@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -12,99 +11,33 @@ use crate::pagination::paginated;
 use crate::types::{Children, ChildrenPage, ObjectMeta, Page};
 use crate::upload_session::{ByteStream, MultipartUploadPage};
 
-/// A lazily-streamed flat enumeration of object keys, one `Result` per key.
-/// [`ObjectStore::list_all`] returns this boxed form so it stays object-safe
-/// behind `dyn ObjectStore` while backends pick their own concrete stream.
+/// Boxed so [`ObjectStore`] stays object-safe.
 pub type KeyStream<'a> = Pin<Box<dyn Stream<Item = Result<String, Error>> + Send + 'a>>;
 
-/// Normalise `prefix` to a directory boundary for [`ObjectStore::delete_prefix`].
-///
-/// A non-empty prefix that does not already end with `/` gets one appended so
-/// the delete is scoped to the directory `prefix/` and never matches a key that
-/// merely shares a string prefix (e.g. `tags/v1` becomes `tags/v1/`, which does
-/// not affect `tags/v1-rc/...`). An empty prefix and a prefix that already ends
-/// with `/` are returned unchanged.
-///
-/// Backends share this so their `delete_prefix` semantics agree byte-for-byte.
-#[must_use]
-pub fn dir_prefix(prefix: &str) -> Cow<'_, str> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Cow::Borrowed(prefix)
-    } else {
-        Cow::Owned(format!("{prefix}/"))
-    }
-}
-
-/// Universal object-storage floor.
-///
-/// Every storage backend implements this. Both FS and S3 can express every
-/// operation here: object CRUD, prefix-batch delete, head metadata, two
-/// listing modes (flat-recursive and one-level-children, separator hard-coded
-/// to `/`), and the keyed, append-only upload primitive (FS appends to a file;
-/// S3 drives its native multipart protocol, hidden from consumers).
-///
-/// # Idempotency
-///
-/// `delete` and `delete_prefix` are idempotent: deleting a missing key or a
-/// prefix with nothing under it counts as success. `get` and `head` on a
-/// missing key return [`Error::NotFound`].
-///
-/// # Uploads
-///
-/// A single append-only upload primitive that both FS (append-mode file) and
-/// S3 (multipart protocol) implement, hiding the S3 multipart wire details
-/// (parts, upload IDs, staged remainders) from consumers. Every upload is
-/// addressed solely by its `key`; there is no caller-held session value. The
-/// caller drives an upload at a fresh key by calling
-/// [`ObjectStore::write_upload`] per chunk, and finally
-/// [`ObjectStore::complete_upload`] or [`ObjectStore::abort_upload`]. After
-/// `complete_upload`, the assembled object is visible via the read methods at
-/// `key`.
-///
-/// The S3 backend recovers all multipart state (the in-flight upload id, the
-/// committed parts, and the staged sub-part remainder) from S3 itself on every
-/// call, so nothing has to be persisted by the caller between calls. The staged
-/// remainder lives at a `staged/<offset>` child of the upload key's
-/// container: the backend derives that location from `key` alone (it replaces
-/// `key`'s final path segment with `staged/<offset>`, where `offset` is the
-/// number of bytes already committed to parts). This mirrors the historical
-/// `.../_uploads/<uuid>/staged/<offset>` layout so it stays backward
-/// compatible.
+/// The storage floor every backend implements. Deletes are idempotent; `get`
+/// and `head` on a missing key return [`Error::NotFound`]. An upload is
+/// addressed by its key alone: `write_upload` per chunk, then
+/// `complete_upload` or `abort_upload`.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
-    /// Read the full object body into memory.
     async fn get(&self, key: &str) -> Result<Vec<u8>, Error>;
 
-    /// Open a streaming reader over the object body, optionally starting at
-    /// `offset` bytes. The returned `u64` is the **total** object size (not
-    /// the remaining length after `offset`).
+    /// The returned `u64` is the **total** object size, not what remains after
+    /// `offset`.
     async fn get_stream(&self, key: &str, offset: Option<u64>)
     -> Result<(BoxedReader, u64), Error>;
 
-    /// Write `data` to `key`, replacing any existing object atomically.
+    /// Replaces any existing object atomically.
     async fn put(&self, key: &str, data: Bytes) -> Result<(), Error>;
 
-    /// Delete `key`. Missing key counts as success.
     async fn delete(&self, key: &str) -> Result<(), Error>;
 
-    /// Delete every object under the directory `prefix`.
-    ///
-    /// The prefix is treated as a directory boundary: a non-empty prefix is
-    /// normalised to a trailing `/`, then every object
-    /// whose key sits under that directory is removed. A key that merely shares
-    /// a string prefix is never affected: `delete_prefix("tags/v1")` deletes
-    /// `tags/v1/...` but leaves `tags/v1-rc/...` untouched.
-    ///
-    /// A prefix with nothing under it counts as success. An empty prefix is a
-    /// no-op (it is never normalised to the store root, so it cannot delete
-    /// every object).
+    /// Deletes everything under the directory `prefix`: `tags/v1` never touches
+    /// `tags/v1-rc/...`. An empty prefix is a no-op, never the whole store.
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error>;
 
-    /// Return the object's size and (when available) `ETag` and
-    /// last-modified timestamp without reading the body.
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error>;
 
-    /// Whether `key` holds an object: a `head` that reads `NotFound` as `false`.
     async fn exists(&self, key: &str) -> Result<bool, Error> {
         match self.head(key).await {
             Ok(_) => Ok(true),
@@ -113,9 +46,7 @@ pub trait ObjectStore: Send + Sync {
         }
     }
 
-    /// Flat-recursive enumeration: returns up to `n` keys under `prefix`,
-    /// without grouping by `/`. Pass `token` from the previous call to
-    /// resume.
+    /// Up to `n` keys under `prefix`, recursively.
     async fn list(
         &self,
         prefix: &str,
@@ -125,17 +56,13 @@ pub trait ObjectStore: Send + Sync {
         self.list_after(prefix, n, token, None).await
     }
 
-    /// Create the object only when the key is absent. `false` means it
-    /// already exists (any content). The check and the write are one atomic
-    /// step on every backend: `link(2)` on FS, `If-None-Match: *` on S3. A
-    /// provider that cannot honour that atomically must error rather than
-    /// overwrite.
+    /// `false` when the key already exists. Atomic on every backend (`link(2)`
+    /// on FS, `If-None-Match: *` on S3); a provider that cannot honour that
+    /// must error rather than overwrite.
     async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error>;
 
-    /// Like [`Self::list`], but the enumeration starts strictly after the
-    /// relative key `start_after` on a chain's first page (`token` wins when
-    /// both are set). This is what serves a `last`-cursor page straight off
-    /// the backend's ordered enumeration.
+    /// [`Self::list`] starting strictly after `start_after`; `token` wins when
+    /// both are set.
     async fn list_after(
         &self,
         prefix: &str,
@@ -144,10 +71,8 @@ pub trait ObjectStore: Send + Sync {
         start_after: Option<String>,
     ) -> Result<Page<String>, Error>;
 
-    /// One-level enumeration: returns the immediate sub-prefixes under
-    /// `prefix` plus any objects sitting directly at that level (the `/`
-    /// separator is hard-coded). `start_after` skips entries up to and
-    /// including the given child name; `token` resumes a truncated page.
+    /// The immediate children of `prefix`, strictly after the child name
+    /// `start_after`.
     async fn list_children(
         &self,
         prefix: &str,
@@ -156,31 +81,18 @@ pub trait ObjectStore: Send + Sync {
         start_after: Option<String>,
     ) -> Result<ChildrenPage, Error>;
 
-    /// Every key under `prefix` in ascending order, its [`ObjectStore::list`]
-    /// pages drained one at a time as the stream is polled: what a caller that
-    /// stops at a key, or reads newest first, walks.
+    /// Every key under `prefix` in ascending order.
     fn list_in_order<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
         Box::pin(paginated(move |token| self.list(prefix, 1000, token)))
     }
 
-    /// Flat-recursive enumeration of *every* key under `prefix`, streamed
-    /// lazily with no caller-managed continuation token. Keys arrive in no
-    /// guaranteed order.
-    ///
-    /// The default is [`ObjectStore::list_in_order`], which FS overrides to
-    /// walk its tree once. S3 overrides this instead, walking disjoint key
-    /// ranges concurrently, so a whole-store scan (scrub, migration) is bounded
-    /// by its slowest range rather than by one continuation-token chain.
+    /// Every key under `prefix`, in no guaranteed order, so S3 can walk key
+    /// ranges concurrently.
     fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
         self.list_in_order(prefix)
     }
 
-    /// Complete one-level enumeration: every immediate child under `prefix`.
-    ///
-    /// The default drains [`ObjectStore::list_children`] pages serially.
-    /// Backends override it with their cheapest complete form: FS reads the
-    /// directory once, S3 walks disjoint name ranges concurrently, so callers
-    /// needing the full child set use this instead of paging themselves.
+    /// Every immediate child of `prefix`.
     async fn list_all_children(&self, prefix: &str) -> Result<Children, Error> {
         let mut sub_prefixes = Vec::new();
         let mut objects = Vec::new();
@@ -199,25 +111,16 @@ pub trait ObjectStore: Send + Sync {
         }
     }
 
-    /// Server-side copy from `source` to `destination`, returning the source's
-    /// size. Backends choose whether to issue a single-shot copy or a
-    /// multipart copy based on source size and backend-specific thresholds.
+    /// Server-side copy, returning the source's size.
     async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error>;
 
-    /// Move `source` to `destination`. The default is a size-checked `copy`
-    /// then a `delete` of the source, which is correct for every backend.
-    /// Backends with a cheaper primitive (notably a same-filesystem `rename`,
-    /// which is atomic and never reads the object body into memory) should
-    /// override this, so a large staged blob promoted to its canonical
-    /// location is moved without buffering the whole object.
+    /// Defaults to a size-checked copy then delete.
     async fn move_object(&self, source: &str, destination: &str) -> Result<(), Error> {
         verified_move(self, source, destination).await
     }
 
-    /// Append `body` to the upload at `key`, returning the new total uploaded
-    /// size. `Some(len)` declares an exact byte count and is validated;
-    /// `None` streams the body to EOF (a chunked request with no
-    /// `Content-Length`). Append-only.
+    /// Appends `body`, returning the new total size. `Some(len)` is an exact,
+    /// validated length; `None` streams to EOF.
     async fn write_upload(
         &self,
         key: &str,
@@ -225,33 +128,21 @@ pub trait ObjectStore: Send + Sync {
         len: Option<u64>,
     ) -> Result<u64, Error>;
 
-    /// Finalise the upload at `key`: the assembled object becomes visible at
-    /// `key` via the read methods (an empty object when nothing was written).
-    /// The caller verifies it, then publishes it with
-    /// [`ObjectStore::promote_upload`].
+    /// Makes the assembled object readable at `key`, empty when nothing was
+    /// written.
     async fn complete_upload(&self, key: &str) -> Result<(), Error>;
 
-    /// Publish the completed upload at `key` as `destination`, then remove
-    /// it. `size` is the length the caller verified, and a backend whose
-    /// upload an in-flight write can still grow must publish exactly that
-    /// many bytes. The default [`verified_move`] suits a backend whose
-    /// completed upload no longer changes.
+    /// Publishes the completed upload as `destination`. A backend whose upload
+    /// an in-flight write can still grow must publish exactly the verified
+    /// `size` bytes.
     async fn promote_upload(&self, key: &str, destination: &str, _size: u64) -> Result<(), Error> {
         verified_move(self, key, destination).await
     }
 
-    /// Discard the upload at `key` and all backend state it owns (in-progress
-    /// multipart(s) for `key` on S3, plus any staged remainder). Idempotent
-    /// (missing state counts as success).
+    /// Discards the upload and all backend state it owns. Idempotent.
     async fn abort_upload(&self, key: &str) -> Result<(), Error>;
 
-    /// List in-flight multipart uploads store-wide, one page at a time.
-    /// `key_marker`/`upload_id_marker` continue a previous page; pass `None`
-    /// for both to start. This is a raw primitive: orphan detection (age
-    /// thresholds, live-session checks) is the caller's responsibility.
-    ///
-    /// Defaults to an empty page: backends without a multipart protocol (FS,
-    /// memory) have no in-flight uploads to report.
+    /// In-flight multipart uploads store-wide; empty on backends without them.
     async fn list_multipart_uploads(
         &self,
         _key_marker: Option<&str>,
@@ -331,15 +222,11 @@ mod tests {
         }
     }
 
-    /// The hooked store and its copy counter.
     fn hooked(
         dir: &TempDir,
         truncations: usize,
-    ) -> (
-        HookedStore<Arc<dyn ObjectStore>, TruncateDestination>,
-        Arc<AtomicUsize>,
-    ) {
-        let inner: Arc<dyn ObjectStore> = Arc::new(fs::Backend::builder(dir.path()).build());
+    ) -> (HookedStore<TruncateDestination>, Arc<AtomicUsize>) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(fs::Backend::new(dir.path(), false));
         let copies = Arc::new(AtomicUsize::new(0));
         let hook = TruncateDestination {
             inner: Arc::clone(&inner),

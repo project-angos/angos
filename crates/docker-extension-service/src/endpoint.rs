@@ -1,19 +1,13 @@
-//! Parse an HTTP method and URL path into a Docker V2 extension [`Endpoint`].
-//!
-//! The only endpoint is the catalog, `GET /v2/_catalog`. A path this surface
-//! does not serve returns `None`, so a caller can try the next surface.
+//! Routing for the Docker V2 extension surface: the catalog only.
 
 use http::Method;
-use serde::Deserialize;
 
-/// A Docker Registry V2 extension operation and the query values it carries.
+use crate::CatalogRequest;
+
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     /// `GET /v2/_catalog`.
-    ListCatalog {
-        n: Option<u16>,
-        last: Option<String>,
-    },
+    ListCatalog(CatalogRequest),
 }
 
 impl Endpoint {
@@ -21,25 +15,19 @@ impl Endpoint {
     #[must_use]
     pub fn endpoint_name(&self) -> &'static str {
         match self {
-            Endpoint::ListCatalog { .. } => "list-catalog",
+            Endpoint::ListCatalog(_) => "list-catalog",
         }
     }
 }
 
-#[derive(Deserialize, Default)]
-struct PaginationQuery {
-    n: Option<u16>,
-    last: Option<String>,
-}
-
-/// Parse `(method, path, query)` into a Docker extension [`Endpoint`], or
-/// `None` when the path is not the catalog. `query` is the raw query without `?`.
+/// `None` when the path is not the catalog, so a caller can try the next
+/// surface. `query` is the raw query without `?`.
 #[must_use]
 pub fn parse(method: &Method, path: &str, query: Option<&str>) -> Option<Endpoint> {
     if path == "/v2/_catalog" && *method == Method::GET {
-        let PaginationQuery { n, last } =
-            serde_html_form::from_str(query.unwrap_or_default()).ok()?;
-        return Some(Endpoint::ListCatalog { n, last });
+        return serde_html_form::from_str(query.unwrap_or_default())
+            .ok()
+            .map(Endpoint::ListCatalog);
     }
     None
 }
@@ -52,17 +40,17 @@ mod tests {
     fn catalog_parsed_with_pagination() {
         assert!(matches!(
             parse(&Method::GET, "/v2/_catalog", Some("n=5&last=foo")),
-            Some(Endpoint::ListCatalog {
+            Some(Endpoint::ListCatalog(CatalogRequest {
                 n: Some(5),
                 last: Some(_)
-            })
+            }))
         ));
         assert!(matches!(
             parse(&Method::GET, "/v2/_catalog", None),
-            Some(Endpoint::ListCatalog {
+            Some(Endpoint::ListCatalog(CatalogRequest {
                 n: None,
                 last: None
-            })
+            }))
         ));
     }
 
@@ -87,7 +75,7 @@ mod tests {
         // listing can answer.
         assert!(matches!(
             parse(&Method::GET, "/v2/_catalog", Some("n=")),
-            Some(Endpoint::ListCatalog { n: None, .. })
+            Some(Endpoint::ListCatalog(CatalogRequest { n: None, .. }))
         ));
     }
 }

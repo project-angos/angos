@@ -4,7 +4,7 @@
 	import { resolve } from '$app/paths';
 	import { getRegistryName } from '#lib/config.svelte.js';
 	import { PAGE, fetchRepositories, type FetchResult, type RepositoriesResponse, type RepositoryInfo, type SortOrder } from '#lib/api.js';
-	import { isInteractiveTarget, pathUrl } from '#lib/utils.js';
+	import { isInteractiveTarget } from '#lib/utils.js';
 	import Card from '#lib/components/Card.svelte';
 	import LoadingState from '#lib/components/LoadingState.svelte';
 	import ErrorState from '#lib/components/ErrorState.svelte';
@@ -42,14 +42,6 @@
 		});
 	});
 
-	// A re-sort keeps as many rows as are on screen.
-	async function load() {
-		const token = ++loadToken;
-		const result = await fetchRepositories(order, 0, Math.max(repositories.length, PAGE));
-		if (token !== loadToken) return;
-		apply(result);
-	}
-
 	function apply(result: FetchResult<RepositoriesResponse>) {
 		loading = false;
 		sorting = false;
@@ -75,17 +67,20 @@
 		}
 	}
 
-	function sort() {
+	// A re-sort keeps as many rows as are on screen.
+	async function sort() {
 		order = order === 'asc' ? 'desc' : 'asc';
 		sorting = true;
-		load();
+		const token = ++loadToken;
+		const result = await fetchRepositories(order, 0, Math.max(repositories.length, PAGE));
+		if (token === loadToken) apply(result);
 	}
 
 	const hosted = $derived(repositories.filter((repo) => !repo.pull_through_cache));
 	const caches = $derived(repositories.filter((repo) => repo.pull_through_cache));
 
 	function open(event: MouseEvent, name: string) {
-		if (!isInteractiveTarget(event)) goto(pathUrl(name));
+		if (!isInteractiveTarget(event)) goto(resolve(name));
 	}
 </script>
 
@@ -95,6 +90,14 @@
 		<div class="load-more">
 			<button class="secondary" onclick={loadMore} disabled={loadingMore}>Load more</button>
 		</div>
+	{/if}
+{/snippet}
+
+{#snippet features(repo: RepositoryInfo)}
+	{#if repo.immutable_tags}
+		<span class="badge immutable">Immutable</span>
+	{:else}
+		<span class="no-features">-</span>
 	{/if}
 {/snippet}
 
@@ -124,14 +127,8 @@
 			<tbody>
 				{#each hosted as repo (repo.name)}
 					<tr class="clickable" onclick={(event) => open(event, repo.name)}>
-						<td><a class="row-link" href={pathUrl(repo.name)}>{repo.name}</a></td>
-						<td>
-							{#if repo.immutable_tags}
-								<span class="badge immutable">Immutable</span>
-							{:else}
-								<span class="no-features">-</span>
-							{/if}
-						</td>
+						<td><a class="row-link" href={resolve(repo.name)}>{repo.name}</a></td>
+						<td>{@render features(repo)}</td>
 						<td>{repo.namespace_count > 0 ? repo.namespace_count : '-'}</td>
 					</tr>
 				{:else}
@@ -160,15 +157,9 @@
 				<tbody>
 					{#each caches as repo (repo.name)}
 						<tr class="clickable" onclick={(event) => open(event, repo.name)}>
-							<td><a class="row-link" href={pathUrl(repo.name)}>{repo.name}</a></td>
+							<td><a class="row-link" href={resolve(repo.name)}>{repo.name}</a></td>
 							<td class="mono">{repo.upstream_urls.join(', ')}</td>
-							<td>
-								{#if repo.immutable_tags}
-									<span class="badge immutable">Immutable</span>
-								{:else}
-									<span class="no-features">-</span>
-								{/if}
-							</td>
+							<td>{@render features(repo)}</td>
 							<td>{repo.namespace_count > 0 ? repo.namespace_count : '-'}</td>
 						</tr>
 					{/each}

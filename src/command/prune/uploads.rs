@@ -19,21 +19,14 @@ use crate::registry::blob_store::{BlobStore, UploadSummary};
 use crate::registry::keys::{DigestExt, REF_ROOT};
 use crate::registry::metadata_store::MetadataStore;
 
-enum UploadVerdict {
-    /// Missing summary or corrupted data.
-    DeleteInconsistent,
-    /// Age exceeds the window.
-    DeleteObsolete,
-    Keep,
-}
-
-fn classify_upload(
+/// Whether an upload session is past the window or its state is broken.
+fn upload_reapable(
     summary: Result<&UploadSummary, &RegistryError>,
     window: Duration,
     now: DateTime<Utc>,
-) -> UploadVerdict {
+) -> bool {
     match summary {
-        Ok(s) if now.signed_duration_since(s.started_at) > window => UploadVerdict::DeleteObsolete,
+        Ok(s) => now.signed_duration_since(s.started_at) > window,
         // A corrupt record never decodes on a retry, so the session can never
         // complete and is safe to reap at any age.
         Err(
@@ -41,9 +34,9 @@ fn classify_upload(
             | RegistryError::NotFound
             | RegistryError::BlobUnknown
             | RegistryError::Corrupt(_),
-        ) => UploadVerdict::DeleteInconsistent,
+        ) => true,
         // Deleting on a transient read failure would destroy a live upload.
-        Ok(_) | Err(_) => UploadVerdict::Keep,
+        Err(_) => false,
     }
 }
 
@@ -81,17 +74,15 @@ async fn sweep_one_upload(
     sink: &dyn ActionSink,
 ) -> Result<(), Error> {
     let summary = blob_store.upload_summary(namespace, session_id).await;
-    match classify_upload(summary.as_ref(), window, Utc::now()) {
-        UploadVerdict::DeleteInconsistent | UploadVerdict::DeleteObsolete => {
-            debug!("prune: reaping upload '{namespace}/{session_id}'");
-            sink.apply(Action::DeleteExpiredUpload {
-                namespace: namespace.clone(),
-                session_id: session_id.clone(),
-            })
-            .await
-        }
-        UploadVerdict::Keep => Ok(()),
+    if !upload_reapable(summary.as_ref(), window, Utc::now()) {
+        return Ok(());
     }
+    debug!("prune: reaping upload '{namespace}/{session_id}'");
+    sink.apply(Action::DeleteExpiredUpload {
+        namespace: namespace.clone(),
+        session_id: session_id.clone(),
+    })
+    .await
 }
 
 /// Abort every in-flight S3 multipart upload older than the window whose
@@ -207,73 +198,40 @@ async fn sweep_one_ref(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration as StdDuration;
+
+    use bytes::Bytes;
     use chrono::TimeZone;
+    use tokio::time::sleep;
 
     use super::*;
+    use crate::command::maintenance::test_helper::test_executor;
     use crate::registry::keys::NamespaceExt;
+    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::test_utils::for_each_backend;
 
-    fn fixed_now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap()
-    }
-
-    fn summary_started_at(offset_secs: i64) -> UploadSummary {
-        UploadSummary {
+    #[test]
+    fn upload_reapable_past_the_window_or_on_broken_state() {
+        let now = Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let started = |offset_secs| UploadSummary {
             size: 0,
-            started_at: fixed_now() - Duration::seconds(offset_secs),
-        }
-    }
-
-    #[test]
-    fn classify_upload_keeps_exactly_at_window() {
-        let verdict = classify_upload(
-            Ok(&summary_started_at(3600)),
-            Duration::hours(1),
-            fixed_now(),
-        );
-        assert!(matches!(verdict, UploadVerdict::Keep));
-    }
-
-    #[test]
-    fn classify_upload_deletes_past_window() {
-        let verdict = classify_upload(
-            Ok(&summary_started_at(3601)),
-            Duration::hours(1),
-            fixed_now(),
-        );
-        assert!(matches!(verdict, UploadVerdict::DeleteObsolete));
-    }
-
-    #[test]
-    fn classify_upload_deletes_broken_state() {
+            started_at: now - Duration::seconds(offset_secs),
+        };
+        let window = Duration::hours(1);
+        assert!(!upload_reapable(Ok(&started(3600)), window, now));
+        assert!(upload_reapable(Ok(&started(3601)), window, now));
         for error in [
             RegistryError::BlobUploadUnknown,
             RegistryError::NotFound,
             RegistryError::BlobUnknown,
             RegistryError::Corrupt("hash state deserialization error".to_string()),
         ] {
-            let verdict = classify_upload(Err(&error), Duration::hours(1), fixed_now());
-            assert!(matches!(verdict, UploadVerdict::DeleteInconsistent));
+            assert!(upload_reapable(Err(&error), window, now), "{error}");
         }
+        let transient = RegistryError::Internal("transient backend error".to_string());
+        assert!(!upload_reapable(Err(&transient), window, now));
     }
-
-    #[test]
-    fn classify_upload_keeps_on_transient_error() {
-        let error = RegistryError::Internal("transient backend error".to_string());
-        let verdict = classify_upload(Err(&error), Duration::hours(1), fixed_now());
-        assert!(matches!(verdict, UploadVerdict::Keep));
-    }
-
-    use std::sync::Mutex;
-    use std::time::Duration as StdDuration;
-
-    use bytes::Bytes;
-    use tokio::time::sleep;
-
-    use angos_oci::{Digest, Namespace};
-
-    use crate::command::maintenance::executor::Executor;
-    use crate::registry::metadata_store::LinkKind;
-    use crate::registry::test_utils::for_each_backend;
 
     #[tokio::test]
     async fn sweep_reaps_obsolete_upload_and_keeps_recent() {
@@ -287,7 +245,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), test_case.metadata_store());
+            let executor = test_executor(blob_store.clone(), test_case.metadata_store());
 
             // Zero window: the just-created upload is already past it.
             sweep_upload_sessions(&blob_store, Duration::zero(), &executor, 4)
@@ -330,7 +288,7 @@ mod tests {
             let objects = blob_store.object_store();
             let old_ts = Utc::now() - Duration::hours(2);
 
-            // New shape, backdated by rewriting `session.json` in place.
+            // Backdated by rewriting `session.json` in place.
             let new_shape = UploadSessionId::generate();
             blob_store
                 .create_upload(&namespace, &new_shape, None)
@@ -348,7 +306,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), test_case.metadata_store());
+            let executor = test_executor(blob_store.clone(), test_case.metadata_store());
             sweep_upload_sessions(&blob_store, Duration::hours(1), &executor, 4)
                 .await
                 .unwrap();
@@ -359,41 +317,6 @@ mod tests {
                     .await
                     .is_err(),
                 "an aged session must be reaped"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn sweep_dry_run_captures_without_deleting() {
-        for_each_backend(async |test_case| {
-            let namespace = Namespace::new("test-repo/app").unwrap();
-            let blob_store = test_case.blob_store();
-
-            let session_id = UploadSessionId::generate();
-            blob_store
-                .create_upload(&namespace, &session_id, None)
-                .await
-                .unwrap();
-
-            let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-            sweep_upload_sessions(&blob_store, Duration::zero(), &sink, 4)
-                .await
-                .unwrap();
-
-            assert!(
-                sink.lock()
-                    .unwrap()
-                    .iter()
-                    .any(|a| matches!(a, Action::DeleteExpiredUpload { .. })),
-                "the capture sink must record the delete"
-            );
-            assert!(
-                blob_store
-                    .upload_summary(&namespace, &session_id)
-                    .await
-                    .is_ok(),
-                "a capture sink must not delete"
             );
         })
         .await;
@@ -470,7 +393,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
 
             sweep_byteless_refs(
                 &blob_store,

@@ -1,19 +1,12 @@
-//! CEL rule newtype that compiles at deserialisation time.
-//!
-//! Invalid CEL syntax is detected when the TOML configuration is parsed,
-//! so the registry fails fast with a clear error rather than at request time.
+//! CEL rules, compiled when the configuration is parsed so a bad rule fails
+//! at startup rather than at request time.
 
-use std::fmt;
 use std::sync::Arc;
 
 use cel_interpreter::{Context, ExecutionError, Program, Value};
 use serde::{Deserialize, Deserializer, de};
 
-/// A pre-compiled CEL expression, keeping its source for configuration
-/// checks and messages.
-///
-/// Wraps [`Program`] in an [`Arc`] so that [`CelRule`] implements [`Clone`]
-/// without requiring [`Program`] itself to be cloneable.
+/// A compiled CEL expression and its source.
 #[derive(Debug, Clone)]
 pub struct CelRule {
     program: Arc<Program>,
@@ -21,11 +14,6 @@ pub struct CelRule {
 }
 
 impl CelRule {
-    /// Compiles a CEL expression from source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error string describing the parse failure.
     pub fn compile(source: &str) -> Result<Self, String> {
         if source.trim().is_empty() {
             return Err("CEL rule cannot be empty".to_string());
@@ -37,38 +25,27 @@ impl CelRule {
             })
             .map_err(|e| format!("Failed to compile CEL rule '{source}': {e}"))
     }
-
-    /// Executes the compiled program against a CEL context.
-    pub fn execute(&self, context: &Context) -> Result<Value, ExecutionError> {
-        self.program.execute(context)
-    }
 }
 
-impl fmt::Display for CelRule {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.source)
-    }
-}
-
-/// Outcome of evaluating an ordered list of CEL rules. The caller maps these to
-/// a policy decision, choosing fail-open vs fail-closed via the `Indeterminate` arm.
+/// Outcome of [`evaluate_rules`]; indices are 1-based. Each caller decides
+/// whether `Indeterminate` fails open or closed.
 pub enum RuleOutcome {
-    /// The 1-based index of the first rule that returned `true`.
     Matched(usize),
-    /// Every rule returned `false`.
     NoMatch,
-    /// Rule at the 1-based `index` returned a non-boolean value or errored.
-    Indeterminate { index: usize, message: String },
+    /// The rule returned a non-boolean or errored.
+    Indeterminate {
+        index: usize,
+        message: String,
+    },
 }
 
-/// Evaluate `rules` in order against `context`. First `bool(true)` wins
-/// (`Matched`); a non-boolean result or execution error stops evaluation
-/// (`Indeterminate`) and the caller decides how to treat it; all-false is `NoMatch`.
+/// Runs `rules` in order: the first `true` matches, and a non-boolean or an
+/// error stops evaluation.
 #[must_use]
 pub fn evaluate_rules(rules: &[CelRule], context: &Context) -> RuleOutcome {
     for (index, rule) in rules.iter().enumerate() {
         let rule_index = index + 1;
-        match rule.execute(context) {
+        match rule.program.execute(context) {
             Ok(Value::Bool(true)) => return RuleOutcome::Matched(rule_index),
             Ok(Value::Bool(false)) => {}
             Ok(value) => {
@@ -88,12 +65,9 @@ pub fn evaluate_rules(rules: &[CelRule], context: &Context) -> RuleOutcome {
     RuleOutcome::NoMatch
 }
 
-/// A log-safe rendering of a CEL execution error. The interpreter's `Display`
-/// prints evaluated operands with `{:?}` for its value-carrying variants, so a
-/// rule run against attacker-controlled identity or request data could write
-/// that data into the log. Only variants whose message is an identifier, type
-/// name or count keep the interpreter text; the rest are reduced to the
-/// operator or method that failed.
+/// A log-safe rendering of a CEL execution error: the interpreter's `Display`
+/// prints evaluated operands, which may be attacker-controlled identity or
+/// request data, so only variants without values keep its text.
 fn sanitize_execution_error(error: &ExecutionError) -> String {
     match error {
         ExecutionError::InvalidArgumentCount { .. }
@@ -147,10 +121,9 @@ impl<'de> Deserialize<'de> for CelRule {
 #[cfg(test)]
 mod tests {
     use cel_interpreter::Context;
-    use serde::de::DeserializeOwned;
 
     use crate::policy::cel_rule::{CelRule, RuleOutcome, evaluate_rules};
-    use crate::policy::{AccessMode, PolicyConfig, RetentionPolicyConfig};
+    use crate::policy::{AccessMode, PolicyConfig};
 
     /// A value-carrying execution error must not copy the evaluated operand
     /// into the message, or a client controls what the registry logs.
@@ -172,60 +145,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cel_rule_fails_compile() {
-        assert!(CelRule::compile("this is (((( not valid").is_err());
-    }
-
-    #[test]
-    fn invalid_access_policy_cel_rule_fails_at_deserialize() {
-        let toml = r#"rules = ["this is (((( not valid"]"#;
-        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str(toml);
-        assert!(
-            result.is_err(),
-            "invalid CEL rule must fail at deserialization"
-        );
-    }
-
-    #[test]
-    fn invalid_retention_policy_cel_rule_fails_at_deserialize() {
-        let toml = r#"rules = ["this is (((( not valid"]"#;
-        let result: Result<RetentionPolicyConfig, _> = toml::from_str(toml);
-        assert!(
-            result.is_err(),
-            "invalid CEL rule must fail at deserialization"
-        );
-    }
-
-    #[test]
-    fn empty_cel_rule_fails_compile() {
-        assert!(CelRule::compile("").is_err());
-    }
-
-    #[test]
-    fn whitespace_only_cel_rule_fails_compile() {
-        assert!(CelRule::compile("   \n\t  ").is_err());
-    }
-
-    fn assert_empty_rule_fails_at_deserialize<C: DeserializeOwned>() {
-        let toml = r#"rules = [""]"#;
-        let result: Result<C, _> = toml::from_str(toml);
-        let msg = result
-            .err()
-            .expect("empty CEL rule must fail at deserialization")
-            .to_string();
-        assert!(
-            msg.contains("empty"),
-            "error should mention empty, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn empty_access_policy_cel_rule_fails_at_deserialize() {
-        assert_empty_rule_fails_at_deserialize::<PolicyConfig<AccessMode>>();
-    }
-
-    #[test]
-    fn empty_retention_policy_cel_rule_fails_at_deserialize() {
-        assert_empty_rule_fails_at_deserialize::<RetentionPolicyConfig>();
+    fn invalid_rule_fails_at_deserialize() {
+        for (rule, expected) in [
+            ("this is (((( not valid", "this is (((( not valid"),
+            ("", "cannot be empty"),
+            ("   \n\t  ", "cannot be empty"),
+        ] {
+            let toml = format!("rules = [{rule:?}]");
+            let Err(error) = toml::from_str::<PolicyConfig<AccessMode>>(&toml) else {
+                panic!("{rule:?} must fail to deserialize");
+            };
+            assert!(error.to_string().contains(expected), "{rule:?}: {error}");
+        }
     }
 }

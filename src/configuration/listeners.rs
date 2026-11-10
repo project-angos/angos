@@ -20,9 +20,8 @@ pub struct ListenerBaseConfig {
     pub handshake_timeout: NonZeroU64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TlsListenerConfig {
-    #[serde(flatten)]
     pub base: ListenerBaseConfig,
     pub tls: ServerTlsConfig,
 }
@@ -80,35 +79,27 @@ impl TryFrom<ServerTlsConfigFields> for ServerTlsConfig {
 }
 
 impl ListenerBaseConfig {
-    fn default_bind_address() -> IpAddr {
-        IpAddr::from(Ipv4Addr::from([0; 4]))
-    }
-
     fn default_port() -> u16 {
         8000
     }
 
-    const DEFAULT_QUERY_TIMEOUT: NonZeroU64 = NonZeroU64::MIN.saturating_add(3600 - 1);
-    const DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD: NonZeroU64 = NonZeroU64::MIN.saturating_add(60 - 1);
-    const DEFAULT_HANDSHAKE_TIMEOUT: NonZeroU64 = NonZeroU64::MIN.saturating_add(10 - 1);
-
     fn default_query_timeout() -> NonZeroU64 {
-        Self::DEFAULT_QUERY_TIMEOUT
+        NonZeroU64::MIN.saturating_add(3600 - 1)
     }
 
     fn default_query_timeout_grace_period() -> NonZeroU64 {
-        Self::DEFAULT_QUERY_TIMEOUT_GRACE_PERIOD
+        NonZeroU64::MIN.saturating_add(60 - 1)
     }
 
     fn default_handshake_timeout() -> NonZeroU64 {
-        Self::DEFAULT_HANDSHAKE_TIMEOUT
+        NonZeroU64::MIN.saturating_add(10 - 1)
     }
 }
 
 impl Default for ListenerBaseConfig {
     fn default() -> Self {
         Self {
-            bind_address: Self::default_bind_address(),
+            bind_address: IpAddr::from(Ipv4Addr::from([0; 4])),
             port: Self::default_port(),
             query_timeout: Self::default_query_timeout(),
             query_timeout_grace_period: Self::default_query_timeout_grace_period(),

@@ -147,7 +147,6 @@ pub async fn scan_reports(
     Ok(reports)
 }
 
-/// Whether a referrer's descriptor is a report angos wrote.
 pub fn is_angos_report(descriptor: &Descriptor) -> bool {
     descriptor
         .artifact_type
@@ -217,20 +216,19 @@ impl ScanSummary {
         summary
     }
 
-    /// The `io.angos.scan.*` annotations carrying this summary.
     pub fn annotations(&self) -> Vec<(String, String)> {
         Severity::ALL
             .iter()
             .map(|severity| {
                 (
-                    format!("io.angos.scan.{}", severity.as_str()),
+                    format!("{SCAN_ANNOTATION_PREFIX}{}", severity.as_str()),
                     self.counts[*severity as usize].to_string(),
                 )
             })
             .chain(
                 self.scanner
                     .iter()
-                    .map(|scanner| ("io.angos.scan.scanner".to_string(), scanner.clone())),
+                    .map(|scanner| (format!("{SCAN_ANNOTATION_PREFIX}scanner"), scanner.clone())),
             )
             .collect()
     }

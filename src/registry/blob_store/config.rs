@@ -118,11 +118,8 @@ impl BlobStoreConfig {
     pub fn build_backend(&self) -> Result<BlobStore, Error> {
         match self {
             BlobStoreConfig::FS(config) => {
-                let object: Arc<dyn ObjectStore> = Arc::new(
-                    StorageFsBackend::builder(&config.root_dir)
-                        .sync_to_disk(config.sync_to_disk)
-                        .build(),
-                );
+                let object: Arc<dyn ObjectStore> =
+                    Arc::new(StorageFsBackend::new(&config.root_dir, config.sync_to_disk));
                 Ok(BlobStore::new(object, None))
             }
             BlobStoreConfig::S3(config) => {

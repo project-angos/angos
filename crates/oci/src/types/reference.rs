@@ -94,42 +94,15 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_string_rejected() {
-        assert!(Reference::from_str("").is_err());
+    fn test_invalid_rejected() {
+        for input in ["", ":", ":foo", "foo:", "sha256:NOT_HEX", "foo!bar"] {
+            assert!(
+                Reference::from_str(input).is_err(),
+                "'{input}' must be rejected"
+            );
+        }
     }
 
-    #[test]
-    fn test_digest_non_hex_rejected() {
-        assert!(
-            Reference::from_str("sha256:NOT_A_HEX_STRING_AT_ALL_XXXXXXXXXXXXXXXXXXXXXXXXXXXX")
-                .is_err()
-        );
-    }
-
-    // Edge case: bare colon (no algorithm, no hash) is rejected via digest path
-    #[test]
-    fn test_bare_colon_rejected() {
-        assert!(Reference::from_str(":").is_err());
-    }
-
-    // Edge case: colon-prefixed string (empty tag portion before colon) is rejected
-    #[test]
-    fn test_colon_prefix_rejected() {
-        assert!(Reference::from_str(":foo").is_err());
-    }
-
-    // Edge case: colon-suffixed string (treated as digest with empty hash) is rejected
-    #[test]
-    fn test_colon_suffix_rejected() {
-        assert!(
-            Reference::from_str("foo:").is_err(),
-            "'foo:' (unsupported algorithm) must be rejected"
-        );
-    }
-
-    /// `Reference` parses from a plain string, so it has to serialize back to
-    /// one. A derived enum impl would emit a tagged object instead, which the
-    /// CEL policy context exposes as a map rather than the documented string.
     #[test]
     fn serializes_as_a_plain_string_in_both_directions() {
         let tag: Reference = "latest".parse().unwrap();

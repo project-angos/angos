@@ -1,11 +1,5 @@
-//! Deterministic repository resolution for namespace-to-repository mapping.
-//!
-//! [`RepositoryResolver`] wraps an `Arc<HashMap<String, Repository>>` and
-//! rejects overlapping repository prefixes at construction. Two prefixes
-//! overlap when one is a namespace-prefix of the other (e.g. `team` and
-//! `team/app`). The rejection makes startup fail fast on misconfigured
-//! repositories rather than allowing non-deterministic runtime behavior driven
-//! by `HashMap` iteration order.
+//! Namespace-to-repository resolution. Overlapping prefixes (`team` and
+//! `team/app`) fail at startup rather than resolving by `HashMap` order.
 
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
@@ -17,10 +11,6 @@ use crate::registry::Repository;
 
 /// A repository map that rejects overlapping repository prefixes at
 /// construction and provides deterministic namespace resolution.
-///
-/// Two prefixes overlap when one is a namespace-prefix of another:
-/// `namespace_belongs_to(a, b) || namespace_belongs_to(b, a)` for any two
-/// distinct keys `a` and `b`.
 pub struct RepositoryResolver {
     inner: Arc<HashMap<String, Repository>>,
 }
@@ -33,10 +23,8 @@ impl fmt::Debug for RepositoryResolver {
     }
 }
 
-/// Error returned when two repositories cannot be told apart: their prefixes
-/// overlap, or they claim the same `ns`.
-///
-/// The error names both offenders so the operator can disambiguate.
+/// Two repositories cannot be told apart: their prefixes overlap, or they
+/// claim the same `ns`.
 #[derive(Debug, thiserror::Error)]
 pub enum OverlapError {
     #[error("repository prefixes overlap: '{first}' and '{second}'")]
@@ -50,12 +38,10 @@ pub enum OverlapError {
 }
 
 impl RepositoryResolver {
-    /// Constructs a resolver from the given map.
-    ///
     /// # Errors
     ///
-    /// Returns [`OverlapError`] if any two keys are namespace-prefixes of each
-    /// other. The error names the first pair of overlapping prefixes found.
+    /// Returns [`OverlapError`] for the first pair of repositories found that
+    /// cannot be told apart.
     pub fn new(repositories: Arc<HashMap<String, Repository>>) -> Result<Self, OverlapError> {
         // Each key paired with the `ns` it mirrors, so the checks below need no
         // lookup back into the map.
@@ -103,13 +89,9 @@ impl RepositoryResolver {
         })
     }
 
-    /// Resolves the repository for a namespace.
-    ///
-    /// Returns the first repository whose key is a namespace-prefix of
-    /// `namespace`, or `None` when no match exists. Because overlapping
-    /// prefixes are rejected at construction, at most one match is possible.
-    pub fn resolve(&self, namespace: impl AsRef<str>) -> Option<&Repository> {
-        let namespace = namespace.as_ref();
+    /// The repository whose key is a namespace-prefix of `namespace`; at most
+    /// one matches, since overlapping prefixes are rejected at construction.
+    pub fn resolve(&self, namespace: &str) -> Option<&Repository> {
         self.inner
             .iter()
             .find(|(key, _)| namespace_belongs_to(namespace, key))
@@ -128,6 +110,10 @@ impl RepositoryResolver {
         self.inner.keys().map(String::as_str)
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &Repository> {
+        self.inner.values()
+    }
+
     pub fn contains_key(&self, name: &str) -> bool {
         self.inner.contains_key(name)
     }
@@ -139,14 +125,10 @@ impl RepositoryResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use angos_oci::Namespace;
 
     use super::*;
-    use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
-    use crate::registry::Repository;
+    use crate::policy::RetentionPolicy;
 
     fn repo(name: &str) -> Repository {
         Repository {
@@ -154,10 +136,7 @@ mod tests {
             namespace: None,
             upstreams: Vec::new(),
             replication: Vec::new(),
-            retention_policy: RetentionPolicy::new(
-                &RetentionPolicyConfig::default(),
-                Arc::new(SystemClock),
-            ),
+            retention_policy: RetentionPolicy::new(Vec::new()),
             immutable_tags: false,
             immutable_tags_exclusions: Vec::new(),
             scan: None,
@@ -242,32 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_match_returns_repository() {
+    fn resolve_matches_whole_namespace_segments_only() {
         let r = resolver(&[("myrepo", "myrepo"), ("other", "other")]).unwrap();
-        let found = r.resolve("myrepo");
-        assert_eq!(found.unwrap().name, "myrepo");
-    }
-
-    #[test]
-    fn sub_namespace_matches_parent_prefix() {
-        let r = resolver(&[("myrepo", "myrepo")]).unwrap();
-        let found = r.resolve("myrepo/sub/path");
-        assert_eq!(found.unwrap().name, "myrepo");
-    }
-
-    #[test]
-    fn unrelated_namespace_returns_none() {
-        let r = resolver(&[("myrepo", "myrepo")]).unwrap();
-        assert!(r.resolve("completely-different").is_none());
-    }
-
-    #[test]
-    fn adjacent_string_non_match() {
-        // "myrepo2" must NOT match a resolver configured for "myrepo".
-        let r = resolver(&[("myrepo", "myrepo")]).unwrap();
-        assert!(
-            r.resolve("myrepo2").is_none(),
-            "myrepo2 must not match prefix myrepo"
-        );
+        let resolved = |namespace| r.resolve(namespace).map(|repo| repo.name.to_string());
+        assert_eq!(resolved("myrepo").as_deref(), Some("myrepo"));
+        assert_eq!(resolved("myrepo/sub/path").as_deref(), Some("myrepo"));
+        assert_eq!(resolved("myrepo2"), None);
+        assert_eq!(resolved("completely-different"), None);
     }
 }

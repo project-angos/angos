@@ -2,16 +2,12 @@
 //! judged over an image when it lands and again by `reconcile scan` and
 //! `reconcile index`.
 
-use std::sync::Arc;
-
 use chrono::Utc;
 use tracing::warn;
 
 use angos_oci::{Namespace, Tag};
 
-use crate::policy::{
-    ManifestImage, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, RuleOutcome, SystemClock,
-};
+use crate::policy::{ManifestImage, PolicyConfig, RetentionPolicy, RuleOutcome};
 
 /// A compiled `scan` or `index` policy.
 pub struct ImagePolicy {
@@ -23,12 +19,7 @@ impl ImagePolicy {
     pub fn new<A: Copy + Into<bool>>(config: &PolicyConfig<A>) -> Self {
         Self {
             applies_by_default: config.default.is_some_and(Into::into),
-            rules: RetentionPolicy::new(
-                &RetentionPolicyConfig {
-                    rules: config.rules.clone(),
-                },
-                Arc::new(SystemClock),
-            ),
+            rules: RetentionPolicy::new(config.rules.clone()),
         }
     }
 

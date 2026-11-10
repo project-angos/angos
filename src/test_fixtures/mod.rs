@@ -1,12 +1,5 @@
-//! Shared test fixtures: dynamically generated cryptographic material,
-//! configuration builders, client configs, and wiremock responders.
-//!
-//! Every cert, private key, and JWK component used by unit tests is generated
-//! at runtime (ECDSA P-256) and cached via `std::sync::LazyLock`. There are no
-//! static base64 blobs or shell-out recipes to maintain. Registry-domain
-//! fixtures (stores, registries, repositories) live in
-//! `crate::registry::test_utils`, which needs access to registry-private
-//! items.
+//! Shared test fixtures. Key material is generated once per process; fixtures
+//! needing registry-private items live in `crate::registry::test_utils`.
 
 pub mod client;
 pub mod configuration;

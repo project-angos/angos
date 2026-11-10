@@ -12,36 +12,44 @@ use crate::registry::Error;
 use crate::registry::keys::{DigestExt, NamespaceExt};
 use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, for_each_backend};
 
-/// Seed `content` at its canonical blob path by driving the whole upload
-/// workflow, as production does.
-async fn seed_blob_with(store: &BlobStore, content: &[u8], algorithm: Algorithm) -> Digest {
-    let namespace = Namespace::new("test/setup").unwrap();
-    let session_id = UploadSessionId::generate();
+/// Open a session in `namespace` and write `content` to it, hashed under
+/// `algorithm`, without completing it.
+async fn stage(
+    store: &BlobStore,
+    namespace: &Namespace,
+    session_id: &UploadSessionId,
+    content: &[u8],
+    algorithm: Algorithm,
+) {
     store
-        .create_upload(&namespace, &session_id, None)
+        .create_upload(namespace, session_id, None)
         .await
         .unwrap();
-    let len = content.len() as u64;
     store
         .write_upload(
-            &namespace,
-            &session_id,
-            store.read_session(&namespace, &session_id).await.unwrap(),
+            namespace,
+            session_id,
+            store.read_session(namespace, session_id).await.unwrap(),
             Box::new(Cursor::new(content.to_vec())),
-            Some(len),
+            Some(content.len() as u64),
             algorithm,
         )
         .await
         .unwrap();
-    let expected = Digest::from_bytes(algorithm, content);
-    store
-        .complete_upload(&namespace, &session_id, &expected, len)
-        .await
-        .unwrap()
 }
 
-async fn seed_blob(store: &BlobStore, content: &[u8]) -> Digest {
-    seed_blob_with(store, content, Algorithm::Sha256).await
+/// Seed `content` at its canonical blob path by driving the whole upload
+/// workflow, as production does.
+async fn seed_blob(store: &BlobStore, content: &[u8], algorithm: Algorithm) -> Digest {
+    let namespace = Namespace::new("test/setup").unwrap();
+    let session_id = UploadSessionId::generate();
+    stage(store, &namespace, &session_id, content, algorithm).await;
+    let expected = Digest::from_bytes(algorithm, content);
+    store
+        .complete_upload(&namespace, &session_id, &expected, content.len() as u64)
+        .await
+        .unwrap();
+    expected
 }
 
 #[tokio::test]
@@ -54,21 +62,8 @@ async fn stream_uploads() {
         let upload_ids: Vec<UploadSessionId> =
             (0..3).map(|_| UploadSessionId::generate()).collect();
         for id in &upload_ids {
-            store.create_upload(namespace, id, None).await.unwrap();
-
-            let content = format!("Content for upload {id}").into_bytes();
-            let len = content.len() as u64;
-            store
-                .write_upload(
-                    namespace,
-                    id,
-                    store.read_session(namespace, id).await.unwrap(),
-                    Box::new(Cursor::new(content)),
-                    Some(len),
-                    Algorithm::Sha256,
-                )
-                .await
-                .unwrap();
+            let content = format!("Content for upload {id}");
+            stage(store, namespace, id, content.as_bytes(), Algorithm::Sha256).await;
         }
 
         let uploads: Vec<UploadSessionId> =
@@ -141,7 +136,7 @@ async fn stream_blobs_across_algorithms() {
         let mut expected = Vec::new();
         for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
             for content in [b"alpha".as_slice(), b"beta".as_slice()] {
-                expected.push(seed_blob_with(store, content, algorithm).await);
+                expected.push(seed_blob(store, content, algorithm).await);
             }
         }
 
@@ -155,47 +150,37 @@ async fn stream_blobs_across_algorithms() {
 }
 
 #[tokio::test]
-async fn blob_operations() {
-    for_each_backend(async |tc| {
-        let store = tc.blob_store();
-        let store = store.as_ref();
-        let test_content = b"Test blob content";
-        let digest = seed_blob(store, test_content).await;
-
-        let retrieved_content = store.read(&digest).await.unwrap();
-        assert_eq!(retrieved_content, test_content);
-
-        let size = store.size(&digest).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-
-        let (mut reader, _) = store.reader(&digest, None).await.unwrap();
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(buffer, test_content);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn blob_reader_with_offset_returns_full_size() {
+async fn blob_reads() {
     for_each_backend(async |tc| {
         let store = tc.blob_store();
         let store = store.as_ref();
         let test_content = b"offset blob reader content here";
-        let digest = seed_blob(store, test_content).await;
-        let offset = 10u64;
+        let digest = seed_blob(store, test_content, Algorithm::Sha256).await;
 
-        let (mut reader, size) = store.reader(&digest, Some(offset)).await.unwrap();
-        assert_eq!(size, test_content.len() as u64);
-
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        let offset = usize::try_from(offset).unwrap();
-        assert_eq!(buffer, &test_content[offset..]);
+        assert_eq!(store.read(&digest).await.unwrap(), test_content);
+        assert_eq!(
+            store.size(&digest).await.unwrap(),
+            test_content.len() as u64
+        );
+        for offset in [None, Some(10)] {
+            let (mut reader, size) = store.reader(&digest, offset).await.unwrap();
+            assert_eq!(
+                size,
+                test_content.len() as u64,
+                "the full size, from {offset:?}"
+            );
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer).await.unwrap();
+            let skipped = usize::try_from(offset.unwrap_or(0)).unwrap();
+            assert_eq!(buffer, &test_content[skipped..]);
+        }
     })
     .await;
 }
 
+/// The session marker is consumed before the multipart-complete, so a re-run
+/// fails rather than re-finalizing, which on S3 would overwrite the promoted
+/// blob with an empty object.
 #[tokio::test]
 async fn upload_operations() {
     for_each_backend(async |tc| {
@@ -203,48 +188,41 @@ async fn upload_operations() {
         let store = store.as_ref();
         let namespace = &Namespace::new("test-namespace").unwrap();
         let session_id = UploadSessionId::generate();
-
-        store
-            .create_upload(namespace, &session_id, None)
-            .await
-            .unwrap();
-
         let test_content = b"Test upload content";
-
-        let expected_digest = Digest::sha256_of_bytes(test_content);
-
-        store
-            .write_upload(
-                namespace,
-                &session_id,
-                store.read_session(namespace, &session_id).await.unwrap(),
-                Box::new(Cursor::new(test_content.to_vec())),
-                Some(test_content.len() as u64),
-                Algorithm::Sha256,
-            )
-            .await
-            .unwrap();
+        let digest = Digest::sha256_of_bytes(test_content);
+        let len = test_content.len() as u64;
+        stage(
+            store,
+            namespace,
+            &session_id,
+            test_content,
+            Algorithm::Sha256,
+        )
+        .await;
 
         let summary = store.upload_summary(namespace, &session_id).await.unwrap();
-        assert_eq!(summary.size, test_content.len() as u64);
+        assert_eq!(summary.size, len);
         assert!(Utc::now().signed_duration_since(summary.started_at) < Duration::hours(1));
 
-        let final_digest = store
-            .complete_upload(
-                namespace,
-                &session_id,
-                &expected_digest,
-                test_content.len() as u64,
-            )
+        store
+            .complete_upload(namespace, &session_id, &digest, len)
             .await
             .unwrap();
-        assert_eq!(final_digest, expected_digest);
+        assert_eq!(store.read(&digest).await.unwrap(), test_content);
+        assert!(store.upload_summary(namespace, &session_id).await.is_err());
 
-        let blob_content = store.read(&final_digest).await.unwrap();
-        assert_eq!(blob_content, test_content);
-
-        let upload_result = store.upload_summary(namespace, &session_id).await;
-        assert!(upload_result.is_err());
+        let rerun = store
+            .complete_upload(namespace, &session_id, &digest, len)
+            .await;
+        assert!(
+            matches!(rerun, Err(Error::BlobUploadUnknown)),
+            "re-run of a completed session must fail: {rerun:?}"
+        );
+        assert_eq!(
+            store.read(&digest).await.unwrap(),
+            test_content,
+            "blob must stay intact after a rejected re-run"
+        );
     })
     .await;
 }
@@ -257,8 +235,8 @@ async fn repeated_promotion_converges() {
         let store = tc.blob_store();
         let store = store.as_ref();
         let content = b"idempotent promotion content";
-        let first = seed_blob(store, content).await;
-        let second = seed_blob(store, content).await;
+        let first = seed_blob(store, content, Algorithm::Sha256).await;
+        let second = seed_blob(store, content, Algorithm::Sha256).await;
 
         assert_eq!(first, second, "identical content must map to one blob");
         assert_eq!(store.read(&first).await.unwrap(), content);
@@ -277,58 +255,9 @@ async fn repeated_promotion_converges() {
     .await;
 }
 
-/// The session marker must be consumed before the multipart-complete: a naive
-/// S3 re-finalize would overwrite the promoted blob with an empty object.
-#[tokio::test]
-async fn complete_upload_fails_on_rerun() {
-    for_each_backend(async |tc| {
-        let store = tc.blob_store();
-        let store = store.as_ref();
-        let namespace = Namespace::new("test/rerun").unwrap();
-        let session_id = UploadSessionId::generate();
-        let content = b"one-shot completion";
-        store
-            .create_upload(&namespace, &session_id, None)
-            .await
-            .unwrap();
-        store
-            .write_upload(
-                &namespace,
-                &session_id,
-                store.read_session(&namespace, &session_id).await.unwrap(),
-                Box::new(Cursor::new(content.to_vec())),
-                Some(content.len() as u64),
-                Algorithm::Sha256,
-            )
-            .await
-            .unwrap();
-        let digest = Digest::sha256_of_bytes(content);
-        store
-            .complete_upload(&namespace, &session_id, &digest, content.len() as u64)
-            .await
-            .unwrap();
-
-        let rerun = store
-            .complete_upload(&namespace, &session_id, &digest, content.len() as u64)
-            .await;
-        assert!(
-            matches!(rerun, Err(Error::BlobUploadUnknown)),
-            "re-run of a completed session must fail: {rerun:?}"
-        );
-        assert_eq!(
-            store.read(&digest).await.unwrap(),
-            content,
-            "blob must stay intact after a rejected re-run"
-        );
-    })
-    .await;
-}
-
-/// FS-only: the assertions are about exact keys under one prefix, which both
-/// backends agree on, so this stays independent of a live S3.
-/// A chunked upload keeps its whole state in one `session.json`: no legacy
-/// keys appear, the checkpoint resumes across chunks, and completion leaves
-/// nothing behind.
+/// A chunked upload keeps its whole state in one `session.json`, the
+/// checkpoint resumes across chunks, and completion leaves nothing behind. The
+/// keys are the same on both backends, so FS alone checks them.
 #[tokio::test]
 async fn session_state_is_one_json_record() {
     let tc = FSRegistryTestCase::new();
@@ -412,7 +341,7 @@ async fn a_truncated_blob_reads_as_unknown() {
 async fn the_empty_blob_reads_as_present() {
     for_each_backend(async |tc| {
         let store = tc.blob_store();
-        let digest = seed_blob(&store, b"").await;
+        let digest = seed_blob(&store, b"", Algorithm::Sha256).await;
 
         assert_eq!(store.size(&digest).await.unwrap(), 0);
         let content = store.read(&digest).await.unwrap();
@@ -433,21 +362,7 @@ async fn complete_upload_rejects_size_divergence() {
         let namespace = Namespace::new("test/divergence").unwrap();
         let session_id = UploadSessionId::generate();
         let content = b"hashed prefix";
-        store
-            .create_upload(&namespace, &session_id, None)
-            .await
-            .unwrap();
-        store
-            .write_upload(
-                &namespace,
-                &session_id,
-                store.read_session(&namespace, &session_id).await.unwrap(),
-                Box::new(Cursor::new(content.to_vec())),
-                Some(content.len() as u64),
-                Algorithm::Sha256,
-            )
-            .await
-            .unwrap();
+        stage(store, &namespace, &session_id, content, Algorithm::Sha256).await;
 
         // A tail the session never hashed.
         let upload_key = namespace.upload_path(&session_id);

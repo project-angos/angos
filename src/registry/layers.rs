@@ -24,7 +24,6 @@ use angos_oci::{Digest, Namespace};
 
 use crate::jobs::Queue;
 use crate::layer::{self, IndexLayerPayload, Listing, elf, pem};
-use crate::registry::angos_extension::layer_listing;
 use crate::registry::{Error, Registry};
 
 /// The boxed reader a layer file streams through. The gzip decode path is
@@ -45,8 +44,8 @@ impl Registry {
             gzip,
         } = request;
         let upstream = self
-            .repository_for_namespace(&namespace)
-            .ok()
+            .resolver
+            .resolve(&namespace)
             .filter(|repository| repository.is_pull_through());
         if !self.metadata_store.can_read(&namespace, &digest).await? {
             // A pull-through namespace can have lost the grant its manifest
@@ -90,8 +89,14 @@ impl Registry {
             .buffered(self.config.listing_read_concurrency.get())
             .try_concat()
             .await?;
+        let listing = LayerListing {
+            refreshing: listing.is_outdated(),
+            compressed: listing.compressed,
+            uncompressed_size: listing.uncompressed_size,
+            entries,
+        };
         // Megabytes to serialize and compress: off the async threads.
-        let body = spawn_blocking(move || encode(&layer_listing(&listing, entries), gzip))
+        let body = spawn_blocking(move || encode(&listing, gzip))
             .await
             .map_err(|e| Error::Internal(e.to_string()))??;
         Ok(LayerEntries::Ready { body, gzip })
@@ -110,16 +115,7 @@ impl Registry {
             download,
             range,
         } = request;
-        self.readable_layer(&namespace, &digest).await?;
-        let listing = self
-            .metadata_store
-            .read_listing(&digest)
-            .await?
-            .ok_or(Error::NotFound)?;
-        let entry = self
-            .file_entry(&digest, &listing, &path)
-            .await?
-            .ok_or(Error::NotFound)?;
+        let (listing, entry) = self.file_entry(&namespace, &digest, &path).await?;
         let range = match range {
             Some(range) => range.resolve(entry.size)?,
             None => None,
@@ -163,16 +159,7 @@ impl Registry {
             digest,
             path,
         } = request;
-        self.readable_layer(&namespace, &digest).await?;
-        let listing = self
-            .metadata_store
-            .read_listing(&digest)
-            .await?
-            .ok_or(Error::NotFound)?;
-        let entry = self
-            .file_entry(&digest, &listing, &path)
-            .await?
-            .ok_or(Error::NotFound)?;
+        let (listing, entry) = self.file_entry(&namespace, &digest, &path).await?;
         let read = |offset: u64, length: u64| {
             // As many bytes as the file holds past `offset`, at most `length`.
             let size = length.min(entry.size.saturating_sub(offset));
@@ -207,28 +194,38 @@ impl Registry {
         Ok(LayerFileDetails::default())
     }
 
-    /// The entry whose bytes `path` names: a file, or the file a hard link
-    /// points at.
+    /// The layer's listing and the entry whose bytes `path` names: a file, or
+    /// the file a hard link points at.
     async fn file_entry(
         &self,
+        namespace: &Namespace,
         digest: &Digest,
-        listing: &Listing,
         path: &str,
-    ) -> Result<Option<LayerEntry>, Error> {
-        let Some(entry) = self.layer_entry(digest, listing, path, |_| true).await? else {
-            return Ok(None);
-        };
-        match (entry.kind, entry.link.as_deref()) {
-            (EntryKind::File, _) => Ok(Some(entry)),
-            (EntryKind::Hardlink, Some(target)) => {
+    ) -> Result<(Listing, LayerEntry), Error> {
+        if !self.metadata_store.can_read(namespace, digest).await? {
+            return Err(Error::BlobUnknown);
+        }
+        let listing = self
+            .metadata_store
+            .read_listing(digest)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let entry = match self.layer_entry(digest, &listing, path, |_| true).await? {
+            Some(entry) if entry.kind == EntryKind::File => Some(entry),
+            Some(LayerEntry {
+                kind: EntryKind::Hardlink,
+                link: Some(target),
+                ..
+            }) => {
                 let target = target.trim_start_matches("./").trim_matches('/');
-                self.layer_entry(digest, listing, target, |entry| {
+                self.layer_entry(digest, &listing, target, |entry| {
                     entry.kind == EntryKind::File
                 })
-                .await
+                .await?
             }
-            _ => Ok(None),
-        }
+            _ => None,
+        };
+        Ok((listing, entry.ok_or(Error::NotFound)?))
     }
 
     /// The last entry at `path` that `wanted` takes, read out of the one chunk
@@ -304,14 +301,6 @@ impl Registry {
             rx.recv().await.map(|chunk| (chunk, rx))
         });
         Ok(Box::pin(StreamReader::new(chunks)))
-    }
-
-    async fn readable_layer(&self, namespace: &Namespace, digest: &Digest) -> Result<(), Error> {
-        if self.metadata_store.can_read(namespace, digest).await? {
-            Ok(())
-        } else {
-            Err(Error::BlobUnknown)
-        }
     }
 
     /// Fire-and-forget enqueue of a layer's index job, after a push into an

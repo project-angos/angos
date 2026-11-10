@@ -1,17 +1,14 @@
 //! Structural job-record validation: a record whose envelope cannot be parsed
 //! can never be drained and is deleted. Config-relative orphan classification
-//! is prune's job.
+//! belongs to the orphan-job sweep.
 
 use tracing::warn;
-
-use angos_storage::Error as StorageError;
 
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::{Action, JobAction, WalkedStore};
 use crate::command::scrub::validate::Validator;
 use crate::jobs::store::{DeadLetterRecord, JobEnvelope, LockKeyIndex, job_pending_path};
 use crate::jobs::{JobState, Queue};
-use crate::registry::Error as RegistryError;
 
 impl Validator {
     /// Validate one pending or dead-lettered job record.
@@ -44,16 +41,7 @@ impl Validator {
         };
 
         let pending = job_pending_path(queue.as_str(), &index.storage_key);
-        if self
-            .metadata_store
-            .object_store()
-            .exists(&pending)
-            .await
-            .map_err(RegistryError::from)?
-        {
-            return Ok(());
-        }
-        if self.younger_than_grace(key).await? {
+        if self.metadata_exists(&pending).await? || self.younger_than_grace(key).await? {
             return Ok(());
         }
         self.emit(Action::Job(JobAction::DeleteOrphanJobIndex {
@@ -62,14 +50,5 @@ impl Validator {
             storage_key: index.storage_key,
         }))
         .await
-    }
-
-    /// Raw metadata-store read tolerating a concurrent deletion.
-    async fn read_metadata_object(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        match self.metadata_store.object_store().get(key).await {
-            Ok(raw) => Ok(Some(raw)),
-            Err(StorageError::NotFound) => Ok(None),
-            Err(e) => Err(RegistryError::from(e).into()),
-        }
     }
 }

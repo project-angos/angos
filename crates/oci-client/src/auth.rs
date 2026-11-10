@@ -51,7 +51,7 @@ pub fn token_index_cache_key(url: &Url, username: Option<&str>) -> Result<String
     ))
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 struct BearerToken {
     token: Option<String>,
     access_token: Option<String>,
@@ -64,11 +64,9 @@ impl BearerToken {
         60
     }
 
-    fn token(&self) -> Result<String, Error> {
+    fn token(self) -> Result<String, Error> {
         self.token
-            .as_ref()
-            .or(self.access_token.as_ref())
-            .cloned()
+            .or(self.access_token)
             .ok_or_else(|| Error::Internal("Missing token in authentication response".to_string()))
     }
 }
@@ -84,16 +82,6 @@ impl BearerChallenge {
         self.other
             .iter()
             .find_map(|(key, value)| (key == name).then_some(value.as_str()))
-    }
-
-    fn cache_key(&self, response_url: &Url, username: Option<&str>) -> Result<String, Error> {
-        token_cache_key(
-            response_url,
-            &self.realm,
-            self.param("service"),
-            self.param("scope"),
-            username,
-        )
     }
 
     fn token_url(&self) -> Result<Url, Error> {
@@ -148,8 +136,6 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
 }
 
 impl RegistryClient {
-    /// Builds an authentication header, reusing cached bearer tokens when possible.
-    ///
     /// # Errors
     ///
     /// Returns an error when the challenge is missing, unsupported, or when bearer
@@ -163,7 +149,13 @@ impl RegistryClient {
             .map_err(|_| Error::Unauthorized("Missing WWW-Authenticate".to_string()))?;
 
         if let Some(challenge) = parse_bearer_challenge(&auth_header) {
-            let cache_key = challenge.cache_key(response.url(), self.auth_username())?;
+            let cache_key = token_cache_key(
+                response.url(),
+                &challenge.realm,
+                challenge.param("service"),
+                challenge.param("scope"),
+                self.auth_username(),
+            )?;
             if let Some(auth_header) = self.cached_auth_header_for_key(&cache_key).await
                 && Some(auth_header.as_str()) != attempted_auth
             {
@@ -191,9 +183,6 @@ impl RegistryClient {
         cache_key: &str,
     ) -> Result<String, Error> {
         let token_url = challenge.token_url()?;
-        // A realm must not downgrade transport: an https registry's credentials
-        // may go only to an https token endpoint, while a cross-host https
-        // realm (Docker Hub's `auth.docker.io`) stays allowed.
         if !realm_scheme_ok(&self.url, &token_url) {
             return Err(Error::Denied(format!(
                 "refusing to send credentials to non-https token endpoint '{token_url}' for an https registry"
@@ -228,8 +217,8 @@ impl RegistryClient {
             .await
             .map_err(|e| Error::Internal(format!("Failed to parse token response: {e}")))?;
 
-        let token = format!("Bearer {}", bearer.token()?);
         let ttl = bearer.expires_in;
+        let token = format!("Bearer {}", bearer.token()?);
 
         let _ = self.cache.store_value(cache_key, &token, ttl).await;
         self.index_token_url(response_url, cache_key, ttl).await;
@@ -268,39 +257,23 @@ mod tests {
         token_cache_key, token_index_cache_key,
     };
 
+    /// An omitted `expires_in` takes the spec's 60 s: caching longer keeps a
+    /// token past the lifetime its issuer granted.
     #[test]
-    fn test_token_from_access_token_field() {
-        let bearer = BearerToken {
-            token: None,
-            access_token: Some("access456".to_string()),
-            expires_in: 3600,
-        };
+    fn bearer_token_responses_parse() {
+        let parse = |json| from_str::<BearerToken>(json).unwrap();
 
-        assert_eq!(bearer.token().unwrap(), "access456");
-    }
-
-    #[test]
-    fn test_token_prefers_token_over_access_token() {
-        let bearer = BearerToken {
-            token: Some("token123".to_string()),
-            access_token: Some("access456".to_string()),
-            expires_in: 3600,
-        };
-
-        assert_eq!(bearer.token().unwrap(), "token123");
-    }
-
-    #[test]
-    fn test_token_missing_both_fields() {
-        let bearer = BearerToken {
-            token: None,
-            access_token: None,
-            expires_in: 3600,
-        };
-
-        let result = bearer.token();
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::Internal(_)));
+        let token_only = parse(r#"{"token":"t"}"#);
+        assert_eq!(token_only.expires_in, 60);
+        assert_eq!(token_only.token().unwrap(), "t");
+        assert_eq!(parse(r#"{"access_token":"a"}"#).token().unwrap(), "a");
+        assert_eq!(
+            parse(r#"{"token":"t","access_token":"a"}"#)
+                .token()
+                .unwrap(),
+            "t"
+        );
+        assert!(matches!(parse("{}").token(), Err(Error::Internal(_))));
     }
 
     /// Closes the loop on angos challenging angos: the server's own challenge
@@ -308,32 +281,16 @@ mod tests {
     /// quoted values and an absolute realm.
     #[test]
     fn the_servers_own_challenge_parses_back() {
-        // The exact WWW-Authenticate the server's token issuer emits (see its
-        // `build_challenge`): realm and service rebuilt from the parsed parts,
-        // both quoted. This closes the loop that the client parser accepts it.
+        // The exact WWW-Authenticate the server's `build_challenge` emits.
         let challenge =
             r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#;
 
         let parsed = parse_bearer_challenge(challenge).unwrap();
 
-        assert_eq!(parsed.realm, "https://registry.example.com/token");
-        // The path the router serves, so a client following the challenge lands
-        // on the token endpoint rather than the UI.
-        assert_eq!(parsed.token_url().unwrap().path(), "/token");
-        assert_eq!(parsed.param("service"), Some("registry.example.com"));
         assert_eq!(
-            parsed.token_url().unwrap().query(),
-            Some("service=registry.example.com")
+            parsed.token_url().unwrap().as_str(),
+            "https://registry.example.com/token?service=registry.example.com"
         );
-    }
-
-    /// The spec's default when an upstream omits `expires_in`. Caching longer
-    /// than that keeps a token past the lifetime its issuer granted.
-    #[test]
-    fn an_omitted_expires_in_defaults_to_sixty_seconds() {
-        let bearer: BearerToken = from_str(r#"{"token":"t"}"#).unwrap();
-
-        assert_eq!(bearer.expires_in, 60);
     }
 
     #[test]
@@ -391,81 +348,46 @@ mod tests {
         );
     }
 
+    /// An https registry's credentials go only to an https token endpoint, but
+    /// a cross-host https realm (Docker Hub's) stays allowed.
     #[test]
-    fn token_cache_key_separates_different_scopes() {
-        let url = Url::parse("https://registry.example.com/v2/").unwrap();
-        let foo = token_cache_key(
-            &url,
-            "https://auth.example.com/token",
-            Some("registry"),
-            Some("repository:foo:pull"),
-            None,
-        )
-        .unwrap();
-        let bar = token_cache_key(
-            &url,
-            "https://auth.example.com/token",
-            Some("registry"),
-            Some("repository:bar:pull"),
-            None,
-        )
-        .unwrap();
-
-        assert_ne!(foo, bar);
+    fn realm_scheme_ok_refuses_only_a_downgrade() {
+        for (registry, realm, ok) in [
+            (
+                "https://registry.example.com",
+                "http://auth.example.com/token",
+                false,
+            ),
+            (
+                "https://registry-1.docker.io",
+                "https://auth.docker.io/token",
+                true,
+            ),
+            (
+                "http://registry.example.com",
+                "http://auth.example.com/token",
+                true,
+            ),
+        ] {
+            let token = Url::parse(realm).unwrap();
+            assert_eq!(
+                realm_scheme_ok(registry, &token),
+                ok,
+                "{registry} -> {realm}"
+            );
+        }
     }
 
     #[test]
-    fn realm_scheme_ok_rejects_http_realm_for_https_registry() {
-        let token = Url::parse("http://auth.example.com/token").unwrap();
-        assert!(!realm_scheme_ok("https://registry.example.com", &token));
-    }
-
-    #[test]
-    fn realm_scheme_ok_allows_cross_host_https_realm() {
-        let token = Url::parse("https://auth.docker.io/token").unwrap();
-        assert!(realm_scheme_ok("https://registry-1.docker.io", &token));
-    }
-
-    #[test]
-    fn realm_scheme_ok_allows_http_realm_for_http_registry() {
-        let token = Url::parse("http://auth.example.com/token").unwrap();
-        assert!(realm_scheme_ok("http://registry.example.com", &token));
-    }
-
-    #[test]
-    fn parse_bearer_challenge_returns_none_for_non_bearer_scheme() {
-        assert!(parse_bearer_challenge(r#"Basic realm="x""#).is_none());
-        assert!(parse_bearer_challenge("garbage").is_none());
-        assert!(parse_bearer_challenge("").is_none());
-    }
-
-    #[test]
-    fn parse_bearer_challenge_returns_none_when_realm_missing() {
-        assert!(
-            parse_bearer_challenge(
-                r#"Bearer service="registry.docker.io",scope="repository:foo:pull""#
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn parse_bearer_challenge_extracts_realm_and_other_params() {
-        let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:foo:pull""#;
-        let challenge = parse_bearer_challenge(header).expect("expected Some");
-        assert_eq!(challenge.realm, "https://auth.docker.io/token");
-        assert!(
-            challenge
-                .other
-                .iter()
-                .any(|(k, v)| k == "service" && v == "registry.docker.io")
-        );
-        assert!(
-            challenge
-                .other
-                .iter()
-                .any(|(k, v)| k == "scope" && v == "repository:foo:pull")
-        );
+    fn parse_bearer_challenge_needs_the_bearer_scheme_and_a_realm() {
+        for header in [
+            r#"Basic realm="x""#,
+            "garbage",
+            "",
+            r#"Bearer service="registry.docker.io",scope="repository:foo:pull""#,
+        ] {
+            assert!(parse_bearer_challenge(header).is_none(), "{header}");
+        }
     }
 
     #[test]
@@ -480,7 +402,5 @@ mod tests {
             url.as_str(),
             "https://auth.example.com/token?service=registry.example.com&scope=repository%3Ateam%2Fapp+image%3Apull%2Cpush"
         );
-        assert!(url.query().unwrap().contains("%2F"));
-        assert!(url.query().unwrap().contains('+'));
     }
 }

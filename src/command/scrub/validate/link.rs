@@ -9,13 +9,11 @@ use futures_util::stream::TryChunksError;
 use tracing::{debug, warn};
 
 use angos_oci::{Digest, Manifest, Namespace, Tag};
-use angos_storage::Error as StorageError;
 
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::{Action, AtimeCompaction, WalkedStore};
 use crate::command::scrub::validate::Validator;
 use crate::registry::Error as RegistryError;
-use crate::registry::content_discovery::holds_manifest_content;
 use crate::registry::keys::{NamespaceExt, TagEntry, atime_entry_name, parse_atime_entry};
 use crate::registry::manifest::referenced_digests;
 use crate::registry::metadata_store::access_time::ATIME_CHUNK_CAP;
@@ -26,19 +24,16 @@ impl Validator {
     /// resolved winner must target existing bytes and a resolvable revision.
     pub async fn validate_tag_entries(
         &self,
-        namespace_raw: &str,
-        tag_raw: &str,
+        namespace: &Namespace,
+        tag: &Tag,
     ) -> Result<(), Error> {
-        if !self.claim(format!("tag-entries:{namespace_raw}:{tag_raw}")) {
+        if !self.claim(format!("tag-entries:{namespace}:{tag}")) {
             return Ok(());
         }
-        let (Ok(namespace), Ok(tag)) = (Namespace::new(namespace_raw), Tag::new(tag_raw)) else {
-            return Ok(());
-        };
-        self.demote_superseded_entries(&namespace, &tag).await?;
+        self.demote_superseded_entries(namespace, tag).await?;
         let metadata = match self
             .metadata_store
-            .read_link(&namespace, &LinkKind::Tag(tag.clone()))
+            .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
             Ok(metadata) => metadata,
@@ -46,7 +41,7 @@ impl Validator {
             Err(RegistryError::NotFound) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        self.validate_tag_target(&namespace, &tag, metadata.target, metadata.created_at)
+        self.validate_tag_target(namespace, tag, metadata.target, metadata.created_at)
             .await
     }
 
@@ -85,39 +80,13 @@ impl Validator {
         Ok(())
     }
 
-    /// One tag's access entries, compacted once per (namespace, tag).
-    pub async fn collect_tag_atime_entries(
-        &self,
-        namespace_raw: &str,
-        tag_raw: &str,
-    ) -> Result<(), Error> {
-        let (Ok(namespace), Ok(tag)) = (Namespace::new(namespace_raw), Tag::new(tag_raw)) else {
-            return Ok(());
-        };
-        self.collect_atime_entries(&namespace, &LinkKind::Tag(tag))
-            .await
-    }
-
-    /// One revision's access entries, compacted once per (namespace, digest).
-    pub async fn collect_revision_atime_entries(
-        &self,
-        namespace_raw: &str,
-        digest: &Digest,
-    ) -> Result<(), Error> {
-        let Ok(namespace) = Namespace::new(namespace_raw) else {
-            return Ok(());
-        };
-        self.collect_atime_entries(&namespace, &LinkKind::Digest(digest.clone()))
-            .await
-    }
-
     /// Compact one target's access entries. The newest decodable entry always
     /// stays, since retention needs the last access durably, and an
     /// undecodable body goes. Every other entry past a gate is packed into one
     /// new chunk, written before those entries retire; an entry past the
     /// history bounds is deleted outright, and older chunks are trimmed to
     /// them.
-    async fn collect_atime_entries(
+    pub async fn collect_atime_entries(
         &self,
         namespace: &Namespace,
         link: &LinkKind,
@@ -131,7 +100,7 @@ impl Validator {
         if !self.claim(format!("atime-entries:{dir}")) {
             return Ok(());
         }
-        let history = self.metadata_store.pull_history;
+        let history = self.metadata_store.settings.pull_history;
         let compact_after_secs = history.compaction_age_secs();
         let now = Utc::now();
         let limit = usize::try_from(history.max_pulls.get()).unwrap_or(usize::MAX);
@@ -169,10 +138,8 @@ impl Validator {
                     continue;
                 };
                 let key = format!("{dir}/{name}");
-                let raw = match self.metadata_store.object_store().get(&key).await {
-                    Ok(raw) => raw,
-                    Err(StorageError::NotFound) => continue,
-                    Err(e) => return Err(RegistryError::from(e).into()),
+                let Some(raw) = self.read_metadata_object(&key).await? else {
+                    continue;
                 };
                 let Ok(entry) = serde_json::from_slice::<AccessEntry>(&raw) else {
                     warn!("scrub: access entry '{key}' does not parse; deleting");
@@ -233,7 +200,7 @@ impl Validator {
             max_pulls,
             max_age_secs,
             ..
-        } = self.metadata_store.pull_history;
+        } = self.metadata_store.settings.pull_history;
         let limit = usize::try_from(max_pulls.get()).unwrap_or(usize::MAX);
         let mut chunks = chunks.into_iter().peekable();
 
@@ -311,10 +278,8 @@ impl Validator {
 
     /// One compacted chunk, `None` once it is gone or, not parsing, deleted.
     async fn read_chunk(&self, key: &str) -> Result<Option<Vec<AccessEntry>>, Error> {
-        let raw = match self.metadata_store.object_store().get(key).await {
-            Ok(raw) => raw,
-            Err(StorageError::NotFound) => return Ok(None),
-            Err(e) => return Err(RegistryError::from(e).into()),
+        let Some(raw) = self.read_metadata_object(key).await? else {
+            return Ok(None);
         };
         let Ok(chunk) = serde_json::from_slice(&raw) else {
             warn!("scrub: compacted access chunk '{key}' does not parse; deleting");
@@ -324,7 +289,7 @@ impl Validator {
         Ok(Some(chunk))
     }
 
-    /// The shared tail of both tag shapes: the target must have blob bytes,
+    /// The tag's winner must target blob bytes,
     /// else its orphan manifest is removed, and its revision link is re-issued
     /// when missing. A winning entry inside the grace period is left alone,
     /// since repairing mid-delete would resurrect a deleted manifest.
@@ -336,11 +301,9 @@ impl Validator {
         entry_created_at: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
         self.ensure_catalog(namespace).await?;
-        if let Some(created_at) = entry_created_at {
-            let grace = i64::try_from(self.metadata_store.gc_grace_secs).unwrap_or(i64::MAX);
-            if Utc::now().signed_duration_since(created_at).num_seconds() < grace {
-                return Ok(());
-            }
+        let grace = Some(self.metadata_store.settings.gc_grace_secs);
+        if entry_created_at.is_some_and(|created_at| !older_than(Utc::now(), created_at, grace)) {
+            return Ok(());
         }
         match self.blob_store.size(&target).await {
             Ok(_) => {
@@ -372,14 +335,9 @@ impl Validator {
     /// Each revision has the one record, so the walk reaches it once.
     pub async fn validate_revision_record(
         &self,
-        namespace_raw: &str,
+        namespace: &Namespace,
         revision: &Digest,
     ) -> Result<(), Error> {
-        // `categorize` rejects an unaddressable namespace before dispatch.
-        let Ok(namespace) = Namespace::new(namespace_raw) else {
-            return Ok(());
-        };
-        let namespace = &namespace;
         self.ensure_catalog(namespace).await?;
 
         // A revision younger than the grace period may belong to a push whose
@@ -460,31 +418,15 @@ impl Validator {
         Ok(())
     }
 
-    /// Whether the revision's record exists, the shape that makes a digest
-    /// resolvable.
-    async fn revision_exists(&self, namespace: &Namespace, digest: &Digest) -> Result<bool, Error> {
-        let record_key = namespace.revision_record_path(digest);
-        Ok(self
-            .metadata_store
-            .object_store()
-            .exists(&record_key)
-            .await
-            .map_err(RegistryError::from)?)
-    }
-
     /// Emit the namespace's catalog index key when it is missing, once per
     /// namespace per run.
     async fn ensure_catalog(&self, namespace: &Namespace) -> Result<(), Error> {
         if !self.claim(format!("catalog:{namespace}")) {
             return Ok(());
         }
-        let key = namespace.catalog_index_path();
         if self
-            .metadata_store
-            .object_store()
-            .exists(&key)
-            .await
-            .map_err(RegistryError::from)?
+            .metadata_exists(&namespace.catalog_index_path())
+            .await?
         {
             return Ok(());
         }
@@ -499,25 +441,16 @@ impl Validator {
     /// window, so the admin listings stop naming it. A push landing in the
     /// meantime rewrites the key, and a race against that is repaired by the
     /// next run's `ensure_catalog`.
-    pub async fn validate_catalog_index(&self, namespace_raw: &str) -> Result<(), Error> {
-        // `categorize` rejects an unaddressable namespace before dispatch.
-        let Ok(namespace) = Namespace::new(namespace_raw) else {
-            return Ok(());
-        };
+    pub async fn validate_catalog_index(&self, namespace: Namespace) -> Result<(), Error> {
         let key = namespace.catalog_index_path();
-        if !self
+        if !self.metadata_exists(&key).await? || self.younger_than_grace(&key).await? {
+            return Ok(());
+        }
+        if self
             .metadata_store
-            .object_store()
-            .exists(&key)
-            .await
-            .map_err(RegistryError::from)?
+            .holds_manifest_content(&namespace)
+            .await?
         {
-            return Ok(());
-        }
-        if self.younger_than_grace(&key).await? {
-            return Ok(());
-        }
-        if holds_manifest_content(&self.metadata_store, namespace.clone()).await? {
             return Ok(());
         }
         self.emit(Action::ReapCatalogIndex { namespace }).await
@@ -546,70 +479,29 @@ impl Validator {
     /// revision.
     pub async fn validate_referrer_record(
         &self,
-        namespace_raw: &str,
-        subject: &Digest,
-        referrer: &Digest,
+        namespace: Namespace,
+        subject: Digest,
+        referrer: Digest,
     ) -> Result<(), Error> {
-        // `categorize` rejects an unaddressable namespace before dispatch.
-        let Ok(namespace) = Namespace::new(namespace_raw) else {
-            return Ok(());
-        };
-        let key = namespace.referrer_record_path(subject, referrer);
-        if !self
-            .metadata_store
-            .object_store()
-            .exists(&key)
-            .await
-            .map_err(RegistryError::from)?
-        {
-            return Ok(());
-        }
+        let key = namespace.referrer_record_path(&subject, &referrer);
         // A young record may precede its referrer's revision inside a push, or
         // follow a delete the walk raced; either way pruning waits.
-        if self.younger_than_grace(&key).await? {
+        if !self.metadata_exists(&key).await? || self.younger_than_grace(&key).await? {
             return Ok(());
         }
-        if self.revision_exists(&namespace, referrer).await? {
-            return Ok(());
-        }
-        self.remove_dead_referrer(&namespace, subject, referrer)
-            .await
-    }
-
-    /// The shared removal tail of both referrer shapes: confirm the referrer
-    /// manifest is durably gone, then emit the orphan-referrer deletion.
-    async fn remove_dead_referrer(
-        &self,
-        namespace: &Namespace,
-        subject: &Digest,
-        referrer: &Digest,
-    ) -> Result<(), Error> {
-        if self.revision_exists(namespace, referrer).await? {
-            return Ok(());
+        // Checked twice, so the referrer manifest is confirmed durably gone.
+        let revision = namespace.revision_record_path(&referrer);
+        for _ in 0..2 {
+            if self.metadata_exists(&revision).await? {
+                return Ok(());
+            }
         }
         self.emit(Action::DeleteOrphanReferrer {
-            namespace: namespace.clone(),
-            subject: subject.clone(),
-            referrer: referrer.clone(),
+            namespace,
+            subject,
+            referrer,
         })
         .await
-    }
-
-    /// Whether the referrer's record key exists, the shape the write path
-    /// creates for a referrer link.
-    async fn referrer_record_exists(
-        &self,
-        namespace: &Namespace,
-        subject: &Digest,
-        referrer: &Digest,
-    ) -> Result<bool, Error> {
-        let key = namespace.referrer_record_path(subject, referrer);
-        Ok(self
-            .metadata_store
-            .object_store()
-            .exists(&key)
-            .await
-            .map_err(RegistryError::from)?)
     }
 
     /// Recreate `link -> expected` when its record is confirmed missing, and
@@ -621,23 +513,18 @@ impl Validator {
         link: &LinkKind,
         expected: &Digest,
     ) -> Result<(), Error> {
-        let missing = move || async move {
-            match link {
-                LinkKind::Digest(_) => {
-                    Ok::<_, Error>(!self.revision_exists(namespace, expected).await?)
-                }
-                LinkKind::Referrer { subject, referrer } => Ok(!self
-                    .referrer_record_exists(namespace, subject, referrer)
-                    .await?),
-                // Every other kind is pinned by its reference entry alone.
-                _ => Ok(false),
+        let record = match link {
+            LinkKind::Digest(_) => namespace.revision_record_path(expected),
+            LinkKind::Referrer { subject, referrer } => {
+                namespace.referrer_record_path(subject, referrer)
             }
+            // Every other kind is pinned by its reference entry alone.
+            _ => return Ok(()),
         };
-        if !missing().await? {
-            return Ok(());
-        }
-        if !missing().await? {
-            return Ok(());
+        for _ in 0..2 {
+            if self.metadata_exists(&record).await? {
+                return Ok(());
+            }
         }
         self.emit(Action::RecreateLink {
             namespace: namespace.clone(),

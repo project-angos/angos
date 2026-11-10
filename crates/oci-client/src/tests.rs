@@ -22,7 +22,7 @@ use angos_oci::response::{DeleteManifestOutcome, PutManifestOutcome, REPLICATION
 use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag};
 
 use angos_cache::Config;
-use angos_mtls_client::{BasicAuth, ClientTls, MtlsIdentity};
+use angos_mtls_client::{BasicAuth, ClientTls};
 use angos_secret::Secret;
 
 use crate::auth::{token_cache_key, token_index_cache_key};
@@ -31,6 +31,9 @@ use crate::{Error, RegistryClient, RegistryClientConfig, without_query};
 /// The registry's default; inlined so the client crate's tests do not reach
 /// into the server-side manifest module.
 const DEFAULT_MAX_MANIFEST_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
+const DIGEST: &str = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const MANIFEST_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 
 fn test_client_config(url: String) -> RegistryClientConfig {
     RegistryClientConfig {
@@ -41,6 +44,104 @@ fn test_client_config(url: String) -> RegistryClientConfig {
         tls: ClientTls::default(),
         basic_auth: None,
     }
+}
+
+fn basic_auth_config(url: String, password: &str) -> RegistryClientConfig {
+    RegistryClientConfig {
+        basic_auth: Some(BasicAuth {
+            username: "user".to_string(),
+            password: Secret::new(password.to_string()),
+        }),
+        ..test_client_config(url)
+    }
+}
+
+fn client_with(config: &RegistryClientConfig) -> RegistryClient {
+    let cache = Config::Memory.to_backend().unwrap();
+    RegistryClient::from_config(config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
+}
+
+fn client_for(mock_server: &MockServer) -> RegistryClient {
+    client_with(&test_client_config(mock_server.uri()))
+}
+
+fn test_namespace() -> Namespace {
+    Namespace::new("test").unwrap()
+}
+
+fn latest() -> Reference {
+    Reference::Tag(Tag::new("latest").unwrap())
+}
+
+fn v1() -> Reference {
+    Reference::Tag(Tag::new("v1").unwrap())
+}
+
+fn head_blob_request() -> HeadBlobRequest {
+    HeadBlobRequest {
+        namespace: test_namespace(),
+        digest: Digest::try_from(DIGEST).unwrap(),
+        accepted_types: Vec::new(),
+    }
+}
+
+fn get_blob_request() -> GetBlobRequest {
+    GetBlobRequest {
+        namespace: test_namespace(),
+        digest: Digest::try_from(DIGEST).unwrap(),
+        accepted_types: Vec::new(),
+        range: None,
+    }
+}
+
+fn get_manifest_request() -> GetManifestRequest {
+    GetManifestRequest {
+        namespace: test_namespace(),
+        reference: latest(),
+        accepted_types: Vec::new(),
+    }
+}
+
+fn put_manifest_request(source_ts: Option<DateTime<Utc>>) -> PutManifestRequest {
+    PutManifestRequest {
+        namespace: test_namespace(),
+        reference: v1(),
+        content_type: Some(MediaType::new(MANIFEST_TYPE).unwrap()),
+        tags: Vec::new(),
+        source_ts,
+    }
+}
+
+fn list_tags_request(namespace: &str) -> ListTagsRequest {
+    ListTagsRequest {
+        namespace: Namespace::new(namespace).unwrap(),
+        n: None,
+        last: None,
+    }
+}
+
+fn mount_request(from: Option<&str>) -> MountBlobRequest {
+    MountBlobRequest {
+        namespace: Namespace::new("target").unwrap(),
+        mount: BlobMount {
+            digest: Digest::try_from(DIGEST).unwrap(),
+            from: from.map(|from| Namespace::new(from).unwrap()),
+        },
+    }
+}
+
+fn bearer_challenge(params: &str) -> ResponseTemplate {
+    ResponseTemplate::new(401).insert_header("WWW-Authenticate", format!("Bearer {params}"))
+}
+
+fn token_response(token: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"token": token, "expires_in": 3600}))
+}
+
+fn manifest_response() -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_bytes(b"{}")
+        .insert_header("Content-Type", "application/json")
 }
 
 /// Collects tracing output into a shared buffer; every clone appends to the
@@ -67,26 +168,6 @@ impl<'a> MakeWriter<'a> for LogCapture {
     }
 }
 
-/// The blob the scope-cache test fetches; its URL is also what the cache keys
-/// are derived from, so both sides read the digest from here.
-const SCOPE_CACHE_DIGEST: &str =
-    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-
-/// The origin timestamp a replication write stamps. The header carries whatever
-/// `to_rfc3339` renders it as, which is what the sender puts on the wire.
-fn source_ts() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-06-03T00:00:00Z")
-        .expect("fixture timestamp must be RFC 3339")
-        .with_timezone(&Utc)
-}
-
-/// Builds a no-auth client pointed at `mock_server`.
-fn client_for(mock_server: &MockServer) -> RegistryClient {
-    let config = test_client_config(mock_server.uri());
-    let cache = Config::Memory.to_backend().unwrap();
-    RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap()
-}
-
 /// A lone username or password, a misspelled key away from the pair, would
 /// otherwise run anonymous and surface later as 401s or rate limits.
 #[test]
@@ -104,17 +185,10 @@ fn a_half_credential_pair_is_rejected_at_deserialize() {
 // Debug-formatted in logs; the configured password must never appear there.
 #[test]
 fn debug_output_redacts_basic_auth_password() {
-    let config = RegistryClientConfig {
-        basic_auth: Some(BasicAuth {
-            username: "user".to_string(),
-            password: Secret::new("hunter2".to_string()),
-        }),
-        ..test_client_config("https://example.com".to_string())
-    };
-
-    let cache = Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let client = client_with(&basic_auth_config(
+        "https://example.com".to_string(),
+        "hunter2",
+    ));
 
     let debug = format!("{client:?}");
     assert!(
@@ -124,355 +198,166 @@ fn debug_output_redacts_basic_auth_password() {
     assert!(debug.contains("[REDACTED]"));
 }
 
-#[tokio::test]
-async fn test_head_blob_success() {
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(DOCKER_CONTENT_DIGEST, test_digest)
-                .insert_header("Content-Length", "1234"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .head_blob(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
-    let (digest, size) = result.unwrap();
-    assert_eq!(digest, Digest::try_from(test_digest).unwrap());
-    assert_eq!(size, 1234);
-}
-
 /// A registry that redirects blob HEADs to a CDN answers without
 /// `Docker-Content-Digest`; the blob asked for by digest is that digest.
 #[tokio::test]
-async fn test_head_blob_without_digest_header_reports_the_requested_digest() {
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+async fn head_blob_reports_the_digest_and_size() {
+    for with_digest in [true, false] {
+        let mock_server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(200).insert_header("Content-Length", "1234");
+        if with_digest {
+            response = response.insert_header(DOCKER_CONTENT_DIGEST, DIGEST);
+        }
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/test/blobs/{DIGEST}")))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
-        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "1234"))
-        .mount(&mock_server)
-        .await;
+        let head = client_for(&mock_server)
+            .head_blob(head_blob_request())
+            .await
+            .unwrap();
 
-    let (digest, size) = client_for(&mock_server)
-        .head_blob(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(digest, Digest::try_from(test_digest).unwrap());
-    assert_eq!(size, 1234);
+        assert_eq!(head, (Digest::try_from(DIGEST).unwrap(), 1234));
+    }
 }
 
+/// `BlobUnknown` means absent: an outage read as one would make replication
+/// re-upload and pull-through serve a miss.
 #[tokio::test]
-async fn test_head_blob_not_found() {
-    let mock_server = MockServer::start().await;
+async fn only_a_404_reads_as_an_unknown_blob() {
+    for status in [404, 503] {
+        let mock_server = MockServer::start().await;
+        Mock::given(path(format!("/v2/test/blobs/{DIGEST}")))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
+        let client = client_for(&mock_server);
 
-    Mock::given(method("HEAD"))
-        .and(path("/v2/test/blobs/sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
+        let head = client.head_blob(head_blob_request()).await.unwrap_err();
+        let get = client.get_blob(get_blob_request()).await.err().unwrap();
 
-    let client = client_for(&mock_server);
-
-    let result = client
-        .head_blob(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(
-                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            )
-            .unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::BlobUnknown));
+        for error in [head, get] {
+            if status == 404 {
+                assert!(matches!(error, Error::BlobUnknown), "got {error:?}");
+            } else {
+                assert!(matches!(error, Error::Internal(_)), "got {error:?}");
+            }
+        }
+    }
 }
 
+/// The OCI spec makes `Docker-Content-Digest` a SHOULD on blob HEAD, so a 2xx
+/// without it is present; a 5xx fails the probe so the job retries instead of
+/// re-uploading.
 #[tokio::test]
-async fn test_blob_exists_true_when_digest_header_absent() {
-    // The OCI spec makes Docker-Content-Digest a SHOULD on blob HEAD; a 2xx
-    // without it must read as present, not as a probe failure that would
-    // dead-letter a converged push.
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+async fn blob_exists_reads_2xx_as_present_404_as_absent_and_else_fails() {
+    for (status, expected) in [(200, Some(true)), (404, Some(false)), (503, None)] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/test/blobs/{DIGEST}")))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
+        let present = client_for(&mock_server)
+            .blob_exists(head_blob_request())
+            .await
+            .ok();
 
-    let client = client_for(&mock_server);
-
-    let present = client
-        .blob_exists(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        present,
-        "a 2xx HEAD without a digest header must read as present"
-    );
+        assert_eq!(present, expected, "status {status}");
+    }
 }
 
+/// `Docker-Content-Digest` is a SHOULD, so a missing one reads as an unknown
+/// digest rather than failing the probe.
 #[tokio::test]
-async fn test_blob_exists_false_on_404() {
-    let mock_server = MockServer::start().await;
+async fn head_manifest_reports_media_type_digest_and_size() {
+    for with_digest in [true, false] {
+        let mock_server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(200)
+            .insert_header("Content-Type", MANIFEST_TYPE)
+            .insert_header("Content-Length", "5678");
+        if with_digest {
+            response = response.insert_header(DOCKER_CONTENT_DIGEST, DIGEST);
+        }
+        Mock::given(method("HEAD"))
+            .and(path("/v2/test/manifests/latest"))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("HEAD"))
-        .and(path("/v2/test/blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
+        let head = client_for(&mock_server)
+            .head_manifest(HeadManifestRequest {
+                namespace: test_namespace(),
+                reference: latest(),
+                accepted_types: Vec::new(),
+            })
+            .await
+            .unwrap();
 
-    let client = client_for(&mock_server);
-
-    let present = client
-        .blob_exists(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .unwrap();
-    assert!(!present, "a 404 HEAD must read as absent");
+        assert_eq!(
+            head.media_type,
+            Some(MediaType::new(MANIFEST_TYPE).unwrap())
+        );
+        assert_eq!(
+            head.digest,
+            with_digest.then(|| Digest::try_from(DIGEST).unwrap())
+        );
+        assert_eq!(head.size, 5678);
+    }
 }
 
+/// Without `Docker-Content-Digest` the body is what the caller hashes to
+/// recover the digest.
 #[tokio::test]
-async fn test_blob_exists_errors_on_server_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("HEAD"))
-        .and(path("/v2/test/blobs/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .blob_exists(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            )
-            .unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await;
-    assert!(
-        result.is_err(),
-        "a transient 5xx must fail the probe so the job retries instead of re-uploading"
-    );
-}
-
-#[tokio::test]
-async fn test_head_manifest_success() {
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-
-    Mock::given(method("HEAD"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(DOCKER_CONTENT_DIGEST, test_digest)
-                .insert_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                )
-                .insert_header("Content-Length", "5678"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .head_manifest(HeadManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
-    let head = result.unwrap();
-    assert_eq!(
-        head.media_type,
-        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
-    );
-    assert_eq!(head.digest, Some(Digest::try_from(test_digest).unwrap()));
-    assert_eq!(head.size, 5678);
-}
-
-/// `Docker-Content-Digest` is a SHOULD, so a conformant upstream may omit it.
-/// A HEAD carries no body to recompute it from, so the digest reads as unknown
-/// instead of failing the whole probe.
-#[tokio::test]
-async fn head_manifest_without_content_digest_reports_an_unknown_digest() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("HEAD"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                )
-                .insert_header("Content-Length", "5678"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let head = client_for(&mock_server)
-        .head_manifest(HeadManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .expect("a manifest HEAD without Docker-Content-Digest must still succeed");
-
-    assert_eq!(head.digest, None);
-    assert_eq!(
-        head.media_type,
-        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
-    );
-    assert_eq!(head.size, 5678);
-}
-
-/// The GET counterpart: the digest is unknown to the client, and the body it
-/// returns is what the caller hashes to recover it.
-#[tokio::test]
-async fn get_manifest_without_content_digest_still_returns_the_body() {
-    let mock_server = MockServer::start().await;
+async fn get_manifest_returns_the_body_with_or_without_a_digest() {
     let manifest_body = b"{\"schemaVersion\":2}";
+    for with_digest in [true, false] {
+        let mock_server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(200)
+            .set_body_bytes(manifest_body)
+            .insert_header("Content-Type", MANIFEST_TYPE);
+        if with_digest {
+            response = response.insert_header(DOCKER_CONTENT_DIGEST, DIGEST);
+        }
+        Mock::given(method("GET"))
+            .and(path("/v2/test/manifests/latest"))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(manifest_body)
-                .insert_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                ),
-        )
-        .mount(&mock_server)
-        .await;
+        let fetched = client_for(&mock_server)
+            .get_manifest(get_manifest_request())
+            .await
+            .unwrap();
 
-    let fetched = client_for(&mock_server)
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .expect("a manifest GET without Docker-Content-Digest must still succeed");
-
-    assert_eq!(fetched.digest, None);
-    assert_eq!(fetched.body, manifest_body);
-}
-
-#[tokio::test]
-async fn test_get_manifest_success() {
-    let mock_server = MockServer::start().await;
-    let manifest_body = b"{\"schemaVersion\":2}";
-    let test_digest = "sha256:fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
-
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(manifest_body)
-                .insert_header(DOCKER_CONTENT_DIGEST, test_digest)
-                .insert_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                ),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
-    let fetched = result.unwrap();
-    assert_eq!(
-        fetched.media_type,
-        Some(MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap())
-    );
-    assert_eq!(fetched.digest, Some(Digest::try_from(test_digest).unwrap()));
-    assert_eq!(fetched.body, manifest_body);
+        assert_eq!(
+            fetched.media_type,
+            Some(MediaType::new(MANIFEST_TYPE).unwrap())
+        );
+        assert_eq!(
+            fetched.digest,
+            with_digest.then(|| Digest::try_from(DIGEST).unwrap())
+        );
+        assert_eq!(fetched.body, manifest_body);
+    }
 }
 
 #[tokio::test]
 async fn test_get_manifest_rejects_oversized_body() {
     let mock_server = MockServer::start().await;
-    let oversized_body = vec![b' '; 8];
-    let test_digest = "sha256:fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(oversized_body)
-                .insert_header(DOCKER_CONTENT_DIGEST, test_digest)
-                .insert_header(
-                    "Content-Type",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; 8]))
         .mount(&mock_server)
         .await;
 
-    let config = test_client_config(mock_server.uri());
-
     let cache = Config::Memory.to_backend().unwrap();
-    let client = RegistryClient::from_config(&config, cache, 7).unwrap();
-
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
+    let client =
+        RegistryClient::from_config(&test_client_config(mock_server.uri()), cache, 7).unwrap();
+    let result = client.get_manifest(get_manifest_request()).await;
 
     assert!(matches!(
         result,
@@ -487,8 +372,7 @@ async fn test_get_manifest_rejects_oversized_body() {
 async fn a_scope_cache_hit_indexes_the_url_it_served() {
     let mock_server = MockServer::start().await;
     let registry_url = mock_server.uri();
-    let location = format!("{registry_url}/v2/test/blobs/{SCOPE_CACHE_DIGEST}");
-    let url = Url::parse(&location).unwrap();
+    let url = Url::parse(&format!("{registry_url}/v2/test/blobs/{DIGEST}")).unwrap();
     let cache = Config::Memory.to_backend().unwrap();
 
     // The scope token is cached, but this URL has never been indexed: the
@@ -509,34 +393,27 @@ async fn a_scope_cache_hit_indexes_the_url_it_served() {
     assert!(cache.retrieve_value(&index_key).await.unwrap().is_none());
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/test/blobs/{SCOPE_CACHE_DIGEST}")))
+        .and(path(format!("/v2/test/blobs/{DIGEST}")))
         .and(header("Authorization", "Bearer scope-token"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"blob"))
         .mount(&mock_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/test/blobs/{SCOPE_CACHE_DIGEST}")))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{registry_url}/token",service="registry",scope="repository:test:pull""#
-            )
-            .as_str(),
-        ))
+        .and(path(format!("/v2/test/blobs/{DIGEST}")))
+        .respond_with(bearer_challenge(&format!(
+            r#"realm="{registry_url}/token",service="registry",scope="repository:test:pull""#
+        )))
         .mount(&mock_server)
         .await;
 
-    let config = test_client_config(registry_url);
-    let client =
-        RegistryClient::from_config(&config, cache.clone(), DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .unwrap();
+    let client = RegistryClient::from_config(
+        &test_client_config(registry_url),
+        cache.clone(),
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .unwrap();
     client
-        .get_blob(GetBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(SCOPE_CACHE_DIGEST).unwrap(),
-            accepted_types: Vec::new(),
-            range: None,
-        })
+        .get_blob(get_blob_request())
         .await
         .expect("blob fetch");
 
@@ -548,170 +425,59 @@ async fn a_scope_cache_hit_indexes_the_url_it_served() {
 }
 
 #[tokio::test]
-async fn test_cached_bearer_token_is_used() {
-    let mock_server = MockServer::start().await;
-    let registry_url = mock_server.uri();
-    let location = format!("{registry_url}/v2/test/manifests/latest");
-    let cache = Config::Memory.to_backend().unwrap();
-    let url = Url::parse(&location).unwrap();
-    let cache_key = token_cache_key(
-        &url,
-        "https://auth.example.com/token",
-        Some("registry"),
-        Some("repository:test:pull"),
-        None,
-    )
-    .unwrap();
-    cache
-        .store_value(&cache_key, "Bearer cached-token", 3600)
-        .await
-        .unwrap();
-    cache
-        .store_value(
-            &token_index_cache_key(&url, None).unwrap(),
-            &cache_key,
-            3600,
-        )
-        .await
-        .unwrap();
-
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .and(header("Authorization", "Bearer cached-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let config = test_client_config(registry_url);
-
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
 async fn test_bearer_tokens_are_cached_per_scope() {
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;
-    let alpha_namespace = Namespace::new("alpha").unwrap();
-    let beta_namespace = Namespace::new("beta").unwrap();
-    let latest = Reference::Tag(Tag::new("latest").unwrap());
 
-    Mock::given(method("GET"))
-        .and(path("/v2/alpha/manifests/latest"))
-        .and(|request: &Request| !request.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:alpha:pull""#,
+    for name in ["alpha", "beta"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{name}/manifests/latest")))
+            .and(|request: &Request| !request.headers.contains_key("authorization"))
+            .respond_with(bearer_challenge(&format!(
+                r#"realm="{}",service="registry",scope="repository:{name}:pull""#,
                 auth_server.uri()
-            ),
-        ))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v2/beta/manifests/latest"))
-        .and(|request: &Request| !request.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:beta:pull""#,
-                auth_server.uri()
-            ),
-        ))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
-        .and(query_param("scope", "repository:alpha:pull"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"token": "token-alpha", "expires_in": 3600})),
-        )
-        .expect(1)
-        .mount(&auth_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
-        .and(query_param("scope", "repository:beta:pull"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"token": "token-beta", "expires_in": 3600})),
-        )
-        .expect(1)
-        .mount(&auth_server)
-        .await;
-
+            )))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("service", "registry"))
+            .and(query_param("scope", format!("repository:{name}:pull")))
+            .respond_with(token_response(&format!("token-{name}")))
+            .expect(1)
+            .mount(&auth_server)
+            .await;
+    }
     Mock::given(method("GET"))
         .and(path("/v2/alpha/manifests/latest"))
         .and(header("Authorization", "Bearer token-alpha"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
+        .respond_with(manifest_response())
         .expect(2)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("GET"))
         .and(path("/v2/beta/manifests/latest"))
         .and(header("Authorization", "Bearer token-beta"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
+        .respond_with(manifest_response())
         .expect(1)
         .mount(&mock_server)
         .await;
 
     let client = client_for(&mock_server);
-
-    let fetch = async |namespace: &Namespace| {
+    let fetch = async |name: &str| {
         client
             .get_manifest(GetManifestRequest {
-                namespace: namespace.clone(),
-                reference: latest.clone(),
+                namespace: Namespace::new(name).unwrap(),
+                reference: latest(),
                 accepted_types: Vec::new(),
             })
             .await
     };
     // Alpha twice: the second read must be served by the cached scope token,
     // which the `expect(1)` on the 401 mock pins.
-    assert!(fetch(&alpha_namespace).await.is_ok());
-    assert!(fetch(&beta_namespace).await.is_ok());
-    assert!(fetch(&alpha_namespace).await.is_ok());
+    assert!(fetch("alpha").await.is_ok());
+    assert!(fetch("beta").await.is_ok());
+    assert!(fetch("alpha").await.is_ok());
 }
 
 #[tokio::test]
@@ -719,9 +485,8 @@ async fn test_expired_bearer_token_is_refetched() {
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;
     let registry_url = mock_server.uri();
-    let location = format!("{registry_url}/v2/test/manifests/latest");
     let cache = Config::Memory.to_backend().unwrap();
-    let url = Url::parse(&location).unwrap();
+    let url = Url::parse(&format!("{registry_url}/v2/test/manifests/latest")).unwrap();
     let cache_key = token_cache_key(
         &url,
         &format!("{}/token", auth_server.uri()),
@@ -744,67 +509,42 @@ async fn test_expired_bearer_token_is_refetched() {
         .unwrap();
 
     Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
         .and(header("Authorization", "Bearer stale-token"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:test:pull""#,
-                auth_server.uri()
-            ),
-        ))
+        .and(header("Authorization", "Bearer fresh-token"))
+        .respond_with(manifest_response())
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/test/manifests/latest"))
+        .respond_with(bearer_challenge(&format!(
+            r#"realm="{}",service="registry",scope="repository:test:pull""#,
+            auth_server.uri()
+        )))
         .up_to_n_times(1)
         .expect(1)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
         .and(query_param("scope", "repository:test:pull"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"token": "fresh-token", "expires_in": 3600})),
-        )
+        .respond_with(token_response("fresh-token"))
         .expect(1)
         .mount(&auth_server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .and(header("Authorization", "Bearer fresh-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let config = test_client_config(registry_url);
-
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
+    let client = RegistryClient::from_config(
+        &test_client_config(registry_url),
+        cache,
+        DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+    )
+    .unwrap();
+    assert!(client.get_manifest(get_manifest_request()).await.is_ok());
 }
 
 #[tokio::test]
@@ -815,56 +555,29 @@ async fn test_concurrent_bearer_refresh_uses_single_token_exchange() {
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
         .and(|request: &Request| !request.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:test:pull""#,
-                auth_server.uri()
-            ),
-        ))
+        .respond_with(bearer_challenge(&format!(
+            r#"realm="{}",service="registry",scope="repository:test:pull""#,
+            auth_server.uri()
+        )))
         .expect(10)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
         .and(query_param("scope", "repository:test:pull"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(50))
-                .set_body_json(serde_json::json!({"token": "shared-token", "expires_in": 3600})),
-        )
+        .respond_with(token_response("shared-token").set_delay(Duration::from_millis(50)))
         .expect(1)
         .mount(&auth_server)
         .await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
         .and(header("Authorization", "Bearer shared-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
+        .respond_with(manifest_response())
         .expect(10)
         .mount(&mock_server)
         .await;
 
     let client = client_for(&mock_server);
-    let namespace = Namespace::new("test").unwrap();
-    let reference = Reference::Tag(Tag::new("latest").unwrap());
-    let results = join_all((0..10).map(|_| {
-        client.get_manifest(GetManifestRequest {
-            namespace: namespace.clone(),
-            reference: reference.clone(),
-            accepted_types: Vec::new(),
-        })
-    }))
-    .await;
+    let results = join_all((0..10).map(|_| client.get_manifest(get_manifest_request()))).await;
 
     assert!(results.iter().all(Result::is_ok));
 }
@@ -872,7 +585,6 @@ async fn test_concurrent_bearer_refresh_uses_single_token_exchange() {
 #[tokio::test]
 async fn test_basic_authentication() {
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
         .respond_with(
@@ -882,43 +594,17 @@ async fn test_basic_authentication() {
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
         .and(header("Authorization", "Basic dXNlcjpwYXNz"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"{}")
-                .insert_header(
-                    DOCKER_CONTENT_DIGEST,
-                    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-                )
-                .insert_header("Content-Type", "application/json"),
-        )
+        .respond_with(manifest_response())
+        .expect(1)
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        basic_auth: Some(BasicAuth {
-            username: "user".to_string(),
-            password: Secret::new("pass".to_string()),
-        }),
-        ..test_client_config(mock_server.uri())
-    };
+    let client = client_with(&basic_auth_config(mock_server.uri(), "pass"));
 
-    let cache = Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
-
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(result.is_ok());
+    assert!(client.get_manifest(get_manifest_request()).await.is_ok());
 }
 
 /// The normal scope-denied token flow: the first attempt 401s, the refreshed
@@ -932,7 +618,7 @@ async fn a_forbidden_response_after_a_token_refresh_is_denied() {
 
     Mock::given(method("GET"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "token": "scoped" })))
+        .respond_with(token_response("scoped"))
         .mount(&mock_server)
         .await;
     // Authenticated: the credential is valid but lacks the scope.
@@ -944,19 +630,14 @@ async fn a_forbidden_response_after_a_token_refresh_is_denied() {
         .await;
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(r#"Bearer realm="{registry_url}/token",service="registry""#).as_str(),
-        ))
+        .respond_with(bearer_challenge(&format!(
+            r#"realm="{registry_url}/token",service="registry""#
+        )))
         .mount(&mock_server)
         .await;
 
     let error = client_for(&mock_server)
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
+        .get_manifest(get_manifest_request())
         .await
         .expect_err("a 403 must not read as a successful fetch");
 
@@ -967,83 +648,43 @@ async fn a_forbidden_response_after_a_token_refresh_is_denied() {
 }
 
 /// A token obtained moments ago will not become valid on another attempt, so a
-/// persistent 401 is terminal rather than a raw response for a read path to
-/// mislabel.
+/// persistent 401 is terminal; a token service that is down or throttling
+/// refused nothing, so it reads as an outage, not a refusal.
 #[tokio::test]
-async fn a_persistent_unauthorized_after_a_refresh_is_terminal() {
-    let mock_server = MockServer::start().await;
-    let registry_url = mock_server.uri();
-
-    Mock::given(method("GET"))
-        .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "token": "scoped" })))
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(r#"Bearer realm="{registry_url}/token",service="registry""#).as_str(),
-        ))
-        .mount(&mock_server)
-        .await;
-
-    let error = client_for(&mock_server)
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
-        .await
-        .expect_err("a persistent 401 must not read as a successful fetch");
-
-    assert!(
-        matches!(error, Error::Unauthorized(_)),
-        "a rejected fresh token must be terminal, got: {error:?}"
-    );
-}
-
-/// A token service that is down or throttling refused nothing, so it reads as
-/// no answer, as the registry's own 5xx does; one that turns the credential
-/// away is still `Unauthorized`.
-#[tokio::test]
-async fn a_failing_token_service_is_an_outage_not_a_refusal() {
-    for (status, outage) in [(503, true), (429, true), (401, false)] {
+async fn a_failed_token_refresh_is_classified_by_who_failed() {
+    for (token_status, outage) in [(200, false), (401, false), (429, true), (503, true)] {
         let mock_server = MockServer::start().await;
         let registry_url = mock_server.uri();
 
         Mock::given(method("GET"))
             .and(path("/token"))
-            .respond_with(ResponseTemplate::new(status))
+            .respond_with(
+                ResponseTemplate::new(token_status).set_body_json(json!({ "token": "scoped" })),
+            )
             .mount(&mock_server)
             .await;
         Mock::given(method("GET"))
             .and(path("/v2/test/manifests/latest"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{registry_url}/token",service="registry""#).as_str(),
-            ))
+            .respond_with(bearer_challenge(&format!(
+                r#"realm="{registry_url}/token",service="registry""#
+            )))
             .mount(&mock_server)
             .await;
 
         let error = client_for(&mock_server)
-            .get_manifest(GetManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                accepted_types: Vec::new(),
-            })
+            .get_manifest(get_manifest_request())
             .await
-            .expect_err("a failed token exchange must fail the fetch");
+            .expect_err("a failed token refresh must fail the fetch");
 
         if outage {
             assert!(
                 matches!(error, Error::Internal(_)),
-                "a token service answering {status} is an outage, got: {error:?}"
+                "token service {token_status}: got {error:?}"
             );
         } else {
             assert!(
                 matches!(error, Error::Unauthorized(_)),
-                "a token service answering {status} is a refusal, got: {error:?}"
+                "token service {token_status}: got {error:?}"
             );
         }
     }
@@ -1052,115 +693,38 @@ async fn a_failing_token_service_is_an_outage_not_a_refusal() {
 #[tokio::test]
 async fn test_forbidden_access() {
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/manifests/latest"))
         .respond_with(ResponseTemplate::new(403))
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-
-    let result = client
-        .get_manifest(GetManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            accepted_types: Vec::new(),
-        })
+    let result = client_for(&mock_server)
+        .get_manifest(get_manifest_request())
         .await;
 
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::Denied(_)));
+    assert!(matches!(result, Err(Error::Denied(_))));
 }
 
 #[tokio::test]
 async fn test_get_blob_success() {
     let mock_server = MockServer::start().await;
-    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let blob_data = b"test blob content here";
-
     Mock::given(method("GET"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
+        .and(path(format!("/v2/test/blobs/{DIGEST}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_data))
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-
-    let result = client
-        .get_blob(GetBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-            range: None,
-        })
-        .await;
-
-    assert!(result.is_ok());
-    let fetched = result.unwrap();
-    assert_eq!(fetched.length, blob_data.len() as u64);
-    let mut reader = fetched.reader;
-
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.unwrap();
-    assert_eq!(buffer, blob_data);
-}
-
-#[tokio::test]
-async fn get_blob_reports_an_upstream_outage_as_transient_not_missing() {
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&mock_server)
-        .await;
-
-    let error = client_for(&mock_server)
-        .get_blob(GetBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-            range: None,
-        })
+    let mut fetched = client_for(&mock_server)
+        .get_blob(get_blob_request())
         .await
-        .err()
-        .expect("a 503 must not read as a successful fetch");
+        .unwrap();
 
-    assert!(
-        matches!(error, Error::Internal(_)),
-        "an upstream outage must not be served as a missing blob, got: {error:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_get_blob_not_found() {
-    let mock_server = MockServer::start().await;
-    let test_digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/test/blobs/{test_digest}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-
-    let result = client
-        .get_blob(GetBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(test_digest).unwrap(),
-            accepted_types: Vec::new(),
-            range: None,
-        })
-        .await;
-
-    assert!(result.is_err());
-    match result {
-        Err(Error::BlobUnknown) => (),
-        _ => panic!("Expected Error::BlobUnknown"),
-    }
+    assert_eq!(fetched.length, blob_data.len() as u64);
+    let mut buffer = Vec::new();
+    fetched.reader.read_to_end(&mut buffer).await.unwrap();
+    assert_eq!(buffer, blob_data);
 }
 
 #[test]
@@ -1175,8 +739,6 @@ fn test_new_with_invalid_ca_bundle() {
 
     let cache = Config::Memory.to_backend().unwrap();
     let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
-
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
 }
 
@@ -1191,31 +753,10 @@ fn test_registry_client_config_cert_without_key_rejected_at_deserialize() {
     assert!(toml::from_str::<RegistryClientConfig>(toml).is_err());
 }
 
-#[test]
-fn test_new_with_both_certificate_and_key_invalid_files() {
-    let config = RegistryClientConfig {
-        tls: ClientTls {
-            server_ca_bundle: None,
-            identity: Some(MtlsIdentity {
-                certificate: PathBuf::from("/nonexistent/cert.pem"),
-                private_key: PathBuf::from("/nonexistent/key.pem"),
-            }),
-        },
-        ..test_client_config("https://example.com".to_string())
-    };
-
-    let cache = Config::Memory.to_backend().unwrap();
-    let result = RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES);
-
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), Error::Initialization(_)));
-}
-
 #[tokio::test]
 async fn test_blob_upload_sequence() {
     let mock_server = MockServer::start().await;
     let content = b"replicated blob content";
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let session_path = "/v2/test/blobs/uploads/session-1";
 
     Mock::given(method("POST"))
@@ -1226,11 +767,10 @@ async fn test_blob_upload_sequence() {
         .expect(1)
         .mount(&mock_server)
         .await;
-
     Mock::given(method("PUT"))
         .and(path(session_path))
         .and(query_param("state", "a"))
-        .and(query_param("digest", digest))
+        .and(query_param("digest", DIGEST))
         .and(body_bytes(content.to_vec()))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
@@ -1238,10 +778,9 @@ async fn test_blob_upload_sequence() {
         .await;
 
     let client = client_for(&mock_server);
-    let namespace = Namespace::new("test").unwrap();
     let session = client
         .start_upload(StartUploadRequest {
-            namespace: namespace.clone(),
+            namespace: test_namespace(),
             digest_algorithm: None,
             target: None,
         })
@@ -1256,7 +795,7 @@ async fn test_blob_upload_sequence() {
         .put_upload(
             &session.url,
             session.auth.as_deref(),
-            &Digest::try_from(digest).unwrap(),
+            &Digest::try_from(DIGEST).unwrap(),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
@@ -1278,10 +817,9 @@ async fn start_upload_refuses_a_cross_origin_location() {
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let outcome = client
+    let outcome = client_for(&mock_server)
         .start_upload(StartUploadRequest {
-            namespace: Namespace::new("test").unwrap(),
+            namespace: test_namespace(),
             digest_algorithm: None,
             target: None,
         })
@@ -1308,15 +846,11 @@ async fn test_put_upload_401_is_unauthorized_without_retry() {
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let session_url = format!("{}{session_path}", mock_server.uri());
-
-    let digest = Digest::from_bytes(Algorithm::Sha256, content);
-    let result = client
+    let result = client_for(&mock_server)
         .put_upload(
-            &session_url,
+            &format!("{}{session_path}", mock_server.uri()),
             None,
-            &digest,
+            &Digest::from_bytes(Algorithm::Sha256, content),
             content.len() as u64,
             Cursor::new(content.to_vec()),
         )
@@ -1326,16 +860,13 @@ async fn test_put_upload_401_is_unauthorized_without_retry() {
         matches!(result, Err(Error::Unauthorized(_))),
         "a 401 on a streamed PUT must be Error::Unauthorized (no replay), got {result:?}"
     );
-    // Dropping the server verifies `.expect(1)`: exactly one PUT, no retry.
-    drop(mock_server);
 }
 
 #[tokio::test]
 async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
-    // Regression: the streamed PUT targets a server-assigned session URL that
-    // never issues its own auth challenge, so it must reuse the bearer token the
-    // start-upload POST resolved. The PUT mock requires that token, so an
-    // unauthenticated PUT (the pre-fix behaviour) would not match and fail.
+    // The session URL never issues its own auth challenge, so the streamed PUT
+    // must reuse the bearer token the start-upload POST resolved; the PUT mock
+    // requires it.
     let mock_server = MockServer::start().await;
     let auth_server = MockServer::start().await;
     let content = b"replicated blob content";
@@ -1344,13 +875,10 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
 
     Mock::given(method("POST"))
         .and(path(start_path))
-        .respond_with(ResponseTemplate::new(401).insert_header(
-            "WWW-Authenticate",
-            format!(
-                r#"Bearer realm="{}",service="registry",scope="repository:test:pull,push""#,
-                auth_server.uri()
-            ),
-        ))
+        .respond_with(bearer_challenge(&format!(
+            r#"realm="{}",service="registry",scope="repository:test:pull,push""#,
+            auth_server.uri()
+        )))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -1364,12 +892,8 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
         .mount(&mock_server)
         .await;
     Mock::given(method("GET"))
-        .and(query_param("service", "registry"))
         .and(query_param("scope", "repository:test:pull,push"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"token": "push-token", "expires_in": 3600})),
-        )
+        .respond_with(token_response("push-token"))
         .mount(&auth_server)
         .await;
     Mock::given(method("PUT"))
@@ -1383,7 +907,7 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
     let client = client_for(&mock_server);
     let session = client
         .start_upload(StartUploadRequest {
-            namespace: Namespace::new("test").unwrap(),
+            namespace: test_namespace(),
             digest_algorithm: None,
             target: None,
         })
@@ -1403,168 +927,68 @@ async fn test_blob_upload_reuses_session_open_bearer_token_on_put() {
 }
 
 #[tokio::test]
-async fn test_blob_upload_reuses_basic_credentials_on_put() {
-    // Basic credentials are never cached, so the streamed PUT must carry the
-    // header resolved when the session was opened.
+async fn test_mount_blob_omits_from_when_none() {
     let mock_server = MockServer::start().await;
-    let content = b"replicated blob content";
-    let start_path = "/v2/test/blobs/uploads/";
-    let session_path = "/v2/test/blobs/uploads/session-8";
-
     Mock::given(method("POST"))
-        .and(path(start_path))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .insert_header("WWW-Authenticate", "Basic realm=\"Registry\""),
-        )
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(start_path))
-        .and(header("Authorization", "Basic dXNlcjpwYXNz"))
-        .respond_with(
-            ResponseTemplate::new(202).insert_header("Location", format!("{session_path}?state=a")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(session_path))
-        .and(header("Authorization", "Basic dXNlcjpwYXNz"))
+        .and(path("/v2/target/blobs/uploads/"))
+        .and(query_param("mount", DIGEST))
+        .and(query_param_is_missing("from"))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let config = RegistryClientConfig {
-        basic_auth: Some(BasicAuth {
-            username: "user".to_string(),
-            password: Secret::new("pass".to_string()),
-        }),
-        ..test_client_config(mock_server.uri())
-    };
-    let cache = Config::Memory.to_backend().unwrap();
-    let client =
-        RegistryClient::from_config(&config, cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES).unwrap();
+    let outcome = client_for(&mock_server)
+        .mount_blob(mount_request(None))
+        .await
+        .unwrap();
 
-    let session = client
-        .start_upload(StartUploadRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest_algorithm: None,
-            target: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(session.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
-    client
-        .put_upload(
-            &session.url,
-            session.auth.as_deref(),
-            &Digest::from_bytes(Algorithm::Sha256, content),
-            content.len() as u64,
-            Cursor::new(content.to_vec()),
-        )
-        .await
-        .unwrap();
+    assert!(outcome.is_none(), "a 201 must report a mount");
 }
 
+/// An advertised digest must match the request, or the blob would be falsely
+/// marked converged; a garbage one must not read as absent and skip that check.
 #[tokio::test]
-async fn test_mount_blob_returns_none_on_201() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+async fn mount_blob_checks_the_digest_a_201_advertises() {
+    let other = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    for (advertised, mounted) in [(DIGEST, true), (other, false), ("not-a-digest", false)] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/target/blobs/uploads/"))
+            .and(query_param("mount", DIGEST))
+            .and(query_param("from", "source"))
+            .respond_with(
+                ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, advertised),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("POST"))
-        .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param("from", "source"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header("Location", format!("/v2/target/blobs/{digest}")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+        let outcome = client_for(&mock_server)
+            .mount_blob(mount_request(Some("source")))
+            .await;
 
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: Some(Namespace::new("source").unwrap()),
-            },
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        outcome.is_none(),
-        "a 201 to a mount request must report a mount (None: no transfer needed)"
-    );
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn test_mount_blob_omits_from_when_none() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("POST"))
-        .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param_is_missing("from"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header("Location", format!("/v2/target/blobs/{digest}")),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: None,
-            },
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        outcome.is_none(),
-        "a 201 to a from=None mount request must report a mount (None: no transfer needed)"
-    );
-    drop(mock_server);
+        assert_eq!(
+            matches!(outcome, Ok(None)),
+            mounted,
+            "advertised {advertised}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn test_mount_blob_falls_back_to_session_on_202() {
     let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
     let session_path = "/v2/target/blobs/uploads/session-9";
-
     Mock::given(method("POST"))
         .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param("from", "source"))
         .respond_with(ResponseTemplate::new(202).insert_header("Location", session_path))
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: Some(Namespace::new("source").unwrap()),
-            },
-        })
+    let outcome = client_for(&mock_server)
+        .mount_blob(mount_request(Some("source")))
         .await
         .unwrap();
 
@@ -1573,145 +997,33 @@ async fn test_mount_blob_falls_back_to_session_on_202() {
         Some(format!("{}{session_path}", mock_server.uri())),
         "a 202 to a mount request must fall back to a session with the continuation URL"
     );
-    drop(mock_server);
 }
 
 #[tokio::test]
-async fn test_mount_blob_rejects_mismatched_201_digest() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    let other_digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-
-    Mock::given(method("POST"))
-        .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param("from", "source"))
-        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, other_digest))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: Some(Namespace::new("source").unwrap()),
-            },
-        })
-        .await;
-
-    assert!(
-        outcome.is_err(),
-        "a 201 advertising a different digest must be rejected"
-    );
-    drop(mock_server);
-}
-
-/// A garbage digest header must not read as an absent one: doing so would skip
-/// the mismatch rejection entirely, letting any unparseable value pass a blob
-/// off as mounted.
-#[tokio::test]
-async fn mount_blob_rejects_an_unparseable_201_digest() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("POST"))
-        .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param("from", "source"))
-        .respond_with(
-            ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, "not-a-digest"),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: Some(Namespace::new("source").unwrap()),
-            },
-        })
-        .await;
-
-    assert!(
-        outcome.is_err(),
-        "a 201 advertising an unparseable digest must be rejected, not accepted as a mount"
-    );
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn test_mount_blob_accepts_matching_201_digest() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("POST"))
-        .and(path("/v2/target/blobs/uploads/"))
-        .and(query_param("mount", digest))
-        .and(query_param("from", "source"))
-        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .mount_blob(MountBlobRequest {
-            namespace: Namespace::new("target").unwrap(),
-            mount: BlobMount {
-                digest: Digest::try_from(digest).unwrap(),
-                from: Some(Namespace::new("source").unwrap()),
-            },
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        outcome.is_none(),
-        "a 201 advertising the requested digest must report a mount (None: no transfer needed)"
-    );
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn test_put_manifest_with_oci_subject() {
+async fn test_put_manifest_stamps_headers_and_reports_echoes() {
     let mock_server = MockServer::start().await;
     let manifest = br#"{"schemaVersion":2}"#;
-    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
     let subject = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-    let media_type = "application/vnd.oci.image.manifest.v1+json";
+    let source_ts = DateTime::parse_from_rfc3339("2026-06-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
 
     Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/latest"))
-        .and(header("Content-Type", media_type))
+        .and(path("/v2/test/manifests/v1"))
+        .and(header("Content-Type", MANIFEST_TYPE))
+        .and(header(X_ANGOS_SOURCE_TIMESTAMP, source_ts.to_rfc3339()))
         .and(body_bytes(manifest.to_vec()))
         .respond_with(
             ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, digest)
+                .insert_header(DOCKER_CONTENT_DIGEST, DIGEST)
                 .insert_header(OCI_SUBJECT, subject),
         )
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let result = client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(MediaType::new(media_type).unwrap()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            manifest.to_vec(),
-        )
+    let result = client_for(&mock_server)
+        .put_manifest(put_manifest_request(Some(source_ts)), manifest.to_vec())
         .await
         .unwrap();
 
@@ -1722,7 +1034,7 @@ async fn test_put_manifest_with_oci_subject() {
     else {
         panic!("a 2xx push must report the manifest as stored, got {result:?}");
     };
-    assert_eq!(echoed, Some(Digest::try_from(digest).unwrap()));
+    assert_eq!(echoed, Some(Digest::try_from(DIGEST).unwrap()));
     assert_eq!(echoed_subject, Some(subject.to_string()));
 }
 
@@ -1732,11 +1044,8 @@ async fn test_put_manifest_with_oci_subject() {
 #[tokio::test]
 async fn put_manifest_warns_on_an_unparseable_advertised_digest() {
     let mock_server = MockServer::start().await;
-    let manifest = br#"{"schemaVersion":2}"#;
-    let media_type = "application/vnd.oci.image.manifest.v1+json";
-
     Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/latest"))
+        .and(path("/v2/test/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, "not-a-digest"),
         )
@@ -1754,16 +1063,7 @@ async fn put_manifest_warns_on_an_unparseable_advertised_digest() {
     let guard = tracing::subscriber::set_default(subscriber);
 
     let result = client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(MediaType::new(media_type).unwrap()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            manifest.to_vec(),
-        )
+        .put_manifest(put_manifest_request(None), b"{}".to_vec())
         .await
         .expect("an unparseable echo must not fail a push the downstream accepted");
 
@@ -1780,349 +1080,108 @@ async fn put_manifest_warns_on_an_unparseable_advertised_digest() {
     );
 }
 
+/// Only a last-writer-wins 409 converges; any other 409 fails so the job
+/// retries or dead-letters.
 #[tokio::test]
-async fn test_put_manifest_without_oci_subject() {
-    let mock_server = MockServer::start().await;
-    let manifest = br#"{"schemaVersion":2}"#;
-    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-    let media_type = "application/vnd.docker.distribution.manifest.v2+json";
+async fn test_put_manifest_409_converges_only_when_superseded() {
+    for (code, superseded) in [(REPLICATION_SUPERSEDED_CODE, true), ("DENIED", false)] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/manifests/v1"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(json!({ "errors": [{ "code": code }] })),
+            )
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/v1"))
-        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+        let result = client_for(&mock_server)
+            .put_manifest(put_manifest_request(None), b"{}".to_vec())
+            .await;
 
-    let client = client_for(&mock_server);
-    let result = client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("v1").unwrap()),
-                content_type: Some(MediaType::new(media_type).unwrap()),
-                tags: Vec::new(),
+        if superseded {
+            assert!(
+                matches!(result, Ok(PutManifestOutcome::Superseded)),
+                "got {result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(Error::Internal(_))), "got {result:?}");
+        }
+    }
+}
+
+/// A retried delete converges on 404, and stock distribution's 405 on tag
+/// deletion reads as unsupported so it never dead-letters a job per event.
+#[tokio::test]
+async fn test_delete_manifest_outcomes() {
+    let superseded = json!({ "errors": [{ "code": REPLICATION_SUPERSEDED_CODE }] });
+    for (response, expected) in [
+        (
+            ResponseTemplate::new(202),
+            Some(DeleteManifestOutcome::Deleted),
+        ),
+        (
+            ResponseTemplate::new(409).set_body_json(superseded),
+            Some(DeleteManifestOutcome::Superseded),
+        ),
+        (
+            ResponseTemplate::new(404),
+            Some(DeleteManifestOutcome::AlreadyAbsent),
+        ),
+        (
+            ResponseTemplate::new(405),
+            Some(DeleteManifestOutcome::Unsupported),
+        ),
+        (ResponseTemplate::new(500), None),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/test/manifests/v1"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let outcome = client_for(&mock_server)
+            .delete_manifest(DeleteManifestRequest {
+                namespace: test_namespace(),
+                reference: v1(),
                 source_ts: None,
-            },
-            manifest.to_vec(),
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .ok();
 
-    let PutManifestOutcome::Stored {
-        digest: echoed,
-        subject,
-    } = result
-    else {
-        panic!("a 2xx push must report the manifest as stored, got {result:?}");
-    };
-    assert_eq!(echoed, Some(Digest::try_from(digest).unwrap()));
-    assert!(
-        subject.is_none(),
-        "OCI-1.0 downstream must not report an OCI-Subject header"
-    );
+        assert_eq!(outcome, expected);
+    }
 }
 
+/// An already-gone session is the goal state of a cancel.
 #[tokio::test]
-async fn test_put_manifest_stamps_replication_headers() {
-    let mock_server = MockServer::start().await;
-    let manifest = br#"{"schemaVersion":2}"#;
-    let digest = "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-    let media_type = "application/vnd.docker.distribution.manifest.v2+json";
+async fn test_delete_upload_succeeds_on_2xx_and_404() {
+    for (status, succeeds) in [(204, true), (404, true), (500, false)] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v2/test/blobs/uploads/s1"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/v1"))
-        .and(header(X_ANGOS_SOURCE_TIMESTAMP, source_ts().to_rfc3339()))
-        .respond_with(ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+        let result = client_for(&mock_server)
+            .delete_upload(&format!("{}/v2/test/blobs/uploads/s1", mock_server.uri()))
+            .await;
 
-    let client = client_for(&mock_server);
-    client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("v1").unwrap()),
-                content_type: Some(MediaType::new(media_type).unwrap()),
-                tags: Vec::new(),
-                source_ts: Some(source_ts()),
-            },
-            manifest.to_vec(),
-        )
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn test_put_manifest_superseded_409() {
-    let mock_server = MockServer::start().await;
-    let body = serde_json::json!({ "errors": [{ "code": REPLICATION_SUPERSEDED_CODE }] });
-
-    Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/v1"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(body))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let result = client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("v1").unwrap()),
-                content_type: Some(MediaType::new("application/json").unwrap()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            b"{}".to_vec(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(result, PutManifestOutcome::Superseded),
-        "an LWW-superseded 409 must converge rather than report a store, got {result:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_put_manifest_non_superseded_409_is_error() {
-    let mock_server = MockServer::start().await;
-    let body = serde_json::json!({ "errors": [{ "code": "DENIED" }] });
-
-    Mock::given(method("PUT"))
-        .and(path("/v2/test/manifests/v1"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(body))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let result = client
-        .put_manifest(
-            PutManifestRequest {
-                namespace: Namespace::new("test").unwrap(),
-                reference: Reference::Tag(Tag::new("v1").unwrap()),
-                content_type: Some(MediaType::new("application/json").unwrap()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            b"{}".to_vec(),
-        )
-        .await;
-    assert!(matches!(result, Err(Error::Internal(_))));
-}
-
-#[tokio::test]
-async fn test_delete_manifest_superseded_409() {
-    let mock_server = MockServer::start().await;
-    let body = serde_json::json!({ "errors": [{ "code": REPLICATION_SUPERSEDED_CODE }] });
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/manifests/v1"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(body))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .delete_manifest(DeleteManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("v1").unwrap()),
-            source_ts: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(outcome, DeleteManifestOutcome::Superseded);
-}
-
-#[tokio::test]
-async fn test_delete_manifest() {
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
-
-    Mock::given(method("DELETE"))
-        .and(path(format!("/v2/test/manifests/{digest}")))
-        .respond_with(ResponseTemplate::new(202))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .delete_manifest(DeleteManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Digest(Digest::try_from(digest).unwrap()),
-            source_ts: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(outcome, DeleteManifestOutcome::Deleted);
-}
-
-#[tokio::test]
-async fn test_delete_manifest_surfaces_error_status() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/manifests/latest"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let result = client
-        .delete_manifest(DeleteManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("latest").unwrap()),
-            source_ts: None,
-        })
-        .await;
-    assert!(matches!(result, Err(Error::Internal(_))));
-}
-
-#[tokio::test]
-async fn test_delete_manifest_absent_404_is_already_absent() {
-    // A retried or already-converged delete must converge as AlreadyAbsent,
-    // never dead-letter.
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/manifests/gone"))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .delete_manifest(DeleteManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("gone").unwrap()),
-            source_ts: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(outcome, DeleteManifestOutcome::AlreadyAbsent);
-}
-
-#[tokio::test]
-async fn test_delete_manifest_405_is_unsupported() {
-    // Stock distribution rejects tag deletion with 405; it must read as
-    // Unsupported (not a retryable error) so a delete never dead-letters one
-    // job per deletion event against such a downstream.
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/manifests/v1"))
-        .respond_with(ResponseTemplate::new(405))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let outcome = client
-        .delete_manifest(DeleteManifestRequest {
-            namespace: Namespace::new("test").unwrap(),
-            reference: Reference::Tag(Tag::new("v1").unwrap()),
-            source_ts: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(outcome, DeleteManifestOutcome::Unsupported);
-}
-
-#[tokio::test]
-async fn test_head_blob_5xx_is_transient_error_not_unknown() {
-    // BlobUnknown means "absent (404)"; a 503 must surface as a transient
-    // error so replication retries instead of starting a full upload.
-    let mock_server = MockServer::start().await;
-    let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/test/blobs/{digest}")))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let result = client
-        .head_blob(HeadBlobRequest {
-            namespace: Namespace::new("test").unwrap(),
-            digest: Digest::try_from(digest).unwrap(),
-            accepted_types: Vec::new(),
-        })
-        .await;
-
-    assert!(
-        matches!(result, Err(Error::Internal(_))),
-        "a 503 blob HEAD must be a transient error, not BlobUnknown, got {result:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_delete_upload_204_and_404_are_success() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/blobs/uploads/s1"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/blobs/uploads/s2"))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    client
-        .delete_upload(&format!("{}/v2/test/blobs/uploads/s1", mock_server.uri()))
-        .await
-        .expect("a 204 session cancel must succeed");
-    client
-        .delete_upload(&format!("{}/v2/test/blobs/uploads/s2", mock_server.uri()))
-        .await
-        .expect("a 404 session cancel must succeed (already gone is the goal state)");
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn test_delete_upload_500_is_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("DELETE"))
-        .and(path("/v2/test/blobs/uploads/s1"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let client = client_for(&mock_server);
-    let result = client
-        .delete_upload(&format!("{}/v2/test/blobs/uploads/s1", mock_server.uri()))
-        .await;
-
-    assert!(
-        matches!(result, Err(Error::Internal(_))),
-        "a 500 session cancel must surface as an error, got {result:?}"
-    );
-    drop(mock_server);
+        assert_eq!(result.is_ok(), succeeds, "status {status}");
+    }
 }
 
 #[tokio::test]
 async fn test_list_tags_follows_pagination() {
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/tags/list"))
         .and(query_param("n", "1"))
         .and(query_param("last", "a"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "tags": ["b"] })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": ["b"] })))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -2132,49 +1191,34 @@ async fn test_list_tags_follows_pagination() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Link", "</v2/test/tags/list?n=1&last=a>; rel=\"next\"")
-                .set_body_json(serde_json::json!({ "tags": ["a"] })),
+                .set_body_json(json!({ "tags": ["a"] })),
         )
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-
-    let tags = client
-        .list_tags(ListTagsRequest {
-            namespace: Namespace::new("test").unwrap(),
-            n: None,
-            last: None,
-        })
+    let tags = client_for(&mock_server)
+        .list_tags(list_tags_request("test"))
         .await
         .unwrap();
-    assert_eq!(
-        tags,
-        vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
-        "tags from both pages must be returned"
-    );
-    drop(mock_server);
+
+    assert_eq!(tags, vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()]);
 }
 
 #[tokio::test]
 async fn test_list_tags_absent_repo_returns_empty() {
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/missing/tags/list"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let tags = client
-        .list_tags(ListTagsRequest {
-            namespace: Namespace::new("missing").unwrap(),
-            n: None,
-            last: None,
-        })
+    let tags = client_for(&mock_server)
+        .list_tags(list_tags_request("missing"))
         .await
         .unwrap();
+
     assert!(tags.is_empty(), "a 404 repo must yield an empty tag list");
 }
 
@@ -2182,39 +1226,26 @@ async fn test_list_tags_absent_repo_returns_empty() {
 async fn list_tags_breaks_on_cyclic_next_link() {
     // The visited-page guard must return the tags gathered so far, not hang.
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/tags/list"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({ "tags": ["a", "b"] }))
+                .set_body_json(json!({ "tags": ["a", "b"] }))
                 .insert_header("Link", "</v2/test/tags/list?last=z>; rel=\"next\""),
         )
         .expect(2)
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let tags = client
-        .list_tags(ListTagsRequest {
-            namespace: Namespace::new("test").unwrap(),
-            n: None,
-            last: None,
-        })
+    let tags = client_for(&mock_server)
+        .list_tags(list_tags_request("test"))
         .await
         .expect("cyclic pagination must terminate, not error");
 
-    // expect(2): the base page and one `?last=z` page are fetched before the
-    // repeated `?last=z` breaks the loop.
-    assert_eq!(
-        tags,
-        vec![
-            Tag::new("a").unwrap(),
-            Tag::new("b").unwrap(),
-            Tag::new("a").unwrap(),
-            Tag::new("b").unwrap(),
-        ]
-    );
+    // The base page and one `?last=z` page are fetched before the repeated
+    // `?last=z` breaks the loop.
+    let page = [Tag::new("a").unwrap(), Tag::new("b").unwrap()];
+    assert_eq!(tags, [page.clone(), page].concat());
 }
 
 #[tokio::test]
@@ -2222,12 +1253,11 @@ async fn list_tags_stops_at_a_cross_origin_next_link() {
     // A next link pointing off-host would send the paging request and its auth
     // elsewhere; pagination must stop with the page in hand.
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/v2/test/tags/list"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({ "tags": ["a", "b"] }))
+                .set_body_json(json!({ "tags": ["a", "b"] }))
                 .insert_header(
                     "Link",
                     "<https://evil.example/v2/test/tags/list?last=z>; rel=\"next\"",
@@ -2237,13 +1267,8 @@ async fn list_tags_stops_at_a_cross_origin_next_link() {
         .mount(&mock_server)
         .await;
 
-    let client = client_for(&mock_server);
-    let tags = client
-        .list_tags(ListTagsRequest {
-            namespace: Namespace::new("test").unwrap(),
-            n: None,
-            last: None,
-        })
+    let tags = client_for(&mock_server)
+        .list_tags(list_tags_request("test"))
         .await
         .expect("a cross-origin next link stops paging, it does not error");
 

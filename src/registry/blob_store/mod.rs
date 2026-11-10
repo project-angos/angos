@@ -5,7 +5,7 @@
 //! collector's grace period and the `v2/gc` marker protocol in the metadata
 //! store.
 
-mod config;
+pub mod config;
 pub mod hashing;
 mod multipart_cleanup;
 pub mod upload_session;
@@ -27,8 +27,6 @@ use angos_storage::{
 
 use crate::registry::keys::{BLOBS_ROOT, DigestExt, namespace_dir};
 use crate::registry::{Error, pagination};
-#[cfg(test)]
-pub use config::TransportFields;
 pub use config::{BlobStoreConfig, FsBackendConfig, S3BackendConfig};
 pub use multipart_cleanup::OrphanMultipartUpload;
 

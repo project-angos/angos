@@ -15,7 +15,7 @@ use tracing::info;
 
 use angos_oci::Namespace;
 
-use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::check::{self, NamespaceChecker};
@@ -120,7 +120,7 @@ impl NamespaceChecker for ScanChecker {
 }
 
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let MaintenanceContext {
+    let StoreContext {
         blob_store,
         metadata_store,
         repositories,
@@ -136,6 +136,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
+            None,
         ))
     })?;
     check::check_namespaces(
@@ -320,26 +321,15 @@ mod tests {
         let image = seed_image(&stack, &namespace).await;
         seed_report(&stack, &namespace, &image, Utc::now() - TimeDelta::days(2)).await;
 
-        let checker = build_checker(
-            &stack,
-            scanning_repository(
-                None,
-                &["image.tag == 'v2' && image.scanned_at < now() - days(1)"],
-            ),
-            false,
-        );
-        let jobs = enqueued(&checker, &namespace).await;
-        assert!(jobs.is_empty(), "{jobs:?}");
-
-        let checker = build_checker(
-            &stack,
-            scanning_repository(
-                None,
-                &["image.tag == 'v1' && image.scanned_at < now() - days(1)"],
-            ),
-            false,
-        );
-        assert_eq!(enqueued(&checker, &namespace).await.len(), 1);
+        for (tag, expected) in [("v2", 0), ("v1", 1)] {
+            let rule = format!("image.tag == '{tag}' && image.scanned_at < now() - days(1)");
+            let checker = build_checker(&stack, scanning_repository(None, &[&rule]), false);
+            assert_eq!(
+                enqueued(&checker, &namespace).await.len(),
+                expected,
+                "{tag}"
+            );
+        }
     }
 
     /// A walk over the namespaces lands the due scans on the queue, and a
@@ -360,6 +350,7 @@ mod tests {
             stack.blob_store.clone(),
             stack.metadata_store.clone(),
             job_store.clone(),
+            None,
         );
         let checker = build_checker(
             &stack,

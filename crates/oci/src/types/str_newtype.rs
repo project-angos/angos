@@ -1,8 +1,5 @@
-//! The trait surface every validated string newtype shares, generated once so
-//! the four grammars differ only in their `new`.
-
 /// The conversions, views and serde impls of a `struct $t(String)` whose
-/// `new(&str)` validates; every constructor funnels through it.
+/// validating `new(&str)` every constructor funnels through.
 macro_rules! str_newtype {
     ($t:ident) => {
         impl ::std::str::FromStr for $t {

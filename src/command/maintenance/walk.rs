@@ -12,8 +12,8 @@ use crate::command::maintenance::error::Error;
 use crate::registry::Error as RegistryError;
 
 /// Run `process` over every key under `prefix` in `store`, at most
-/// `concurrency` keys in flight at once. Keys are absolute (the prefix is
-/// re-joined onto the backend's prefix-relative listing results).
+/// `concurrency` keys in flight at once. Keys are absolute: `prefix` (no
+/// trailing slash, or empty for the root) is re-joined onto the listing.
 ///
 /// `process` is expected to be infallible per key (log-and-count); only a
 /// listing failure aborts the walk, since pagination cannot continue without
@@ -31,23 +31,19 @@ where
     let process = &process;
     store
         .list_all(prefix)
-        .map_ok(|key| join_key(prefix, &key))
+        .map_ok(|key| {
+            if prefix.is_empty() {
+                key
+            } else {
+                format!("{prefix}/{key}")
+            }
+        })
         .map_err(|e| RegistryError::from(e).into())
         .try_for_each_concurrent(concurrency.max(1), |key| async move {
             process(key).await;
             Ok(())
         })
         .await
-}
-
-/// Rebuild the absolute key from a walk `prefix` (no trailing slash, or empty
-/// for the store root) and a prefix-relative listing result.
-fn join_key(prefix: &str, relative: &str) -> String {
-    if prefix.is_empty() {
-        relative.to_string()
-    } else {
-        format!("{prefix}/{relative}")
-    }
 }
 
 /// Atomic tallies of one scrub run, logged as its summary.
@@ -103,7 +99,7 @@ mod tests {
     /// A store holding one object per key, plus the temp directory backing it.
     async fn seeded_store(keys: &[&str]) -> (Arc<dyn ObjectStore>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let store = StorageFsBackend::builder(dir.path()).build();
+        let store = StorageFsBackend::new(dir.path(), false);
         for key in keys {
             store.put(key, Bytes::from_static(b"x")).await.unwrap();
         }

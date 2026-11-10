@@ -24,7 +24,7 @@ pub struct OrphanMultipartUpload {
 
 /// Inverse of [`NamespaceExt::upload_path`], parsing an upload's `data` key
 /// into `(namespace, uuid)`.
-pub fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
+fn parse_upload_key(key: &str) -> Option<(&str, &str)> {
     let rest = key.strip_prefix(REPOS_ROOT)?.strip_prefix('/')?;
     rest.strip_suffix("/data")?.rsplit_once("/_uploads/")
 }
@@ -244,51 +244,36 @@ mod tests {
         }
     }
 
-    /// The abort destroys every committed part, so a probe that merely failed
-    /// must not condemn the upload.
+    /// Only a proven-absent marker orphans a stale upload: the abort destroys
+    /// every committed part, so a probe that merely failed must not condemn it.
     #[tokio::test]
-    async fn a_failed_liveness_probe_does_not_orphan_a_live_upload() {
-        let namespace = Namespace::new("test-repo").unwrap();
-        let key = namespace.upload_path(&UploadSessionId::generate());
-        let store = BlobStore::new(
-            Arc::new(OneStaleUpload {
-                key,
-                head_error: StorageError::Backend("upstream is unavailable".to_string()),
-            }),
-            None,
-        );
+    async fn only_an_absent_marker_orphans_a_stale_upload() {
+        for (head_error, orphaned) in [
+            (
+                StorageError::Backend("upstream is unavailable".to_string()),
+                false,
+            ),
+            (StorageError::NotFound, true),
+        ] {
+            let key = Namespace::new("test-repo")
+                .unwrap()
+                .upload_path(&UploadSessionId::generate());
+            let store = BlobStore::new(
+                Arc::new(OneStaleUpload {
+                    key: key.clone(),
+                    head_error,
+                }),
+                None,
+            );
 
-        let orphans = store
-            .list_orphan_multipart_uploads(Duration::hours(1))
-            .await
-            .expect("a failed probe must not fail the sweep");
+            let orphans = store
+                .list_orphan_multipart_uploads(Duration::hours(1))
+                .await
+                .expect("a failed probe must not fail the sweep");
 
-        assert!(
-            orphans.is_empty(),
-            "a transient probe failure must not condemn an upload, got {} orphan(s)",
-            orphans.len()
-        );
-    }
-
-    /// The counterpart: an absent marker still proves the session is gone.
-    #[tokio::test]
-    async fn an_absent_marker_still_orphans_a_stale_upload() {
-        let namespace = Namespace::new("test-repo").unwrap();
-        let key = namespace.upload_path(&UploadSessionId::generate());
-        let store = BlobStore::new(
-            Arc::new(OneStaleUpload {
-                key: key.clone(),
-                head_error: StorageError::NotFound,
-            }),
-            None,
-        );
-
-        let orphans = store
-            .list_orphan_multipart_uploads(Duration::hours(1))
-            .await
-            .expect("listing must succeed");
-
-        assert_eq!(orphans.len(), 1, "an absent marker must still be cleaned");
-        assert_eq!(orphans[0].key, key);
+            let keys: Vec<&str> = orphans.iter().map(|orphan| orphan.key.as_str()).collect();
+            let expected: &[&str] = if orphaned { &[key.as_str()] } else { &[] };
+            assert_eq!(keys, expected);
+        }
     }
 }

@@ -76,10 +76,7 @@
 	--muted: rgba(var(--ink), 0.46);
 	--faint: rgba(var(--ink), 0.3);
 	--border: rgba(var(--ink), 0.094);
-	--border-strong: rgba(var(--ink), 0.16);
-	--subtle: rgba(var(--ink), 0.04);
 	--hover: rgba(var(--ink), 0.055);
-	--hover-strong: rgba(var(--ink), 0.08);
 	--field: rgba(var(--ink), 0.055);
 	--accent: #06b6d4;
 	--accent-hover: #22d3ee;
@@ -153,7 +150,8 @@ h1 {
 	overflow-wrap: anywhere;
 }
 
-h2 {
+h2,
+h3 {
 	font-size: 0.9375rem;
 	font-weight: 600;
 	letter-spacing: -0.01em;
@@ -161,9 +159,6 @@ h2 {
 }
 
 h3 {
-	font-size: 0.9375rem;
-	font-weight: 600;
-	letter-spacing: -0.01em;
 	margin: 0;
 }
 
@@ -246,27 +241,17 @@ pre {
 	color: var(--warn-fg);
 }
 
-.card > table {
+.card > table,
+.fs-pane > table,
+.fs-rich > table {
 	border: 0;
 	border-radius: 0;
-}
-
-.card > table tr:last-child td {
-	border-bottom: 0;
 }
 
 .header-actions {
 	display: flex;
 	align-items: center;
 	gap: 0.5rem;
-}
-
-/* A second header row holding a panel's tabs, under the title row. */
-.card-tabs {
-	display: flex;
-	padding: 0.5rem 0.875rem;
-	border-bottom: 1px solid var(--border);
-	background: var(--subtle);
 }
 
 /* ===== TABLES ===== */
@@ -371,9 +356,6 @@ tfoot td {
 .subject-meta {
 	color: var(--muted);
 	font-size: 0.8125rem;
-}
-
-.subject-meta {
 	margin-left: 0.5rem;
 }
 
@@ -511,6 +493,7 @@ button.link,
 	box-shadow: none;
 	color: var(--link);
 	font-weight: 500;
+	white-space: nowrap;
 }
 
 /* Under a paged table, the control that appends its next page. */
@@ -547,11 +530,6 @@ th button.sort.busy::after {
 	border-top-color: var(--muted);
 	border-radius: 50%;
 	animation: spin 0.7s linear infinite;
-}
-
-/* Its narrow cell must never break the word across two lines. */
-.download-link {
-	white-space: nowrap;
 }
 
 button.link:hover,
@@ -598,7 +576,6 @@ table button.danger:hover,
 .delete-confirm .confirm {
 	background: var(--danger);
 	color: #fff;
-	box-shadow: var(--shadow-xs);
 }
 
 .delete-confirm .confirm:hover {
@@ -628,7 +605,6 @@ table button.danger:hover,
 	background: var(--surface);
 	color: var(--muted);
 	box-shadow: none;
-	text-decoration: none;
 }
 
 .view-toggle > * + * {
@@ -670,7 +646,6 @@ table button.danger:hover,
 	color: var(--muted);
 	font-size: 0.875rem;
 	font-weight: 500;
-	text-decoration: none;
 	border-bottom: 2px solid transparent;
 	margin-bottom: -1px;
 }
@@ -1041,11 +1016,6 @@ select:focus-visible {
 	text-overflow: ellipsis;
 }
 
-.fs-pane > table {
-	border: 0;
-	border-radius: 0;
-}
-
 /* The row the list's focus rests on shows it by its shade. */
 .fs-pane tr:focus {
 	outline: none;
@@ -1197,11 +1167,6 @@ button.badge.fs-version.active {
 	overflow: auto;
 }
 
-.fs-rich > table {
-	border: 0;
-	border-radius: 0;
-}
-
 .fs-markdown {
 	padding: 0.25rem 1.25rem 1rem;
 	line-height: 1.6;
@@ -1229,7 +1194,6 @@ button.badge.fs-version.active {
 	background: none;
 }
 
-/* Library names wrap between each other, never inside one. */
 /* A library name stays whole, over the details table's breakable code. */
 .fs-rich .fs-libraries code {
 	white-space: nowrap;
@@ -1381,6 +1345,7 @@ button.badge.fs-version.active {
 }
 
 .hljs-built_in,
+.hljs-code,
 .hljs-type,
 .hljs-selector-class,
 .hljs-selector-id {
@@ -1397,10 +1362,6 @@ button.badge.fs-version.active {
 
 .hljs-meta {
 	color: var(--muted);
-}
-
-.hljs-code {
-	color: var(--chip-cyan-fg);
 }
 
 .hljs-link {
@@ -1498,11 +1459,6 @@ button.badge.fs-version.active {
 	background: var(--chip-purple-fg);
 }
 
-.badge.waste-unchanged {
-	background: var(--chip-yellow-bg);
-	color: var(--chip-yellow-fg);
-}
-
 /* ===== STATES ===== */
 .loading {
 	display: flex;
@@ -1592,31 +1548,24 @@ button.badge.fs-version.active {
 	color: var(--chip-gray-fg);
 }
 
-.badge.pull-through {
-	background: var(--chip-purple-bg);
-	color: var(--chip-purple-fg);
-}
-
-.badge.immutable {
+.badge.immutable,
+.badge.backoff,
+.badge.waste-unchanged {
 	background: var(--chip-yellow-bg);
 	color: var(--chip-yellow-fg);
 }
 
 .badge.backoff {
 	margin-left: 0.4rem;
-	background: var(--chip-yellow-bg);
-	color: var(--chip-yellow-fg);
 }
 
 .tag,
 .tag-standalone {
 	background: var(--chip-cyan-bg);
 	color: var(--chip-cyan-fg);
-	text-decoration: none;
 }
 
-a.tag:hover,
-a.tag-standalone:hover {
+a.tag:hover {
 	text-decoration: none;
 	filter: brightness(0.94);
 }

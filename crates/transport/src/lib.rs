@@ -1,8 +1,5 @@
 //! The HTTP transport layer: the hyper response body and its builders, the one
-//! place in the workspace allowed to own hyper. Every HTTP surface renders
-//! through it, the OCI service and extension crates that answer the protocol's
-//! own operations as much as the server surface that answers the ones which
-//! never reach the registry (errors, tokens, UI assets, probes).
+//! place in the workspace allowed to own hyper.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -23,10 +20,7 @@ use tokio_util::io::ReaderStream;
 
 type BytesFrameStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, io::Error>> + Send>>;
 
-/// A rendering failure: a header value the spec would carry cannot be built, or
-/// a JSON body cannot be serialized. Both are internal faults the transport
-/// answers `500` for. Shared by every response builder, in the registry and the
-/// service and extension crates alike.
+/// An internal fault building a response, which the transport answers `500` for.
 #[derive(Debug)]
 pub enum RenderError {
     Header(HttpError),
@@ -62,8 +56,6 @@ impl fmt::Display for RenderError {
 
 impl StdError for RenderError {}
 
-/// The headers of a plain JSON response, the shape most non-OCI endpoints
-/// serve.
 pub fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -71,8 +63,9 @@ pub fn json_headers() -> HeaderMap {
     headers
 }
 
-/// A JSON response under [`json_headers`]. Generic over the caller's error so
-/// the registry and the server surface share one builder.
+/// Generic over the caller's error so the registry and the server surface
+/// share one builder.
+///
 /// # Errors
 /// Propagates serialization and response-build failures via `E`.
 pub fn json_response<T, E>(status: StatusCode, body: &T) -> Result<Response<ResponseBody>, E>
@@ -95,14 +88,8 @@ pub enum ResponseBody {
 
 impl ResponseBody {
     #[must_use]
-    pub fn empty() -> Self {
-        ResponseBody::Empty
-    }
-
-    #[must_use]
     pub fn fixed(data: Vec<u8>) -> Self {
-        let data = Bytes::from(data);
-        ResponseBody::Fixed(Full::new(data))
+        ResponseBody::Fixed(Full::new(Bytes::from(data)))
     }
 
     /// `frame_size` is the read buffer each frame is filled from, and must be

@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use angos_backoff::Backoff;
 use arc_swap::ArcSwap;
-#[cfg(test)]
-use arc_swap::Guard;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,7 +32,6 @@ pub struct HandshakeResult<S> {
 /// The per-connection deadlines: how long the handshake may take, the
 /// wall-clock request-processing timeout, and the grace period allowed for the
 /// in-flight request to drain after it fires.
-#[derive(Clone, Copy, Debug)]
 pub struct RequestTimeouts {
     pub handshake: Duration,
     pub query: Duration,
@@ -92,21 +89,17 @@ pub trait Connector: Send + Sync {
     fn scheme(&self) -> RequestScheme;
 }
 
-/// The shared listener shell: a bound address plus a hot-swappable context and
-/// timeouts, driving connections through a [`Connector`] that supplies the
-/// per-scheme handshake. TLS and non-TLS listeners are the same shell over a
-/// different connector, so the shape lives here once.
+/// A bound address plus a hot-swappable context and timeouts, driving
+/// connections through a [`Connector`] that supplies the per-scheme handshake.
 pub struct Listener<C: Connector> {
     binding_address: SocketAddr,
     connector: Arc<C>,
-    context: Arc<ArcSwap<ServerContext>>,
+    pub context: Arc<ArcSwap<ServerContext>>,
     timeouts: ArcSwap<RequestTimeouts>,
     connections: Connections,
 }
 
 impl<C: Connector + 'static> Listener<C> {
-    /// Assemble the shell around `connector`, deriving the bind address and
-    /// timeouts from `base`.
     pub fn build(base: &ListenerBaseConfig, connector: C, context: ServerContext) -> Self {
         Self {
             binding_address: SocketAddr::new(base.bind_address, base.port),
@@ -117,19 +110,17 @@ impl<C: Connector + 'static> Listener<C> {
         }
     }
 
-    /// Swap in a freshly-built server context on a non-listener config reload.
     pub fn store_context(&self, context: ServerContext) {
         self.context.store(Arc::new(context));
     }
 
-    /// Swap in the per-connection timeouts from an updated base config.
     pub fn store_timeouts(&self, base: &ListenerBaseConfig) {
         self.timeouts
             .store(Arc::new(RequestTimeouts::from_config(base)));
     }
 
     /// Stop serving: no new connections, every in-flight exchange gets up to
-    /// `grace` to finish, then the webhook deliveries drain as before.
+    /// `grace` to finish, then the webhook deliveries drain.
     pub async fn shutdown(&self, grace: Duration) {
         self.connections.drain(grace).await;
         self.context.load().registry.shutdown().await;
@@ -146,16 +137,6 @@ impl<C: Connector + 'static> Listener<C> {
         )
         .await
     }
-
-    #[cfg(test)]
-    pub fn current_context(&self) -> Guard<Arc<ServerContext>> {
-        self.context.load()
-    }
-
-    #[cfg(test)]
-    pub fn current_timeouts(&self) -> Guard<Arc<RequestTimeouts>> {
-        self.timeouts.load()
-    }
 }
 
 pub async fn accept_loop<C: Connector + 'static>(
@@ -165,14 +146,11 @@ pub async fn accept_loop<C: Connector + 'static>(
     timeouts: &ArcSwap<RequestTimeouts>,
     connections: &Connections,
 ) -> Result<(), Error> {
-    let binding_address = match listener.local_addr() {
-        Ok(address) => address,
-        Err(error) => {
-            return Err(Error::Initialization(format!(
-                "Failed to read the address of a bound listener: {error}"
-            )));
-        }
-    };
+    let binding_address = listener.local_addr().map_err(|error| {
+        Error::Initialization(format!(
+            "Failed to read the address of a bound listener: {error}"
+        ))
+    })?;
     info!("Listening on {} ({})", binding_address, connector.label());
     let mut consecutive_failures = 0;
 
@@ -245,13 +223,9 @@ pub async fn accept_loop<C: Connector + 'static>(
 }
 
 async fn build_listener(binding_address: SocketAddr) -> Result<TcpListener, Error> {
-    match TcpListener::bind(binding_address).await {
-        Ok(listener) => Ok(listener),
-        Err(err) => {
-            let msg = format!("Failed to bind to {binding_address}: {err}");
-            Err(Error::Initialization(msg))
-        }
-    }
+    TcpListener::bind(binding_address)
+        .await
+        .map_err(|err| Error::Initialization(format!("Failed to bind to {binding_address}: {err}")))
 }
 
 #[cfg(test)]
@@ -316,9 +290,8 @@ mod tests {
         (listener, address)
     }
 
-    /// The regression: connection tasks were detached spawns, so a shutdown
-    /// returned at once and the runtime cut every exchange in flight. Shutdown
-    /// must wait for them instead, up to its grace.
+    /// Shutdown waits for the exchanges in flight, up to its grace, rather
+    /// than letting the runtime cut them.
     #[tokio::test]
     async fn shutdown_waits_for_the_connections_it_spawned() {
         let (listener, address) = bound_listener().await;
@@ -369,8 +342,6 @@ mod tests {
         );
     }
 
-    /// The regression: awaiting the handshake in the accept loop let one
-    /// stalled client hold up every connection behind it.
     #[tokio::test]
     async fn a_stalled_handshake_does_not_block_the_next_connection() {
         let (listener, address) = bound_listener().await;

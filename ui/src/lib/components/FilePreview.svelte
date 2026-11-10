@@ -1,6 +1,5 @@
 <script lang="ts">
-	import type { LayerEntry, LayerFileDetails } from '#lib/api.js';
-	import { authedFetch, fetchLayerFileDetails, layerFileUrl } from '#lib/api.js';
+	import { authedFetch, fetchLayerFileDetails, layerFileUrl, type LayerEntry, type LayerFileDetails } from '#lib/api.js';
 	import { highlight } from '#lib/highlight.js';
 	import { SECRET_LABELS, formatMode, formatSize, secretKinds, type FsNode } from '#lib/utils.js';
 	import CopyButton from './CopyButton.svelte';
@@ -48,7 +47,7 @@
 
 	// Raw HTML stays text and script links are refused by default; images are
 	// off so a README cannot fetch from anywhere it likes.
-	async function markdown(text: string): Promise<string> {
+	async function markdown(text: string) {
 		const { default: MarkdownIt } = await import('markdown-it');
 		const md = new MarkdownIt({ highlight: (code, language) => highlight(code, language) ?? '' });
 		return md.disable('image').render(text);
@@ -252,14 +251,12 @@
 		</div>
 		{#if content}
 			<div class="fs-preview-digests">
-				<span>
-					SHA-256 <code title={content.sha256}>{content.sha256.slice(0, 12)}…</code>
-					<CopyButton text={content.sha256} label="Copy SHA-256" />
-				</span>
-				<span>
-					SHA-512 <code title={content.sha512}>{content.sha512.slice(0, 12)}…</code>
-					<CopyButton text={content.sha512} label="Copy SHA-512" />
-				</span>
+				{#each [['SHA-256', content.sha256], ['SHA-512', content.sha512]] as [algorithm, hash]}
+					<span>
+						{algorithm} <code title={hash}>{hash.slice(0, 12)}…</code>
+						<CopyButton text={hash} label="Copy {algorithm}" />
+					</span>
+				{/each}
 			</div>
 		{/if}
 	</div>

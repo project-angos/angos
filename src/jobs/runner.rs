@@ -7,14 +7,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::jobs::Queue;
-use crate::jobs::store::{ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore};
+use crate::jobs::store::{
+    ClaimOutcome, ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore,
+};
 
 /// Idle poll interval of an in-process claim loop; production polls once a
 /// second so an empty queue does not storm the object store with `LIST`s.
-#[cfg(not(test))]
 const IDLE_POLL: Duration = Duration::from_secs(1);
-#[cfg(test)]
-const IDLE_POLL: Duration = Duration::from_millis(10);
 
 /// One in-process claim loop over `queue`, where `handler` is the handler bound
 /// to it. Cancellation races only the claim, so a job already claimed runs to
@@ -31,12 +30,10 @@ pub async fn claim_loop(
             outcome = consumer.claim_one(queue) => match outcome {
                 // `claim_one` self-throttles on a backend error; nothing to do.
                 Err(_) => {}
-                Ok(claim_outcome) => match claim_outcome.claimed {
-                    None => sleep(claim_outcome.idle_sleep(IDLE_POLL)).await,
-                    Some(claimed) => {
-                        execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
-                    }
-                },
+                Ok(ClaimOutcome { claimed: Some(claimed), .. }) => {
+                    execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                }
+                Ok(idle) => sleep(idle.idle_sleep(IDLE_POLL)).await,
             },
         }
     }
@@ -113,7 +110,7 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::spawn;
-    use tokio::time::{Instant, sleep, timeout};
+    use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
     use angos_storage::ObjectStore;
@@ -121,7 +118,8 @@ mod tests {
 
     use crate::jobs::Queue;
     use crate::jobs::runner::{execute_one, run_once};
-    use crate::jobs::store::{ClaimMode, ClaimedJob, Error, JobEnvelope, JobHandler, JobStore};
+    use crate::jobs::store::tests::claimed_job;
+    use crate::jobs::store::{ClaimMode, Error, JobEnvelope, JobHandler, JobStore};
     use crate::metrics_provider;
     use crate::registry::test_utils::metadata_store_over;
 
@@ -135,7 +133,7 @@ mod tests {
     }
 
     fn make_store(dir: &TempDir) -> Arc<JobStore> {
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         Arc::new(JobStore::new(
             &metadata_store_over(object),
             "test-worker",
@@ -244,7 +242,7 @@ mod tests {
 
         let lost = CancellationToken::new();
         let lost_clone = lost.clone();
-        let claimed = ClaimedJob::for_test(
+        let claimed = claimed_job(
             JobEnvelope::new(Queue::Cache, "test.sleep", "cache.ns:sha256:lost", &())
                 .expect("envelope"),
             "00000000-0000-0000-0000-000000000000".to_string(),
@@ -264,7 +262,6 @@ mod tests {
             lost_clone.cancel();
         });
 
-        let started = Instant::now();
         timeout(
             Duration::from_secs(2),
             execute_one(&consumer, &handler, claimed),
@@ -275,10 +272,6 @@ mod tests {
         assert!(
             !completed.load(Ordering::Acquire),
             "handler must be cancelled by lock loss before completing its sleep"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "execute_one must abort on lock loss long before the handler's 30s sleep elapses"
         );
     }
 }

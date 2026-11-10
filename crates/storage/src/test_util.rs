@@ -1,14 +1,5 @@
-//! Shared test fixtures for storage-backed tests.
-//!
-//! [`HookedStore`] replaces the hand-rolled delegating store decorators the
-//! workspace's tests used for fault injection: it forwards every
-//! [`ObjectStore`] method to the wrapped store after consulting a
-//! [`StoreHook`], so a test only writes the hook logic (crash on the N-th
-//! write, gate a specific key, fail a named key) instead of seventeen
-//! delegation methods.
-//!
-//! Enabled for this crate's own tests and, through the `test-util` feature,
-//! for downstream crates' dev-dependencies.
+//! Fault-injection fixtures, exported to other crates by the `test-util`
+//! feature.
 
 use std::sync::Arc;
 
@@ -22,13 +13,13 @@ use crate::{
 };
 
 /// Single-frame [`ByteStream`] over `body`.
+#[must_use]
 pub fn frame(body: &[u8]) -> ByteStream {
     let bytes = Bytes::copy_from_slice(body);
     Box::pin(stream::once(async move { Ok(bytes) }))
 }
 
-/// One storage call about to be delegated by a [`HookedStore`], with the
-/// arguments a hook can meaningfully inspect.
+/// The call a [`HookedStore`] is about to delegate.
 #[derive(Debug)]
 pub enum StoreOp<'a> {
     Get {
@@ -39,7 +30,6 @@ pub enum StoreOp<'a> {
     },
     Put {
         key: &'a str,
-        data: &'a Bytes,
     },
     Delete {
         key: &'a str,
@@ -72,44 +62,28 @@ pub enum StoreOp<'a> {
     ListMultipartUploads,
 }
 
-/// Interception point run before every delegated call of a [`HookedStore`].
-///
-/// Returning an error short-circuits the call without touching the wrapped
-/// store; returning `Ok(())` delegates. Hooks hold their own state (atomic
-/// counters, gates, fault scripts) and may clone the wrapped store to apply
-/// side effects themselves before failing, which models lost-acknowledgement
-/// faults.
+/// Runs before every delegated call; an error short-circuits it.
 #[async_trait]
 pub trait StoreHook: Send + Sync {
-    /// Decide the fate of `op`.
-    ///
-    /// # Errors
-    /// Any error returned here is surfaced to the caller as the outcome of
-    /// the intercepted call.
     async fn before(&self, op: StoreOp<'_>) -> Result<(), Error>;
 }
 
-/// A store decorator that consults a [`StoreHook`] before delegating to the
-/// wrapped store.
-///
-/// Implemented for an `Arc<dyn ObjectStore>` inner; coerce the wrapped store
-/// accordingly at construction. `move_object` and `promote_upload` are
-/// intentionally left on the trait default (copy plus delete), so hooks
-/// observe moves through their constituent writes.
-#[derive(Debug)]
-pub struct HookedStore<S, H> {
-    inner: S,
+/// Consults a [`StoreHook`] before delegating. `move_object` and
+/// `promote_upload` keep the trait defaults, so hooks see their copy and
+/// delete.
+pub struct HookedStore<H> {
+    inner: Arc<dyn ObjectStore>,
     hook: H,
 }
 
-impl<S, H> HookedStore<S, H> {
-    pub fn new(inner: S, hook: H) -> Self {
+impl<H> HookedStore<H> {
+    pub fn new(inner: Arc<dyn ObjectStore>, hook: H) -> Self {
         Self { inner, hook }
     }
 }
 
 #[async_trait]
-impl<H: StoreHook> ObjectStore for HookedStore<Arc<dyn ObjectStore>, H> {
+impl<H: StoreHook> ObjectStore for HookedStore<H> {
     async fn get(&self, key: &str) -> Result<Vec<u8>, Error> {
         self.hook.before(StoreOp::Get { key }).await?;
         self.inner.get(key).await
@@ -125,12 +99,12 @@ impl<H: StoreHook> ObjectStore for HookedStore<Arc<dyn ObjectStore>, H> {
     }
 
     async fn create_if_absent(&self, key: &str, data: Bytes) -> Result<bool, Error> {
-        self.hook.before(StoreOp::Put { key, data: &data }).await?;
+        self.hook.before(StoreOp::Put { key }).await?;
         self.inner.create_if_absent(key, data).await
     }
 
     async fn put(&self, key: &str, data: Bytes) -> Result<(), Error> {
-        self.hook.before(StoreOp::Put { key, data: &data }).await?;
+        self.hook.before(StoreOp::Put { key }).await?;
         self.inner.put(key, data).await
     }
 
@@ -147,16 +121,6 @@ impl<H: StoreHook> ObjectStore for HookedStore<Arc<dyn ObjectStore>, H> {
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
         self.hook.before(StoreOp::Head { key }).await?;
         self.inner.head(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        n: u16,
-        token: Option<String>,
-    ) -> Result<Page<String>, Error> {
-        self.hook.before(StoreOp::List { prefix }).await?;
-        self.inner.list(prefix, n, token).await
     }
 
     async fn list_after(

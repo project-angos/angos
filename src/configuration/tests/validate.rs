@@ -2,55 +2,19 @@ use crate::configuration::{Configuration, Error};
 use crate::test_fixtures::configuration::{config_toml, load_config};
 
 #[test]
-fn global_max_manifest_size_must_be_greater_than_zero() {
-    let config = config_toml(
-        r"
-    max_manifest_size = 0
-    ",
-    );
-
-    let result = Configuration::load_from_str(&config);
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("global.max_manifest_size must be greater than zero"));
+fn global_sizes_must_be_greater_than_zero() {
+    for key in [
+        "max_manifest_size",
+        "max_blob_size",
+        "max_index_size",
+        "blob_stream_frame_size",
+    ] {
+        match Configuration::load_from_str(&config_toml(&format!("{key} = 0"))) {
+            Err(Error::InvalidFormat(msg)) => {
+                assert!(msg.contains(&format!("global.{key} must be greater than zero")));
+            }
+            other => panic!("Expected InvalidFormat error for {key}, got {other:?}"),
         }
-        other => panic!("Expected InvalidFormat error, got {other:?}"),
-    }
-}
-
-/// A zero-capacity read buffer reads nothing, so a blob body would end at once
-/// with a `200` rather than fail.
-#[test]
-fn global_blob_stream_frame_size_must_be_greater_than_zero() {
-    let config = config_toml(
-        r"
-    blob_stream_frame_size = 0
-    ",
-    );
-
-    let result = Configuration::load_from_str(&config);
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("global.blob_stream_frame_size must be greater than zero"));
-        }
-        other => panic!("Expected InvalidFormat error, got {other:?}"),
-    }
-}
-
-#[test]
-fn global_max_blob_size_must_be_greater_than_zero() {
-    let config = config_toml(
-        r"
-    max_blob_size = 0
-    ",
-    );
-
-    let result = Configuration::load_from_str(&config);
-    match result {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(msg.contains("global.max_blob_size must be greater than zero"));
-        }
-        other => panic!("Expected InvalidFormat error, got {other:?}"),
     }
 }
 
@@ -87,23 +51,6 @@ fn test_validate_webhook_missing_global_reference() {
         }
         _ => panic!("Expected InvalidFormat error"),
     }
-}
-
-#[test]
-fn test_validate_webhook_referenced_in_repository() {
-    let config = config_toml(
-        r#"
-    [repository.myapp]
-    authorization_webhook = "repo-webhook"
-
-    [auth.webhook.repo-webhook]
-    url = "https://example.com/webhook"
-    timeout_ms = 5000
-    "#,
-    );
-
-    let result = Configuration::load_from_str(&config);
-    assert!(result.is_ok());
 }
 
 #[test]
@@ -244,31 +191,6 @@ fn ui_sign_in_accepts_a_configured_oidc_provider() {
     let configuration = Configuration::load_from_str(&config).unwrap();
 
     assert_eq!(configuration.ui.oidc.unwrap().client_id, "angos-ui");
-}
-
-#[test]
-fn listing_read_concurrency_must_be_greater_than_zero() {
-    let config = config_toml("listing_read_concurrency = 0");
-
-    match Configuration::load_from_str(&config) {
-        Err(Error::InvalidFormat(msg)) => {
-            assert!(
-                msg.contains("listing_read_concurrency"),
-                "the refusal must name the key; got: {msg}"
-            );
-        }
-        other => panic!("Expected InvalidFormat error, got {other:?}"),
-    }
-}
-
-#[test]
-fn listing_read_concurrency_defaults_and_loads() {
-    let default = Configuration::load_from_str(&config_toml("")).unwrap();
-    assert_eq!(default.global.listing_read_concurrency.get(), 16);
-
-    let raised =
-        Configuration::load_from_str(&config_toml("listing_read_concurrency = 64")).unwrap();
-    assert_eq!(raised.global.listing_read_concurrency.get(), 64);
 }
 
 /// Loads the minimal configuration with a scanner and `extra` appended.

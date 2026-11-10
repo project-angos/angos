@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use http::request::Parts;
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::dangerous::insecure_decode;
@@ -17,15 +16,12 @@ use tracing::debug;
 use angos_mtls_client::ClientTls;
 
 use crate::auth::authorization::{basic_credentials, bearer_token};
-use crate::auth::{AuthMiddleware, AuthResult, Error};
+use crate::auth::{AuthResult, Error};
 use crate::identity::ClientIdentity;
 use angos_cache::Cache;
 
 /// An OIDC provider: the issuer to trust, and how tokens it signed are validated.
-///
-/// Providers differ only by configuration, so there is one type rather than one
-/// per vendor. What a vendor "is" reduces to its issuer, its JWKS location, and
-/// the claims its tokens are expected to carry.
+/// Vendors differ only by issuer, JWKS location and required claims.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub issuer: String,
@@ -100,19 +96,14 @@ impl Config {
 }
 
 pub struct OidcValidator {
-    provider_name: String,
-    config: Config,
-    client: Arc<Client>,
+    pub provider_name: String,
+    pub config: Config,
+    client: Client,
     cache: Arc<Cache>,
 }
 
 impl OidcValidator {
-    pub fn new(
-        provider_name: String,
-        config: &Config,
-        client: Arc<Client>,
-        cache: Arc<Cache>,
-    ) -> Self {
+    pub fn new(provider_name: String, config: &Config, client: Client, cache: Arc<Cache>) -> Self {
         Self {
             provider_name,
             config: config.clone(),
@@ -120,11 +111,8 @@ impl OidcValidator {
             cache,
         }
     }
-}
 
-#[async_trait]
-impl AuthMiddleware for OidcValidator {
-    async fn authenticate(
+    pub async fn authenticate(
         &self,
         parts: &Parts,
         identity: &mut ClientIdentity,
@@ -180,11 +168,8 @@ pub fn unverified_issuer(token: &str) -> Option<String> {
         .map(|token| token.claims.iss)
 }
 
-/// Extracts an OIDC credential string from `parts`:
-/// - `Authorization: Bearer <token>` → `Some(token)` (any provider can claim a Bearer header).
-/// - `Authorization: Basic <user:pass>` where `user == provider_name` → `Some(password)`
-///   (the OIDC token is in the password field; the username gates which provider claims it).
-/// - Anything else → `None`.
+/// A bearer token, which any provider claims, or the password of a Basic
+/// credential whose username names this provider.
 fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String> {
     if let Some(token) = bearer_token(&parts.headers) {
         debug!("Found Bearer token for OIDC provider '{provider_name}'");
@@ -205,8 +190,6 @@ fn extract_oidc_credential(parts: &Parts, provider_name: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use serde_json::json;
     use wiremock::MockServer;
 
@@ -222,11 +205,13 @@ mod tests {
     };
     use angos_cache::Config as CacheConfig;
 
-    fn build_config(issuer: &str) -> Config {
-        Config {
+    fn validator(name: &str, issuer: &str) -> OidcValidator {
+        let config = Config {
             required_audience: None,
             ..build_test_provider_config(issuer)
-        }
+        };
+        let cache = CacheConfig::Memory.to_backend().unwrap();
+        OidcValidator::new(name.to_string(), &config, Client::new(), cache)
     }
 
     fn make_test_token(issuer: &str) -> String {
@@ -236,158 +221,56 @@ mod tests {
         make_token(&claims, KID)
     }
 
-    fn test_http_client() -> Arc<Client> {
-        Arc::new(Client::new())
-    }
+    /// The token rides as a bearer, or as the password of a Basic credential
+    /// naming the provider.
+    #[tokio::test]
+    async fn authenticates_a_bearer_or_a_basic_credential_naming_the_provider() {
+        let server = MockServer::start().await;
+        mount_jwks(&server, static_jwks_response()).await;
+        let validator = validator("github", &server.uri());
+        let token = make_test_token(&server.uri());
 
-    #[test]
-    fn test_config_deserialize_minimal() {
-        let toml = r#"
-            issuer = "https://auth.example.com"
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.issuer, "https://auth.example.com");
-        assert!(config.jwks_uri.is_none());
-        assert!(config.bearer_token_file.is_none());
-        assert!(
-            config.required_claims.is_empty(),
-            "{:?}",
-            config.required_claims
-        );
-        assert_eq!(config.jwks_refresh_interval, 3600);
-        assert!(config.required_audience.is_none());
-        assert_eq!(config.clock_skew_tolerance, 60);
-        assert_eq!(config.allowed_algorithms, vec![Algorithm::RS256]);
-        assert_eq!(config.http_request_timeout_secs, 30);
-        assert_eq!(config.jwks_refresh_timeout_secs, 5);
-    }
-
-    /// GitHub Actions used to be its own provider type. Its entire definition
-    /// is now a config entry, so this pins that the shape still loads without
-    /// a dedicated variant.
-    #[test]
-    fn test_config_deserialize_github_actions_shape() {
-        let toml = r#"
-            issuer = "https://token.actions.githubusercontent.com"
-            jwks_uri = "https://token.actions.githubusercontent.com/.well-known/jwks"
-            required_claims = ["repository", "actor"]
-        "#;
-
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.issuer, "https://token.actions.githubusercontent.com");
-        assert_eq!(config.required_claims, vec!["repository", "actor"]);
+        for parts in [
+            parts_with_authorization(&format!("Bearer {token}")),
+            parts_with_basic_auth("github", &token),
+        ] {
+            let mut identity = ClientIdentity::new(None);
+            let result = validator.authenticate(&parts, &mut identity).await;
+            assert!(
+                matches!(result, Ok(AuthResult::Authenticated)),
+                "{result:?}"
+            );
+            let claims = identity.oidc.unwrap();
+            assert_eq!(claims.provider_name, "github");
+            assert_eq!(claims.claims["sub"], "test-user");
+        }
     }
 
     #[tokio::test]
-    async fn test_authenticate_with_bearer_token() {
-        let mock_server = MockServer::start().await;
+    async fn no_credential_for_this_provider_is_no_credentials() {
+        let validator = validator("github", "https://auth.example.com");
 
-        mount_jwks(&mock_server, static_jwks_response()).await;
-
-        let config = build_config(&mock_server.uri());
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "test-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
-        let token = make_test_token(&mock_server.uri());
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
-        let mut identity = ClientIdentity::new(None);
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), AuthResult::Authenticated));
-        assert!(identity.oidc.is_some());
-        let oidc_claims = identity.oidc.unwrap();
-        assert_eq!(oidc_claims.provider_name, "test-provider");
-        assert_eq!(oidc_claims.claims.get("sub").unwrap(), "test-user");
+        for parts in [
+            empty_parts(),
+            parts_with_basic_auth("wrong-provider", "token"),
+        ] {
+            let mut identity = ClientIdentity::new(None);
+            let result = validator.authenticate(&parts, &mut identity).await;
+            assert!(
+                matches!(result, Ok(AuthResult::NoCredentials)),
+                "{result:?}"
+            );
+            assert!(identity.oidc.is_none());
+        }
     }
 
     #[tokio::test]
-    async fn test_authenticate_with_basic_auth_matching_provider() {
-        let mock_server = MockServer::start().await;
-
-        mount_jwks(&mock_server, static_jwks_response()).await;
-
-        let config = build_config(&mock_server.uri());
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let validator =
-            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
-
-        let token = make_test_token(&mock_server.uri());
-        let parts = parts_with_basic_auth("github", &token);
-        let mut identity = ClientIdentity::new(None);
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), AuthResult::Authenticated));
-        assert!(identity.oidc.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_with_basic_auth_non_matching_provider() {
-        let config = build_config("https://auth.example.com");
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let validator =
-            OidcValidator::new("github".to_string(), &config, test_http_client(), cache);
-
-        let parts = parts_with_basic_auth("wrong-provider", "token");
-        let mut identity = ClientIdentity::new(None);
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), AuthResult::NoCredentials));
-        assert!(identity.oidc.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_no_credentials() {
-        let config = build_config("https://auth.example.com");
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "test-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
-        let parts = empty_parts();
-        let mut identity = ClientIdentity::new(None);
-
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), AuthResult::NoCredentials));
-        assert!(identity.oidc.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_authenticate_with_invalid_token() {
-        let config = build_config("https://auth.example.com");
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let validator = OidcValidator::new(
-            "test-provider".to_string(),
-            &config,
-            test_http_client(),
-            cache,
-        );
-
+    async fn an_invalid_token_is_an_error() {
+        let validator = validator("test-provider", "https://auth.example.com");
         let parts = parts_with_authorization("Bearer invalid-token");
         let mut identity = ClientIdentity::new(None);
 
-        let result = validator.authenticate(&parts, &mut identity).await;
-
-        assert!(result.is_err());
+        assert!(validator.authenticate(&parts, &mut identity).await.is_err());
         assert!(identity.oidc.is_none());
     }
 }

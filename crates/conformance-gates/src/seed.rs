@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
@@ -30,6 +31,26 @@ pub const ORPHAN_FAILED_JOB_KEY: &str = "_jobs/failed/cache/0000000000000002-gat
 
 /// Bytes of the orphan blob, seeded at its canonical path with no references.
 const ORPHAN_CONTENT: &[u8] = b"orphan-blob-bytes";
+
+/// An upload whose namespace name fails validation.
+const ZOMBIE_UPLOAD_KEY: &str =
+    "v2/repositories/UPPER-UP/_uploads/00000000-0000-4000-8000-000000000000/data";
+
+/// Corrupt job records the walk deletes outright, with their bodies.
+const JUNK_JOBS: [(&str, &str); 3] = [
+    (
+        "_jobs/pending/replication/0000000000000000-gate-junk.json",
+        "not an envelope",
+    ),
+    (
+        "_jobs/failed/cache/0000000000000000-gate-junk.json",
+        "not a dead letter",
+    ),
+    (
+        "_jobs/index/replication/gate-junk.json",
+        "not an index entry",
+    ),
+];
 
 /// Upload container of the seeded orphan multipart (s3 only): a real
 /// in-flight multipart with no session marker.
@@ -72,17 +93,11 @@ impl Probes {
     /// plus the revision record.
     pub fn recreated_links(&self) -> Vec<String> {
         vec![
-            format!(
-                "v2/ref/sha256/{}/{}/{GATE_NS}!r/sha256.{}",
-                &self.gate_layer_digest[..2],
-                self.gate_layer_digest,
-                self.gate_manifest_digest
-            ),
-            format!(
-                "v2/ref/sha256/{}/{}/{GATE_NS}!r/sha256.{}",
-                &self.gate_config_digest[..2],
-                self.gate_config_digest,
-                self.gate_manifest_digest
+            ref_entry(&self.gate_layer_digest, GATE_NS, &self.gate_manifest_digest),
+            ref_entry(
+                &self.gate_config_digest,
+                GATE_NS,
+                &self.gate_manifest_digest,
             ),
             format!(
                 "v2/ns/{GATE_NS}!rev/sha256/{}/{}",
@@ -119,17 +134,10 @@ impl Probes {
         let mut gone = vec![
             self.dangling_tag_entry(),
             self.orphan_referrer_record(),
-            "v2/repositories/UPPER-UP/_uploads/00000000-0000-4000-8000-000000000000/data"
-                .to_string(),
-            format!(
-                "v2/blobs/sha256/{}/{}/data",
-                &self.orphan_digest[..2],
-                self.orphan_digest
-            ),
-            "_jobs/pending/replication/0000000000000000-gate-junk.json".to_string(),
-            "_jobs/failed/cache/0000000000000000-gate-junk.json".to_string(),
-            "_jobs/index/replication/gate-junk.json".to_string(),
+            ZOMBIE_UPLOAD_KEY.to_string(),
+            blob_data_key(&self.orphan_digest),
         ];
+        gone.extend(JUNK_JOBS.map(|(key, _)| key.to_string()));
         gone.extend(self.aliens().into_iter().map(|alien| alien.key));
         gone
     }
@@ -169,40 +177,43 @@ impl Probes {
 
     /// Gate2's per-referrer reference entry on the shared config blob.
     pub fn gate2_config_ref_entry(&self) -> String {
-        format!(
-            "v2/ref/sha256/{}/{}/{GATE2_NS}!r/sha256.{}",
-            &self.gate_config_digest[..2],
-            self.gate_config_digest,
-            self.gate2_manifest_digest
+        ref_entry(
+            &self.gate_config_digest,
+            GATE2_NS,
+            &self.gate2_manifest_digest,
         )
     }
 
-    /// Canonical data key of the gate image's layer, the audit-teeth target.
+    /// The audit-teeth target.
     pub fn gate_layer_data(&self) -> String {
         blob_data_key(&self.gate_layer_digest)
     }
 
-    /// Canonical data key of the grant-only blob.
     pub fn grant_only_data(&self) -> String {
         blob_data_key(&self.grant_only_digest)
     }
 
-    /// The grant-only blob's ownership reference key.
     pub fn grant_only_ref(&self) -> String {
         own_ref_key(&self.grant_only_digest)
     }
 
-    /// The byteless blob's surviving reference key.
     pub fn byteless_ref(&self) -> String {
         own_ref_key(&self.byteless_digest)
+    }
+
+    /// The artifacts only prune may reap, and only past the `-u` window.
+    pub fn age_gated(&self) -> [(String, &'static str); 3] {
+        [
+            (self.grant_only_data(), "grant-only blob bytes"),
+            (self.grant_only_ref(), "grant-only blob grant"),
+            (self.byteless_ref(), "byteless index entry"),
+        ]
     }
 
     /// Key prefixes a repair run may legitimately touch. A snapshot-diff line
     /// outside these means scrub damaged innocent data.
     pub fn blast_prefixes(&self) -> Vec<String> {
-        let blob_container = |digest: &str| format!("v2/blobs/sha256/{}/{digest}/", &digest[..2]);
-        let ref_container = |digest: &str| format!("v2/ref/sha256/{}/{digest}/", &digest[..2]);
-        vec![
+        let mut prefixes = vec![
             format!("v2/repositories/{GATE_NS}/"),
             format!("v2/repositories/{GATE2_NS}/"),
             "v2/repositories/UPPER-UP/".to_string(),
@@ -210,33 +221,29 @@ impl Probes {
             format!("v2/ns/{GATE2_NS}!"),
             format!("v2/cat/{GATE_NS}!"),
             format!("v2/cat/{GATE2_NS}!"),
-            ref_container(&self.gate_layer_digest),
-            ref_container(&self.gate_config_digest),
-            ref_container(&self.gate_manifest_digest),
-            ref_container(&self.gate2_layer_digest),
-            ref_container(&self.gate2_manifest_digest),
-            ref_container(&self.orphan_digest),
-            ref_container(&self.grant_only_digest),
-            ref_container(&self.byteless_digest),
-            blob_container(&self.gate_layer_digest),
-            blob_container(&self.gate_config_digest),
-            blob_container(&self.gate_manifest_digest),
-            blob_container(&self.gate2_layer_digest),
-            blob_container(&self.gate2_manifest_digest),
-            blob_container(&self.orphan_digest),
-            blob_container(&self.grant_only_digest),
-            blob_container(&self.byteless_digest),
             "zz-alien/".to_string(),
             "v2/zz-alien-under-v2".to_string(),
-            "_jobs/pending/replication/0000000000000000-gate-junk.json".to_string(),
-            "_jobs/failed/cache/0000000000000000-gate-junk.json".to_string(),
-            "_jobs/index/replication/gate-junk.json".to_string(),
             ORPHAN_PENDING_JOB_KEY.to_string(),
             ORPHAN_FAILED_JOB_KEY.to_string(),
             "_lost_and_found/".to_string(),
             // A reclaiming run leaves its marker to linger past the delete.
             "v2/gc/".to_string(),
-        ]
+        ];
+        prefixes.extend(JUNK_JOBS.map(|(key, _)| key.to_string()));
+        for digest in [
+            &self.gate_layer_digest,
+            &self.gate_config_digest,
+            &self.gate_manifest_digest,
+            &self.gate2_layer_digest,
+            &self.gate2_manifest_digest,
+            &self.orphan_digest,
+            &self.grant_only_digest,
+            &self.byteless_digest,
+        ] {
+            prefixes.push(format!("v2/ref/sha256/{}/{digest}/", &digest[..2]));
+            prefixes.push(format!("v2/blobs/sha256/{}/{digest}/", &digest[..2]));
+        }
+        prefixes
     }
 }
 
@@ -263,7 +270,10 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
     let byteless_digest = registry
         .upload_blob(GATE_NS, b"byteless-blob-bytes")
         .await?;
-    store.delete(&blob_data_key(&byteless_digest)).await?;
+    store
+        .objects
+        .delete(&blob_data_key(&byteless_digest))
+        .await?;
 
     // An in-flight multipart with no session marker (s3 only): prune's
     // multipart sweep must abort it past the window, and only then. The pins
@@ -271,11 +281,11 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
     // never lists them, leaving both the sweep and the gate blind, so probe
     // the capability and skip (loudly) instead of passing vacuously.
     let mut multipart_seeded = false;
-    if store.is_s3() {
+    if store.is_s3 {
         store.seed_orphan_multipart(ORPHAN_MULTIPART_KEY).await?;
         multipart_seeded = store.multipart_count().await? > 0;
         if !multipart_seeded {
-            store.abort_upload(ORPHAN_MULTIPART_KEY).await?;
+            store.objects.abort_upload(ORPHAN_MULTIPART_KEY).await?;
             println!(
                 "backend does not list in-flight multiparts; the multipart sweep pins are skipped"
             );
@@ -304,63 +314,32 @@ pub async fn seed_defects(store: &GateStore, registry: &RegistryClient) -> GateR
     Ok(probes)
 }
 
-/// Damage the store directly: one defect per failure class the walk claims
-/// to handle.
 async fn damage_store(store: &GateStore, probes: &Probes) -> GateResult<()> {
-    // Repair defects: deleted derivable links (layer, config, revision).
+    let objects = &store.objects;
+    // Repair defects: deleted derivable links.
     for link in probes.recreated_links() {
-        store.delete(&link).await?;
+        objects.delete(&link).await?;
     }
-
-    // A tag entry whose target blob does not exist.
-    store.put(&probes.dangling_tag_entry(), b"{}").await?;
-
-    // An upload directory whose namespace name fails validation.
-    store
-        .put(
-            "v2/repositories/UPPER-UP/_uploads/00000000-0000-4000-8000-000000000000/data",
-            b"zombie",
-        )
-        .await?;
-
-    // Orphan blob: bytes at a canonical path with no index references.
-    store
-        .put(
-            &format!(
-                "v2/blobs/sha256/{}/{}/data",
-                &probes.orphan_digest[..2],
-                probes.orphan_digest
-            ),
-            ORPHAN_CONTENT,
-        )
-        .await?;
-
-    // Orphan referrer: a record whose referrer manifest is not a current
-    // revision.
-    store.put(&probes.orphan_referrer_record(), b"{}").await?;
-
-    // Corrupt-content defects, deleted outright by the walk.
-    let corrupt: [(String, &str); 3] = [
-        (
-            "_jobs/pending/replication/0000000000000000-gate-junk.json".to_string(),
-            "not an envelope",
-        ),
-        (
-            "_jobs/failed/cache/0000000000000000-gate-junk.json".to_string(),
-            "not a dead letter",
-        ),
-        (
-            "_jobs/index/replication/gate-junk.json".to_string(),
-            "not an index entry",
-        ),
+    // A dangling tag, a zombie upload, an orphan blob and an orphan referrer.
+    let raw: [(String, &'static [u8]); 4] = [
+        (probes.dangling_tag_entry(), b"{}"),
+        (ZOMBIE_UPLOAD_KEY.to_string(), b"zombie"),
+        (blob_data_key(&probes.orphan_digest), ORPHAN_CONTENT),
+        (probes.orphan_referrer_record(), b"{}"),
     ];
-    for (key, body) in corrupt {
-        store.put(&key, body.as_bytes()).await?;
+    for (key, body) in raw {
+        objects.put(&key, Bytes::from_static(body)).await?;
     }
-
-    // Alien keys, quarantined with bytes preserved.
+    for (key, body) in JUNK_JOBS {
+        objects
+            .put(key, Bytes::from_static(body.as_bytes()))
+            .await?;
+    }
+    // Quarantined with bytes preserved.
     for alien in probes.aliens() {
-        store.put(&alien.key, alien.body.as_bytes()).await?;
+        objects
+            .put(&alien.key, Bytes::from_static(alien.body.as_bytes()))
+            .await?;
     }
 
     // Config-orphan jobs: structurally valid records whose targets left the
@@ -381,9 +360,6 @@ async fn damage_store(store: &GateStore, probes: &Probes) -> GateResult<()> {
             "kind": "replication.push_manifest",
         },
     });
-    store
-        .put(ORPHAN_PENDING_JOB_KEY, &serde_json::to_vec(&pending)?)
-        .await?;
     let failed = json!({
         "id": "gate-orphan-failed",
         "queue": "cache",
@@ -399,18 +375,30 @@ async fn damage_store(store: &GateStore, probes: &Probes) -> GateResult<()> {
         "last_error": "upstream gone",
         "failed_at": Utc::now(),
     });
-    store
-        .put(ORPHAN_FAILED_JOB_KEY, &serde_json::to_vec(&failed)?)
-        .await?;
+    for (key, record) in [
+        (ORPHAN_PENDING_JOB_KEY, pending),
+        (ORPHAN_FAILED_JOB_KEY, failed),
+    ] {
+        objects
+            .put(key, Bytes::from(serde_json::to_vec(&record)?))
+            .await?;
+    }
 
     let seeded = if probes.multipart_seeded { 27 } else { 26 };
     println!("seeded {seeded} defects across 4 classes plus 2 decoys");
     Ok(())
 }
 
-/// Canonical `data` key of a blob digest.
 fn blob_data_key(digest: &str) -> String {
     format!("v2/blobs/sha256/{}/{digest}/data", &digest[..2])
+}
+
+/// `namespace`'s per-referrer reference entry on blob `digest` from `manifest`.
+fn ref_entry(digest: &str, namespace: &str, manifest: &str) -> String {
+    format!(
+        "v2/ref/sha256/{}/{digest}/{namespace}!r/sha256.{manifest}",
+        &digest[..2]
+    )
 }
 
 /// The `GATE_NS` ownership reference key of a blob digest.

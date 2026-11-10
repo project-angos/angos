@@ -15,18 +15,16 @@ use crate::configuration::Configuration;
 use crate::identity::{Action, ClientIdentity};
 use crate::policy::{AccessPolicy, PolicyDecision, RepositoryPolicy};
 use crate::registry::{Registry, Repository};
-use angos_mtls_client::{ClientTls, MtlsClientBuilder};
+use angos_mtls_client::{ClientTls, build_client};
 
 const ACCESS_DENIED: &str = "Access denied";
 
-/// Centralized authorization component that handles all access control decisions
 pub struct Authorizer {
     global_access_policy: AccessPolicy,
     global_authorization_webhook: Option<Arc<WebhookAuthorizer>>,
     repositories: HashMap<String, AuthorizerRepository>,
 }
 
-/// Repository-specific authorization configuration
 struct AuthorizerRepository {
     access_policy: Option<AccessPolicy>,
     authorization_webhook: Option<Arc<WebhookAuthorizer>>,
@@ -64,7 +62,7 @@ impl Authorizer {
     ) -> Result<(), Error> {
         let namespace = action.namespace();
         let repository =
-            namespace.and_then(|namespace| registry.repository_for_namespace(namespace).ok());
+            namespace.and_then(|namespace| registry.repository_for_namespace(namespace));
 
         debug!("Evaluating global access policy");
         enforce_policy(
@@ -182,7 +180,7 @@ impl Authorizer {
         identity: &ClientIdentity,
         registry: &Registry,
     ) -> bool {
-        let repository = registry.repository_for_namespace(namespace).ok();
+        let repository = registry.repository_for_namespace(namespace);
         // A repository is listable when the client could list its tags: the
         // catalog is a listing, so it gates on the same read.
         let action = Action::ListTags {
@@ -198,18 +196,15 @@ impl Authorizer {
         if !matches!(global, PolicyDecision::Allow) {
             return false;
         }
-        let Some(repository) = repository else {
-            return true;
-        };
-        match self.repositories.get(repository.name.as_ref()) {
-            Some(auth_repo) => auth_repo.access_policy.as_ref().is_none_or(|policy| {
+        repository
+            .and_then(|repository| self.repositories.get(repository.name.as_ref()))
+            .and_then(|auth_repo| auth_repo.access_policy.as_ref())
+            .is_none_or(|policy| {
                 matches!(
                     policy.evaluate(&action, identity, RepositoryPolicy::Declared),
                     PolicyDecision::Allow
                 )
-            }),
-            None => true,
-        }
+            })
     }
 
     /// Whether the `[repository]` covering the request carries its own access
@@ -238,13 +233,13 @@ fn build_webhooks(
         let client = if let Some(client) = clients.get(&webhook_config.tls) {
             client.clone()
         } else {
-            let client = MtlsClientBuilder::new()
-                .with_redirect_policy(Policy::none())
-                .with_tls(&webhook_config.tls)
-                .build()
-                .map_err(|e| {
-                    Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
-                })?;
+            let client = build_client(
+                Client::builder().redirect(Policy::none()),
+                &webhook_config.tls,
+            )
+            .map_err(|e| {
+                Error::Initialization(format!("Failed to create webhook '{name}': {e}"))
+            })?;
             clients.insert(webhook_config.tls.clone(), client.clone());
             client
         };

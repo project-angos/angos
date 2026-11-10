@@ -1,12 +1,8 @@
 use bytesize::ByteSize;
 use serde::Deserialize;
 
-/// Transport-level configuration for the S3 backend.
-///
-/// `access_key_id` and `secret_key` are plain `String`s here. Application
-/// layers that want debug-redaction or zeroize-on-drop semantics should keep
-/// their own secret-wrapper type and call `.expose()` (or equivalent) when
-/// building this config. This crate is a transport, not a security layer.
+/// Credentials are plain `String`s: callers wanting redaction keep their own
+/// secret wrapper and expose it when building this config.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BackendConfig {

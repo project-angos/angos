@@ -34,31 +34,7 @@ impl Namespace {
         }
     }
 
-    /// Remove the leading whole-segment `prefix`, returning the sub-namespace,
-    /// which is still a valid namespace by construction. Errors when `prefix` is
-    /// not a segment prefix or matches exactly (which would leave nothing).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `prefix` is not a whole-segment prefix of this
-    /// namespace, or is the whole of it.
-    pub fn strip_prefix(&self, prefix: &Namespace) -> Result<Namespace, Error> {
-        match self
-            .0
-            .strip_prefix(prefix.0.as_str())
-            .and_then(|rest| rest.strip_prefix('/'))
-        {
-            Some(sub) if !sub.is_empty() => Ok(Namespace(sub.to_owned())),
-            _ => Err(Error::Namespace(format!(
-                "'{}' is not a prefix of '{}'",
-                prefix.0, self.0
-            ))),
-        }
-    }
-
-    /// Nest this namespace under `prefix`, yielding `prefix/self`. Joining two
-    /// valid namespaces always yields valid grammar, so only the total length
-    /// cap is checked here, keeping the request path off the full grammar.
+    /// `prefix/self`; joining two valid namespaces only risks the length cap.
     ///
     /// # Errors
     ///
@@ -72,10 +48,9 @@ impl Namespace {
         }
     }
 
-    /// Map this local namespace to its remote form: drop the `local_namespace`
-    /// prefix when set, then nest under `target_namespace` when set. At the
-    /// repository root (namespace equals `local_namespace`) the remote is
-    /// `target_namespace` alone, or this namespace verbatim when no target is set.
+    /// The remote form: strip `local_namespace`, then nest under
+    /// `target_namespace`. The repository root maps to the target alone, or to
+    /// itself without one.
     ///
     /// # Errors
     ///
@@ -88,7 +63,19 @@ impl Namespace {
     ) -> Result<Namespace, Error> {
         let bare = match local_namespace {
             Some(local_namespace) if self == local_namespace => None,
-            Some(local_namespace) => Some(self.strip_prefix(local_namespace)?),
+            Some(local_namespace) => {
+                let sub = self
+                    .0
+                    .strip_prefix(local_namespace.0.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .ok_or_else(|| {
+                        Error::Namespace(format!(
+                            "'{}' is not a prefix of '{}'",
+                            local_namespace.0, self.0
+                        ))
+                    })?;
+                Some(Namespace(sub.to_owned()))
+            }
             None => Some(self.clone()),
         };
         Ok(match (bare, target_namespace) {
@@ -102,12 +89,8 @@ impl Namespace {
 
 str_newtype!(Namespace);
 
-/// Returns `true` when `namespace` belongs to the configured `repository_name`,
-/// either as an exact match or as a direct sub-namespace of the form
-/// `{repository_name}/...`.
-///
-/// The `/` separator check is intentional: without it, `"myrepo2"` would
-/// spuriously match `"myrepo"` via `starts_with`.
+/// Whether `namespace` is `repository_name` or under it; `myrepo2` is not
+/// under `myrepo`.
 #[must_use]
 pub fn namespace_belongs_to(namespace: &str, repository_name: &str) -> bool {
     namespace == repository_name
@@ -121,125 +104,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deserialize_invalid() {
-        let json = "\"Invalid-Repo\"";
-        let result: Result<Namespace, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_namespace_length_cap() {
         assert!(Namespace::new(&"a".repeat(MAX_NAMESPACE_LENGTH)).is_ok());
         assert!(Namespace::new(&"a".repeat(MAX_NAMESPACE_LENGTH + 1)).is_err());
     }
 
-    #[test]
-    fn strip_prefix_respects_segment_boundaries() {
-        // `repo` is not a whole-segment prefix of `repo2/app`, so it errors.
-        assert!(
-            Namespace::new("repo2/app")
-                .unwrap()
-                .strip_prefix(&Namespace::new("repo").unwrap())
-                .is_err()
-        );
+    fn ns(s: &str) -> Namespace {
+        Namespace::new(s).unwrap()
     }
 
     #[test]
-    fn strip_prefix_exact_match_errors() {
-        assert!(
-            Namespace::new("repo")
-                .unwrap()
-                .strip_prefix(&Namespace::new("repo").unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn remote_passes_through_verbatim() {
-        assert_eq!(
-            Namespace::new("repo/app")
-                .unwrap()
-                .remote(None, None)
-                .unwrap(),
-            "repo/app"
-        );
-    }
-
-    #[test]
-    fn remote_strips_repository_prefix() {
-        let repo = Namespace::new("repo").unwrap();
-        assert_eq!(
-            Namespace::new("repo/app")
-                .unwrap()
-                .remote(Some(&repo), None)
-                .unwrap(),
-            "app"
-        );
-    }
-
-    #[test]
-    fn remote_strips_then_prepends() {
-        let repo = Namespace::new("repo").unwrap();
-        let mirror = Namespace::new("mirror").unwrap();
-        assert_eq!(
-            Namespace::new("repo/app")
-                .unwrap()
-                .remote(Some(&repo), Some(&mirror))
-                .unwrap(),
-            "mirror/app"
-        );
-    }
-
-    #[test]
-    fn remote_keeps_deeper_sub_namespaces() {
-        let repo = Namespace::new("repo").unwrap();
-        let mirror = Namespace::new("mirror").unwrap();
-        assert_eq!(
-            Namespace::new("repo/team/app")
-                .unwrap()
-                .remote(Some(&repo), Some(&mirror))
-                .unwrap(),
-            "mirror/team/app"
-        );
-    }
-
-    #[test]
-    fn remote_root_maps_to_prefix() {
-        // The bug fix: a push at the repository root (namespace == strip) must
-        // map to the bare URL-path prefix, not error.
-        let repo = Namespace::new("repo").unwrap();
-        let mirror = Namespace::new("mirror").unwrap();
-        assert_eq!(
-            Namespace::new("repo")
-                .unwrap()
-                .remote(Some(&repo), Some(&mirror))
-                .unwrap(),
-            "mirror"
-        );
-    }
-
-    #[test]
-    fn remote_root_without_prefix_is_verbatim() {
-        let repo = Namespace::new("repo").unwrap();
-        assert_eq!(
-            Namespace::new("repo")
-                .unwrap()
-                .remote(Some(&repo), None)
-                .unwrap(),
-            "repo"
-        );
-    }
-
-    #[test]
-    fn remote_errors_on_non_prefix() {
-        let repo = Namespace::new("repo").unwrap();
-        let mirror = Namespace::new("mirror").unwrap();
-        assert!(
-            Namespace::new("other/x")
-                .unwrap()
-                .remote(Some(&repo), Some(&mirror))
-                .is_err()
-        );
+    fn remote_maps_every_local_and_target_combination() {
+        let (repo, mirror) = (ns("repo"), ns("mirror"));
+        for (namespace, local, target, expected) in [
+            ("repo/app", None, None, "repo/app"),
+            ("repo/app", Some(&repo), None, "app"),
+            (
+                "repo/team/app",
+                Some(&repo),
+                Some(&mirror),
+                "mirror/team/app",
+            ),
+            // The repository root maps to the bare target.
+            ("repo", Some(&repo), Some(&mirror), "mirror"),
+            ("repo", Some(&repo), None, "repo"),
+        ] {
+            assert_eq!(
+                ns(namespace).remote(local, target).unwrap(),
+                expected,
+                "{namespace}"
+            );
+        }
+        assert!(ns("other/x").remote(Some(&repo), Some(&mirror)).is_err());
+        // Only a whole-segment prefix strips.
+        assert!(ns("repo2/app").remote(Some(&repo), None).is_err());
     }
 
     #[test]
@@ -252,26 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn test_namespace_belongs_to_exact_match() {
+    fn test_namespace_belongs_to() {
         assert!(namespace_belongs_to("myrepo", "myrepo"));
-    }
-
-    #[test]
-    fn test_namespace_belongs_to_prefix_match() {
-        assert!(namespace_belongs_to("myrepo/sub", "myrepo"));
         assert!(namespace_belongs_to("myrepo/sub/path", "myrepo"));
-    }
-
-    #[test]
-    fn test_namespace_belongs_to_distinct_namespace() {
-        assert!(!namespace_belongs_to("other", "myrepo"));
-        assert!(!namespace_belongs_to("other/sub", "myrepo"));
-    }
-
-    #[test]
-    fn test_namespace_belongs_to_no_trailing_slash_without_sub() {
+        for namespace in ["other", "other/sub", "myrepo2"] {
+            assert!(!namespace_belongs_to(namespace, "myrepo"), "{namespace}");
+        }
         assert!(!namespace_belongs_to("myrepo", "myrepo/"));
-        assert!(!namespace_belongs_to("myrepo2", "myrepo"));
         assert!(!namespace_belongs_to("myrepo", "myrepo2"));
     }
 

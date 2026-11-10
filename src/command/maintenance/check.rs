@@ -12,7 +12,6 @@ use angos_oci::Namespace;
 
 use crate::command::maintenance::error::Error;
 use crate::command::maintenance::executor::ActionSink;
-use crate::registry::content_discovery::holds_manifest_content;
 use crate::registry::metadata_store::{LIST_PAGE, MetadataStore};
 
 /// A checker that operates on a single namespace at a time.
@@ -36,9 +35,7 @@ pub async fn check_namespaces(
     concurrency: usize,
 ) -> Result<(), Error> {
     metadata_store
-        .stream_namespaces(None, LIST_PAGE, &|_| true, |namespace| {
-            holds_manifest_content(metadata_store, namespace)
-        })
+        .stream_namespaces(None, LIST_PAGE, &|_| true)
         .try_for_each_concurrent(concurrency, |namespace| async move {
             if let Err(e) = checker.check(&namespace, sink).await {
                 warn!("Check failed for namespace '{namespace}': {e}");

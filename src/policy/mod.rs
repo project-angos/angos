@@ -8,7 +8,6 @@ mod retention_policy;
 
 pub use access_policy::{AccessMode, AccessPolicy, RepositoryPolicy};
 pub use cel_rule::{CelRule, RuleOutcome, evaluate_rules};
-pub use clock::SystemClock;
 pub use config::PolicyConfig;
 pub use error::{Error, PolicyDecision, PolicyError};
 pub use image_policy::ImagePolicy;

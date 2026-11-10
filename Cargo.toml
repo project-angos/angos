@@ -144,8 +144,6 @@ x509-parser = "0.18.1"
 zeroize = { workspace = true }
 
 [dev-dependencies]
-angos-cache = { workspace = true, features = ["test-util"] }
-angos-oci = { workspace = true, features = ["test-util"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 angos-storage = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,10 +1,17 @@
-mod error;
+use std::io;
 
 use argh::FromArgs;
+use argon2::password_hash::Error as PasswordHashError;
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use zeroize::Zeroizing;
 
-use error::Error;
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Input(#[from] io::Error),
+    #[error("{0}")]
+    Hashing(PasswordHashError),
+}
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -43,17 +50,12 @@ mod tests {
         let password = "my_secure_password";
         let hash = generate_password(password).expect("Failed to generate password hash");
 
-        let parsed_hash = PasswordHash::new(&hash).expect("Failed to parse hash");
-        let password_verify = Argon2::default().verify_password(password.as_bytes(), &parsed_hash);
-        assert!(password_verify.is_ok());
-    }
-
-    #[test]
-    fn generated_hash_has_argon2id_prefix() {
-        let hash = generate_password("any-password").expect("hash must be produced");
         assert!(
             hash.starts_with("$argon2id$"),
             "hash must start with '$argon2id$', got: {hash}"
         );
+        let parsed_hash = PasswordHash::new(&hash).expect("Failed to parse hash");
+        let password_verify = Argon2::default().verify_password(password.as_bytes(), &parsed_hash);
+        assert!(password_verify.is_ok());
     }
 }

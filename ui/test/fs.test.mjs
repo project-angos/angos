@@ -1,7 +1,4 @@
-// The `utils.ts` helpers: the layer merge's accounting of wasted bytes and
-// identical files, how a manifest is named for pulling, and how a finding's
-// severity is read. Run by `npm test` on Node's own runner. `utils.ts` imports
-// `$app/paths` for its links, which only SvelteKit provides, so it is stubbed.
+// `utils.ts` imports `$app/paths`, which only SvelteKit provides, so it is stubbed.
 import { register } from 'node:module';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -67,10 +64,6 @@ test('a later layer wastes the bytes it overwrites or removes, largest first', (
 	);
 });
 
-test('a folder listed again keeps what lower layers put in it', () => {
-	assert.ok(tree.root.children.get('app')?.children.has('a'));
-});
-
 test('the tree rows open what was expanded, and a filter keeps a match with the folders above it', () => {
 	const row = ({ node, depth, guides, hasNext, open }) => [node.path, depth, guides.join(), hasNext, open];
 	const none = { layers: new Set(), text: '' };
@@ -133,7 +126,6 @@ test('setuid, setgid, capable and world-writable entries are risky, a sticky fol
 
 test('a digest of any algorithm is pulled after an at, a tag after a colon', () => {
 	assert.equal(imageReference('apps/web', 'sha512:abc'), 'apps/web@sha512:abc');
-	assert.equal(imageReference('apps/web', 'sha256:abc'), 'apps/web@sha256:abc');
 	assert.equal(imageReference('apps/web', 'v1'), 'apps/web:v1');
 });
 

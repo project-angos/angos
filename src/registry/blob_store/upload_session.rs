@@ -8,13 +8,14 @@
 //! The backend owns the upload mechanics behind its keyed `ObjectStore`
 //! methods, so nothing about them is persisted here.
 
+use std::collections::VecDeque;
 use std::io::Cursor;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::stream::Stream;
+use futures_util::stream::{FuturesUnordered, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tracing::{instrument, warn};
@@ -22,25 +23,14 @@ use tracing::{instrument, warn};
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
 use angos_storage::{Error as StorageError, Page, paginated};
 
-use crate::registry::blob_store::hashing::{HashState, Hasher, HashingReader, hashing_stream};
+use crate::registry::Error;
+use crate::registry::blob_store::hashing::{Hasher, HashingReader, hashing_stream};
 use crate::registry::blob_store::{BlobStore, UploadSummary};
 use crate::registry::keys::{DigestExt, NamespaceExt, REPOS_ROOT};
-use crate::registry::{Error, pagination};
 
 /// Bytes peeked from a chunked (`None`) body to tell an empty finalize from
 /// one carrying data.
 const PEEK_FRAME_SIZE: usize = 8 * 1024;
-
-/// How an append seeds its hasher.
-#[derive(Debug)]
-enum HashStart {
-    /// Rebuild every supported algorithm from the checkpoint, for a chunked
-    /// upload whose target algorithm was unknown during PATCH.
-    Resume,
-    /// Start one algorithm fresh, for a monolithic PUT that knows its target
-    /// up front and has no checkpointed bytes.
-    Fresh(Algorithm),
-}
 
 /// The durable `session.json`: an upload's progress as of its last write.
 #[derive(Serialize, Deserialize)]
@@ -131,6 +121,9 @@ impl BlobStore {
     /// `scope` restricts the walk to one repository's subtree. It must walk
     /// this store, since the metadata catalog keys namespaces off `_manifests`
     /// and would miss an upload-only namespace on a split backend.
+    ///
+    /// `_`-prefixed children are never descended into, so that substructure
+    /// is not mistaken for nested namespaces.
     #[instrument(skip(self))]
     pub async fn collect_upload_namespaces(
         &self,
@@ -138,7 +131,7 @@ impl BlobStore {
     ) -> Result<Vec<Namespace>, Error> {
         // The scoped walk keeps the repository segment in the names it
         // returns, so the prefix carries it back into each namespace.
-        let (root, prefix) = match scope {
+        let root = match scope {
             Some(repository) => (
                 format!("{REPOS_ROOT}/{repository}"),
                 format!("{repository}/"),
@@ -146,17 +139,40 @@ impl BlobStore {
             None => (REPOS_ROOT.to_string(), String::new()),
         };
 
-        pagination::collect_namespaces_with_marker(
-            &root,
-            &prefix,
-            "_uploads",
-            self.namespace_walk_concurrency.get(),
-            |path| async move {
-                let sub_prefixes = self.object.list_all_children(&path).await?.sub_prefixes;
-                Ok(sub_prefixes)
-            },
-        )
-        .await
+        let mut namespaces = Vec::new();
+        let mut backlog = VecDeque::from([root]);
+        let mut in_flight = FuturesUnordered::new();
+        while !(backlog.is_empty() && in_flight.is_empty()) {
+            while in_flight.len() < self.namespace_walk_concurrency.get() {
+                let Some((path, prefix)) = backlog.pop_front() else {
+                    break;
+                };
+                in_flight.push(async move {
+                    let children = self.object.list_all_children(&path).await;
+                    (path, prefix, children)
+                });
+            }
+            let Some((path, prefix, children)) = in_flight.next().await else {
+                break;
+            };
+            let mut is_namespace = false;
+            for entry in children?.sub_prefixes {
+                if entry == "_uploads" {
+                    is_namespace = true;
+                } else if !entry.starts_with('_') {
+                    backlog.push_back((format!("{path}/{entry}"), format!("{prefix}{entry}/")));
+                }
+            }
+            // A directory whose name is not a namespace is dropped rather than
+            // surfaced, as the tag walk does for tags: scrub reports and
+            // reclaims such directories, so the drop is silent.
+            if is_namespace
+                && let Ok(namespace) = Namespace::new(prefix.strip_suffix('/').unwrap_or(&prefix))
+            {
+                namespaces.push(namespace);
+            }
+        }
+        Ok(namespaces)
     }
 
     /// Opens an upload session at a fresh id, returning the record it wrote.
@@ -178,7 +194,7 @@ impl BlobStore {
         let record = SessionFile {
             last_activity: Utc::now(),
             committed_offset: 0,
-            hash_state: BASE64_STANDARD.encode(hasher.state().to_bytes()?),
+            hash_state: BASE64_STANDARD.encode(hasher.checkpoint()?),
         };
         self.write_session(namespace, session_id, &record).await?;
         Ok(record)
@@ -199,13 +215,20 @@ impl BlobStore {
         content_length: Option<u64>,
         algorithm: Algorithm,
     ) -> Result<(Digest, u64), Error> {
-        let start = if record.committed_offset > 0 {
-            HashStart::Resume
+        let hasher = if record.committed_offset > 0 {
+            Hasher::resume(&record.hash_context()?)?
         } else {
-            HashStart::Fresh(algorithm)
+            Hasher::for_algorithm(algorithm)
         };
         let (hasher, size) = self
-            .append(namespace, session_id, record, stream, content_length, start)
+            .append(
+                namespace,
+                session_id,
+                record,
+                stream,
+                content_length,
+                hasher,
+            )
             .await?;
         Ok((hasher.digest(algorithm)?, size))
     }
@@ -222,20 +245,22 @@ impl BlobStore {
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
     ) -> Result<(Hasher, u64), Error> {
+        let hasher = Hasher::resume(&record.hash_context()?)?;
         self.append(
             namespace,
             session_id,
             record,
             stream,
             content_length,
-            HashStart::Resume,
+            hasher,
         )
         .await
     }
 
-    /// Append `stream` to the session, persisting the updated hash state and
-    /// size, and return the live hasher plus the new total. `record` is the
-    /// session as its caller just read it, so a chunk costs one session read.
+    /// Append `stream` to the session through `hasher`, persisting the updated
+    /// hash state and size, and return the live hasher plus the new total.
+    /// `record` is the session as its caller just read it, so a chunk costs
+    /// one session read.
     async fn append(
         &self,
         namespace: &Namespace,
@@ -243,13 +268,8 @@ impl BlobStore {
         mut record: SessionFile,
         mut stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: Option<u64>,
-        start: HashStart,
+        hasher: Hasher,
     ) -> Result<(Hasher, u64), Error> {
-        let hasher = match start {
-            HashStart::Resume => HashState::from_bytes(&record.hash_context()?)?.into_hasher()?,
-            HashStart::Fresh(algorithm) => Hasher::for_algorithm(algorithm),
-        };
-
         if content_length == Some(0) {
             return Ok((hasher, record.committed_offset));
         }
@@ -304,7 +324,7 @@ impl BlobStore {
             return Err(Error::DigestInvalid);
         }
 
-        record.hash_state = BASE64_STANDARD.encode(hasher.state().to_bytes()?);
+        record.hash_state = BASE64_STANDARD.encode(hasher.checkpoint()?);
         record.committed_offset = hashed_total;
         record.last_activity = Utc::now();
         self.write_session(namespace, session_id, &record).await?;
@@ -342,7 +362,7 @@ impl BlobStore {
         session_id: &UploadSessionId,
         digest: &Digest,
         hashed_size: u64,
-    ) -> Result<Digest, Error> {
+    ) -> Result<(), Error> {
         // The record's existence alone answers liveness, so a HEAD suffices.
         let session_key = namespace.upload_session_path(session_id);
         if !self.object.exists(&session_key).await? {
@@ -372,7 +392,7 @@ impl BlobStore {
         let container = namespace.upload_container_path(session_id);
         let _ = self.object.delete_prefix(&container).await;
 
-        Ok(digest.clone())
+        Ok(())
     }
 
     /// Abort the upload and delete the session artifacts plus any staged
@@ -384,7 +404,6 @@ impl BlobStore {
         session_id: &UploadSessionId,
     ) -> Result<(), Error> {
         let upload_path = namespace.upload_path(session_id);
-        // Discards the backend state the upload owns.
         let _ = self.object.abort_upload(&upload_path).await;
 
         let container = namespace.upload_container_path(session_id);

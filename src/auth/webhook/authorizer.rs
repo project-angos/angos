@@ -1,8 +1,7 @@
 use std::time::Duration;
 
-use http::HeaderMap;
 use http::request::Parts;
-use reqwest::{Client, Error as ReqwestError, Response, StatusCode};
+use reqwest::{Client, StatusCode};
 use tracing::warn;
 
 use crate::auth::Error;
@@ -30,20 +29,6 @@ impl WebhookAuthorizer {
         }
     }
 
-    async fn do_request(&self, headers: &HeaderMap) -> Result<Response, ReqwestError> {
-        let mut request = self
-            .client
-            .get(self.config.url.clone())
-            .timeout(Duration::from_millis(self.config.timeout_ms));
-        for (key, value) in headers {
-            request = request.header(key, value);
-        }
-        if let Some(auth) = &self.config.auth {
-            request = auth.apply_to(request);
-        }
-        request.send().await
-    }
-
     fn record_outcome(&self, label: &str) {
         metrics_provider()
             .webhook_auth_requests
@@ -57,13 +42,25 @@ impl WebhookAuthorizer {
         identity: &ClientIdentity,
         parts: &Parts,
     ) -> Result<bool, Error> {
-        let headers = build_headers(&self.config.forward_headers, action, identity, parts)?;
+        let mut request = self
+            .client
+            .get(self.config.url.clone())
+            .timeout(Duration::from_millis(self.config.timeout_ms))
+            .headers(build_headers(
+                &self.config.forward_headers,
+                action,
+                identity,
+                parts,
+            )?);
+        if let Some(auth) = &self.config.auth {
+            request = auth.apply_to(request);
+        }
 
         let timer = metrics_provider()
             .webhook_auth_duration
             .with_label_values(&[&self.name])
             .start_timer();
-        let send_result = self.do_request(&headers).await;
+        let send_result = request.send().await;
         timer.observe_duration();
 
         match send_result {

@@ -11,49 +11,32 @@ use angos_oci_service::{
 use crate::identity::Action;
 use crate::jobs::{JobState, Queue};
 
-/// The token service's endpoint. Shared with the dispatcher, which answers a
-/// method this route does not serve rather than letting it fall through to the
-/// catch-all.
+/// Shared with the dispatcher, which answers an unserved method here with 405.
 pub const TOKEN_PATH: &str = "/token";
 
-/// The `_angos/` path the host's UI reads its configuration from. Served by the
-/// binary, not by any service crate, so it is matched here before the extension
-/// parser is consulted.
+/// Served by the binary, so matched before the extension parser sees it.
 const UI_CONFIG_PATH: &str = "/v2/_angos/ui/config";
 
-/// A parsed request: an operation of one of the service surfaces
-/// ([`Route::Oci`], [`Route::Docker`], [`Route::Angos`]), or one of the routes
-/// the binary itself serves (health, metrics, token, UI). Each surface's crate
-/// owns the parsing of its own paths; this only sequences them and adds the
-/// binary's own routes.
-#[derive(Clone, Debug)]
+/// An operation of one of the service surfaces, whose crates parse their own
+/// paths, or one of the routes the binary itself serves.
+#[derive(Debug)]
 pub enum Route {
-    /// A static UI asset by path.
     UiAsset {
         path: String,
     },
-    /// The UI's runtime configuration document.
     UiConfig,
-    /// The bearer-token service.
     Token,
     Healthz,
     Readyz,
     Metrics,
-    /// An OCI Distribution operation.
     Oci(OciEndpoint),
     /// A Docker V2 extension operation (the catalog).
     Docker(DockerEndpoint),
-    /// An `_angos/` extension operation.
     Angos(AngosEndpoint),
 }
 
-/// Parses the HTTP method and URI into a [`Route`].
-///
-/// Returns `None` for paths that match no known route; callers should return a
-/// `404` for `None` without running authentication or authorization. Each
-/// service surface is tried in turn; a path one surface declines is offered to
-/// the next, and only a path under `/v2` that every surface declines (or a
-/// non-GET UI path) is a miss rather than a UI asset.
+/// Returns `None` for a route nothing serves, which `handle_unknown_route`
+/// answers before authentication: mostly a 404 for a read and a 400 for a write.
 pub fn parse(method: &Method, uri: &Uri) -> Option<Route> {
     let path = uri.path();
     let query = uri.query();
@@ -85,18 +68,12 @@ pub fn parse(method: &Method, uri: &Uri) -> Option<Route> {
         return None;
     }
 
-    if method == Method::GET || method == Method::HEAD {
-        return Some(Route::UiAsset {
-            path: path.to_string(),
-        });
-    }
-
-    None
+    (method == Method::GET || method == Method::HEAD).then(|| Route::UiAsset {
+        path: path.to_string(),
+    })
 }
 
 impl Route {
-    /// The metrics label for this route: the binary's own routes named here,
-    /// each service surface named by the crate that owns it.
     #[must_use]
     pub fn metric_label(&self) -> &'static str {
         match self {
@@ -144,9 +121,9 @@ impl From<&Route> for Action {
             Route::Metrics => Action::Metrics,
 
             Route::Oci(endpoint) => Action::from(endpoint.clone()),
-            Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Action::ListCatalog {
-                n: *n,
-                last: last.clone(),
+            Route::Docker(DockerEndpoint::ListCatalog(request)) => Action::ListCatalog {
+                n: request.n,
+                last: request.last.clone(),
             },
             Route::Angos(endpoint) => Action::from(endpoint),
         }
@@ -263,13 +240,9 @@ impl From<&AngosEndpoint> for Action {
             AngosEndpoint::ListUploads { namespace, .. } => Action::ListUploads {
                 namespace: namespace.clone(),
             },
-            AngosEndpoint::ListPulls {
-                namespace,
-                reference,
-                ..
-            } => Action::ListPulls {
-                namespace: namespace.clone(),
-                reference: reference.clone(),
+            AngosEndpoint::ListPulls(request) => Action::ListPulls {
+                namespace: request.namespace.clone(),
+                reference: request.reference.clone(),
             },
             AngosEndpoint::ListLayerEntries { namespace, digest } => Action::ListLayerEntries {
                 namespace: namespace.clone(),
@@ -286,37 +259,29 @@ impl From<&AngosEndpoint> for Action {
                 path: path.clone(),
                 download: *download,
             },
-            AngosEndpoint::GetLayerFileDetails {
-                namespace,
-                digest,
-                path,
-            } => Action::GetLayerFileDetails {
-                namespace: namespace.clone(),
-                digest: digest.clone(),
-                path: path.clone(),
+            AngosEndpoint::GetLayerFileDetails(request) => Action::GetLayerFileDetails {
+                namespace: request.namespace.clone(),
+                digest: request.digest.clone(),
+                path: request.path.clone(),
             },
-            AngosEndpoint::ListJobs { queue, n, after } => Action::ListJobs {
-                queue: Queue::from(*queue),
-                n: *n,
-                after: after.clone(),
+            AngosEndpoint::ListJobs(request) => Action::ListJobs {
+                queue: Queue::from(request.queue),
+                n: request.n,
+                after: request.after.clone(),
             },
-            AngosEndpoint::ListFailedJobs { queue, n, after } => Action::ListFailedJobs {
-                queue: Queue::from(*queue),
-                n: *n,
-                after: after.clone(),
+            AngosEndpoint::ListFailedJobs(request) => Action::ListFailedJobs {
+                queue: Queue::from(request.queue),
+                n: request.n,
+                after: request.after.clone(),
             },
-            AngosEndpoint::RetryJob { queue, storage_key } => Action::RetryJob {
-                queue: Queue::from(*queue),
-                storage_key: storage_key.clone(),
+            AngosEndpoint::RetryJob(request) => Action::RetryJob {
+                queue: Queue::from(request.queue),
+                storage_key: request.storage_key.clone(),
             },
-            AngosEndpoint::DeleteJob {
-                queue,
-                state,
-                storage_key,
-            } => Action::DeleteJob {
-                queue: Queue::from(*queue),
-                state: JobState::from(*state),
-                storage_key: storage_key.clone(),
+            AngosEndpoint::DeleteJob(request) => Action::DeleteJob {
+                queue: Queue::from(request.queue),
+                state: JobState::from(request.state),
+                storage_key: request.storage_key.clone(),
             },
         }
     }

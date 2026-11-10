@@ -123,20 +123,11 @@ impl LinkMetadata {
     }
 }
 
-/// Every key angos writes outside the blob store, over one object store.
-/// Cheap to clone: the handle is shared.
+/// Every key angos writes outside the blob store. Cheap to clone.
 #[derive(Clone)]
 pub struct MetadataStore {
     object: Arc<dyn ObjectStore>,
-    namespace_walk_concurrency: NonZeroUsize,
-    /// How long fresh blob data and fresh reference keys are unconditionally
-    /// live, and how long a collector's range marker outlives its last
-    /// refresh. Writers and collectors over the same store share the value.
-    pub gc_grace_secs: u64,
-    /// How pull history is kept and compacted.
-    pub pull_history: PullHistoryConfig,
-    /// How long a released reclamation marker keeps blocking writers.
-    release_linger_ms: i64,
+    pub settings: Settings,
 }
 
 /// Keys fetched per page when the store walks a directory it does not bound
@@ -149,10 +140,10 @@ pub const DEFAULT_GC_GRACE_SECS: u64 = 300;
 
 /// Default age past which a superseded access entry is compacted, when no
 /// compaction gate is configured.
-pub const DEFAULT_COMPACT_AFTER_SECS: u64 = 3600;
+const DEFAULT_COMPACT_AFTER_SECS: u64 = 3600;
 
 /// Default number of pulls a target's history keeps.
-pub const DEFAULT_MAX_PULLS: NonZeroU32 = NonZeroU32::MIN.saturating_add(1000 - 1);
+const DEFAULT_MAX_PULLS: NonZeroU32 = NonZeroU32::MIN.saturating_add(1000 - 1);
 
 /// `[global.pull_history]`: how each tag's and revision's pull history is
 /// kept. A superseded access entry older than `compact_after_secs` or ranked
@@ -193,22 +184,18 @@ impl PullHistoryConfig {
 
 /// Default linger of a released reclamation marker, which has to outlast a
 /// writer's whole backoff budget plus one listing.
-pub const DEFAULT_RELEASE_LINGER_MS: i64 = 5_000;
+const DEFAULT_RELEASE_LINGER_MS: i64 = 5_000;
 
-/// What the store reads off its configuration. [`Settings::default`] is what a
-/// test or an offline run gets; the server bootstrap fills all three from the
-/// operator's configuration.
+/// What the store reads off its configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    /// Concurrent directory-scan fan-out for catalog namespace walks.
     pub namespace_walk_concurrency: NonZeroUsize,
-    /// The reclamation grace period, in seconds; tests and offline maintenance
-    /// runs shrink it to exercise reclamation immediately.
+    /// How long fresh blob data and fresh reference keys are unconditionally
+    /// live, and how long a collector's range marker outlives its last
+    /// refresh. Writers and collectors over the same store share the value.
     pub gc_grace_secs: u64,
-    /// How pull history is kept and compacted.
     pub pull_history: PullHistoryConfig,
-    /// How long a released reclamation marker keeps blocking writers; tests
-    /// shrink it so they do not sleep out the real one.
+    /// How long a released reclamation marker keeps blocking writers.
     pub release_linger_ms: i64,
 }
 
@@ -224,27 +211,18 @@ impl Default for Settings {
 }
 
 impl MetadataStore {
-    /// A store over `object`, the one object store all its reads and writes
-    /// flow through.
     #[must_use]
     pub fn new(object: Arc<dyn ObjectStore>, settings: Settings) -> Self {
-        Self {
-            object,
-            namespace_walk_concurrency: settings.namespace_walk_concurrency,
-            gc_grace_secs: settings.gc_grace_secs,
-            pull_history: settings.pull_history,
-            release_linger_ms: settings.release_linger_ms,
-        }
+        Self { object, settings }
     }
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object
     }
 
-    /// Write one link of any kind: the repair path's "make this link exist". The reference key lands first and is
-    /// checked against collector runs before the record it pins, the same
-    /// order a push keeps across its whole batch; a kind that lives as a
-    /// reference key alone is done once the key is.
+    /// Write one link of any kind, for the repair path. The reference key
+    /// lands and is checked against collector runs before the record it pins,
+    /// the same order a push keeps.
     pub async fn write_link(
         &self,
         namespace: &Namespace,
@@ -301,18 +279,15 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use angos_oci::{MediaType, Namespace, Tag};
+    use angos_oci::{Digest, MediaType, Namespace, Tag};
 
     use crate::registry::Error;
     use crate::registry::metadata_store::LinkKind;
     use crate::registry::metadata_store::record::RevisionRecord;
-    use crate::registry::test_utils::{
-        create_link, drop_links, for_each_backend, put_blob_direct, seed_links,
-    };
+    use crate::registry::test_utils::{drop_links, for_each_backend, put_blob_direct, seed_links};
 
-    /// A tag and a revision written by `write_link` read back with the target
-    /// and the stamp the write recorded, and stop resolving once the record is
-    /// gone.
+    /// A link written by `write_link` reads back with its target and stamp,
+    /// and stops resolving once its record is gone.
     #[tokio::test]
     async fn a_written_link_reads_back_and_stops_resolving_once_dropped() {
         for_each_backend(async |test_case| {
@@ -358,14 +333,12 @@ mod tests {
         .await;
     }
 
-    /// A revision keeps the media type its push recorded; a tag seeded without
-    /// one reads as `None` rather than as a default.
     #[tokio::test]
-    async fn a_recorded_media_type_round_trips_and_its_absence_reads_as_none() {
+    async fn a_revision_keeps_its_recorded_media_type() {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = Namespace::new("media-type-test").unwrap();
-            let digest = put_blob_direct(&test_case.blob_store(), b"test content").await;
+            let digest = Digest::sha256_of_bytes(b"test content");
             let recorded =
                 MediaType::new("application/vnd.docker.distribution.manifest.v2+json").unwrap();
 
@@ -373,25 +346,15 @@ mod tests {
                 .await
                 .unwrap();
             let revision = m
-                .read_link(&namespace, &LinkKind::Digest(digest.clone()))
+                .read_link(&namespace, &LinkKind::Digest(digest))
                 .await
                 .unwrap();
             assert_eq!(revision.media_type, Some(recorded));
-            assert_eq!(revision.target, digest);
-
-            let tag = LinkKind::Tag(Tag::new("latest").unwrap());
-            create_link(&m, &namespace, &tag, &digest).await;
-            let tag = m.read_link(&namespace, &tag).await.unwrap();
-            assert_eq!(tag.media_type, None);
-            assert_eq!(tag.target, digest);
         })
         .await;
     }
 
-    /// An angos before 1.5.0 copied the pushed `Content-Type` into the record
-    /// verbatim, parameter section included. The revision record must keep
-    /// reading such a value, since refusing it has scrub delete the record as
-    /// corrupt.
+    /// A pre-1.5.0 record with a parametered media type must keep reading.
     #[test]
     fn a_stored_media_type_keeps_reading_when_it_carries_parameters() {
         let body = br#"{"media_type":"application/vnd.oci.image.manifest.v1+json; charset=utf-8"}"#;

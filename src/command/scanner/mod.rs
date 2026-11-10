@@ -76,7 +76,6 @@ pub struct Options {
 #[derive(Deserialize)]
 pub struct Document {
     pub scanner: Option<ScannerConfig>,
-    #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
 }
 
@@ -112,7 +111,7 @@ pub async fn run(options: &Options, config: Option<ScannerConfig>) -> Result<(),
     };
     let service = Arc::new(Service {
         scanner: options.scanner,
-        token: config.token.clone(),
+        token: config.token,
         registry_authority: authority,
         plain_http: config.registry.url.starts_with("http://"),
         credentials: config.registry.basic_auth,

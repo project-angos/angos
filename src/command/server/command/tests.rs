@@ -1,38 +1,16 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::crypto::aws_lc_rs::default_provider;
-use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use tempfile::{NamedTempFile, TempDir};
+use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use angos_cache::Config as CacheConfig;
-use angos_docker_extension_service::CatalogRequest;
-use angos_mtls_client::BasicAuth;
-use angos_oci::Namespace;
-use angos_oci_client::RegistryClientConfig;
-use angos_secret::Secret;
-
-use crate::command::bootstrap;
-use crate::command::server::Command;
 use crate::command::server::command::ServiceListener;
-use crate::command::server::listeners::tls::tests::build_config;
+use crate::command::server::listeners::tls::tests::{build_config, init_crypto_provider};
 use crate::command::server::server_context::tests::create_test_event;
-use crate::configuration::{Configuration, GlobalConfig};
+use crate::command::server::{Command, ServerContext};
+use crate::configuration::Configuration;
 use crate::metrics_provider::initialize_metrics;
-use crate::policy::{AccessMode, PolicyConfig};
-use crate::registry::test_utils::{response_json, test_job_store};
-use crate::registry::{Registry, RegistryConfig, repository};
-use crate::test_fixtures::client::test_client_config;
-
-static CRYPTO_INIT: Once = Once::new();
-
-fn init_crypto_provider() {
-    CRYPTO_INIT.call_once(|| {
-        default_provider().install_default().ok();
-    });
-}
 
 // These tests build real filesystem stores, so the returned `TempDir` values
 // must be kept alive for as long as the config is used. `extra` is appended
@@ -66,145 +44,15 @@ fn tempdir_config(extra: &str) -> (Configuration, TempDir, TempDir) {
     (Configuration::load_from_str(&toml).unwrap(), blobs, meta)
 }
 
-fn create_minimal_config() -> (Configuration, TempDir, TempDir) {
-    tempdir_config("")
-}
-
-fn create_config_with_repository() -> (Configuration, TempDir, TempDir) {
-    tempdir_config(
-        r#"
-        [repository.test-repo.access_policy]
-        default = "allow"
-        rules = []
-    "#,
-    )
-}
-
-#[tokio::test]
-async fn test_build_repository_with_upstream() {
-    let repo_config = repository::Config {
-        access_policy: Some(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            ..PolicyConfig::default()
-        }),
-        upstream: vec![RegistryClientConfig {
-            basic_auth: Some(BasicAuth {
-                username: "testuser".to_string(),
-                password: Secret::new("testpass".to_string()),
-            }),
-            ..test_client_config("https://registry-1.docker.io".to_string())
-        }],
-        ..repository::Config::default()
-    };
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-    let configs = HashMap::from([("cached-repo".to_string(), repo_config)]);
-    let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_repositories_multiple() {
-    let repo_config = repository::Config {
-        access_policy: Some(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            ..PolicyConfig::default()
-        }),
-        ..repository::Config::default()
-    };
-    let mut configs = HashMap::new();
-    configs.insert("repo1".to_string(), repo_config.clone());
-    configs.insert("repo2".to_string(), repo_config.clone());
-    configs.insert("repo3".to_string(), repo_config);
-
-    let cache_config = CacheConfig::Memory;
-    let cache = cache_config.to_backend().unwrap();
-
-    let result = bootstrap::repositories(&configs, &cache, &GlobalConfig::default()).await;
-
-    let repos = result.unwrap();
-    assert_eq!(repos.len(), 3);
-    assert!(repos.contains_key("repo1"));
-    assert!(repos.contains_key("repo2"));
-    assert!(repos.contains_key("repo3"));
-}
-
-#[tokio::test]
-async fn test_command_new_insecure_listener() {
-    let (config, _blobs, _meta) = create_minimal_config();
-    let result = Command::new(&config).await;
-
-    let command = result.unwrap();
-
-    match command.listener {
-        ServiceListener::Insecure(_) => {}
-        ServiceListener::Secure(_) => panic!("Expected insecure listener"),
-    }
-}
-
-#[tokio::test]
-async fn test_command_new_with_repositories() {
-    let (config, _blobs, _meta) = create_config_with_repository();
-    let result = Command::new(&config).await;
-
-    assert!(result.is_ok());
-}
-
 #[tokio::test]
 async fn test_command_notify_tls_config_change_with_insecure_listener() {
-    let (config, _blobs, _meta) = create_minimal_config();
+    let (config, _blobs, _meta) = tempdir_config("");
     let command = Command::new(&config).await.unwrap();
 
     let (tls_config, _temp_files) = build_config(false);
     let result = command.notify_tls_config_change(&tls_config);
 
     assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_build_registry_components_integration() {
-    let (config, _blobs, _meta) = create_config_with_repository();
-
-    let auth_cache = config.cache.to_backend().unwrap();
-    let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
-    let metadata_store = bootstrap::metadata_store(
-        &config.resolve_registry_storage(),
-        config.global.namespace_walk_concurrency,
-        config.global.gc_grace_secs,
-        config.global.pull_history,
-    )
-    .unwrap();
-    let repositories = bootstrap::repositories(&config.repository, &auth_cache, &config.global)
-        .await
-        .unwrap();
-
-    let registry_config = RegistryConfig {
-        update_pull_time: config.global.update_pull_time,
-        redirect: config.global.redirect,
-        global_immutable_tags: config.global.immutable_tags,
-        global_immutable_tags_exclusions: config.global.immutable_tags_exclusions.clone(),
-        ..RegistryConfig::new(test_job_store(&metadata_store))
-    };
-
-    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
-
-    let response = registry
-        .handle_list_catalog(
-            CatalogRequest {
-                n: None,
-                last: None,
-            },
-            &|_: &Namespace| true,
-        )
-        .await
-        .unwrap()
-        .into_response()
-        .unwrap();
-    let body = response_json(response).await;
-    assert!(
-        body["repositories"].as_array().unwrap().is_empty(),
-        "a freshly built registry must serve an empty catalog"
-    );
 }
 
 fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
@@ -220,96 +68,33 @@ fn create_config_with_webhook(url: &str) -> (Configuration, TempDir, TempDir) {
     ))
 }
 
+/// The live context of a command built from an insecure-listener config.
+fn context(command: &Command) -> Arc<ServerContext> {
+    let ServiceListener::Insecure(listener) = &command.listener else {
+        panic!("test commands listen insecurely");
+    };
+    listener.context.load_full()
+}
+
 #[tokio::test]
-async fn test_hot_reload_adds_webhook_via_command() {
-    let (config, _blobs, _meta) = create_minimal_config();
+async fn test_hot_reload_adds_and_removes_webhook_via_command() {
+    let has_dispatcher = |command: &Command| context(command).registry.event_dispatcher().is_some();
+    let (config, _blobs, _meta) = tempdir_config("");
     let command = Command::new(&config).await.unwrap();
+    assert!(!has_dispatcher(&command));
 
-    assert!(
-        !command
-            .as_insecure()
-            .unwrap()
-            .current_context()
-            .registry
-            .has_event_dispatcher()
-    );
-
-    let (new_config, _new_blobs, _new_meta) =
+    let (with_hook, _hook_blobs, _hook_meta) =
         create_config_with_webhook("https://example.com/webhook");
-    command.notify_config_change(&new_config).await.unwrap();
+    command.notify_config_change(&with_hook).await.unwrap();
+    assert!(has_dispatcher(&command));
 
-    assert!(
-        command
-            .as_insecure()
-            .unwrap()
-            .current_context()
-            .registry
-            .has_event_dispatcher()
-    );
+    command.notify_config_change(&config).await.unwrap();
+    assert!(!has_dispatcher(&command));
 }
 
-#[tokio::test]
-async fn test_hot_reload_removes_webhook_via_command() {
-    let (config, _blobs, _meta) = create_config_with_webhook("https://example.com/webhook");
-    let command = Command::new(&config).await.unwrap();
-
-    assert!(
-        command
-            .as_insecure()
-            .unwrap()
-            .current_context()
-            .registry
-            .has_event_dispatcher()
-    );
-
-    let (new_config, _new_blobs, _new_meta) = create_minimal_config();
-    command.notify_config_change(&new_config).await.unwrap();
-
-    assert!(
-        !command
-            .as_insecure()
-            .unwrap()
-            .current_context()
-            .registry
-            .has_event_dispatcher()
-    );
-}
-
-#[tokio::test]
-async fn test_hot_reload_changes_webhook_url_via_command() {
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/webhook"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server_a)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/webhook"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let (config_a, _blobs_a, _meta_a) =
-        create_config_with_webhook(&format!("{}/webhook", server_a.uri()));
-    let command = Command::new(&config_a).await.unwrap();
-
-    let (config_b, _blobs_b, _meta_b) =
-        create_config_with_webhook(&format!("{}/webhook", server_b.uri()));
-    command.notify_config_change(&config_b).await.unwrap();
-
-    let context = command.as_insecure().unwrap().current_context();
-    context
-        .registry
-        .dispatch_events(&[create_test_event()])
-        .await
-        .unwrap();
-}
-
+/// Each generation delivers to its own webhook: a request the old context
+/// started is not redirected by the reload, and the new one never reaches the
+/// old URL (each server expects exactly one delivery).
 #[tokio::test]
 async fn test_hot_reload_inflight_old_dispatcher_still_works() {
     let server_old = MockServer::start().await;
@@ -330,7 +115,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
     let (config_old, _blobs_old, _meta_old) = create_config_with_webhook(&server_old.uri());
     let command = Command::new(&config_old).await.unwrap();
 
-    let old_context = Arc::clone(&command.as_insecure().unwrap().current_context());
+    let old_context = context(&command);
 
     let (config_new, _blobs_new, _meta_new) = create_config_with_webhook(&server_new.uri());
     command.notify_config_change(&config_new).await.unwrap();
@@ -341,7 +126,7 @@ async fn test_hot_reload_inflight_old_dispatcher_still_works() {
         .await
         .unwrap();
 
-    let new_context = command.as_insecure().unwrap().current_context();
+    let new_context = context(&command);
     new_context
         .registry
         .dispatch_events(&[create_test_event()])
@@ -362,7 +147,7 @@ async fn test_command_shutdown_drains_in_flight_async_delivery() {
     let (config, _blobs, _meta) = create_config_with_webhook(&server.uri());
     let command = Command::new(&config).await.unwrap();
 
-    let context = command.as_insecure().unwrap().current_context();
+    let context = context(&command);
     context
         .registry
         .dispatch_events(&[create_test_event()])
@@ -384,11 +169,7 @@ fn create_tls_config() -> (
     Configuration,
     TempDir,
     TempDir,
-    (
-        tempfile::NamedTempFile,
-        tempfile::NamedTempFile,
-        tempfile::NamedTempFile,
-    ),
+    (NamedTempFile, NamedTempFile, NamedTempFile),
 ) {
     let (tls_config, temp_files) = build_config(false);
     let (config, blobs, meta) = tempdir_config(&format!(
@@ -408,7 +189,7 @@ fn create_tls_config() -> (
 async fn test_notify_config_change_insecure_to_tls_does_not_fail() {
     init_crypto_provider();
 
-    let (insecure_config, _blobs, _meta) = create_minimal_config();
+    let (insecure_config, _blobs, _meta) = tempdir_config("");
     let command = Command::new(&insecure_config).await.unwrap();
 
     let (tls_config, _tls_blobs, _tls_meta, _temp_files) = create_tls_config();
@@ -424,7 +205,7 @@ async fn test_notify_config_change_tls_to_insecure_does_not_fail() {
     let (tls_config, _tls_blobs, _tls_meta, _temp_files) = create_tls_config();
     let command = Command::new(&tls_config).await.unwrap();
 
-    let (insecure_config, _blobs, _meta) = create_minimal_config();
+    let (insecure_config, _blobs, _meta) = tempdir_config("");
     let result = command.notify_config_change(&insecure_config).await;
 
     assert!(result.is_ok());

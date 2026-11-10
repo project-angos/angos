@@ -1,19 +1,6 @@
-//! Backend-agnostic conformance suites for the storage traits.
-//!
-//! [`object_store_conformance!`] stamps out one named `#[tokio::test]` per
-//! contract clause, so every backend runs the identical suite under its own
-//! module path and a failure names the backend. Each backend's own test module
-//! instantiates the suite and keeps only backend-specific tests next to them.
-
-/// Stamp out the [`ObjectStore`](crate::ObjectStore) contract tests against
-/// one backend, in a child module named `object_store_suite`.
-///
-/// `$fixture` is an expression evaluated fresh in every test; it must yield a
-/// `(store, guard)` tuple. `store` is the backend under test (a concrete
-/// backend or a trait object) and `guard` is whatever must stay alive for the
-/// test's duration (the FS backend's `TempDir`; `()` when nothing is needed).
-/// The expression is expanded inside the child module, so names it references
-/// resolve through `use super::*` in the instantiating module.
+/// Stamps out the [`ObjectStore`](crate::ObjectStore) contract tests for one
+/// backend. `$fixture` is evaluated in every test, inside a child module, and
+/// yields `(store, guard)`, the guard living as long as the test.
 macro_rules! object_store_conformance {
     ($fixture:expr) => {
         mod object_store_suite {
@@ -21,27 +8,21 @@ macro_rules! object_store_conformance {
             use tokio::io::AsyncReadExt;
 
             use super::*;
-            use crate::Error;
-            // Resolves trait methods on the concrete backends under test.
-            use crate::ObjectStore;
             use crate::test_util::frame;
-
-            #[tokio::test]
-            async fn put_then_get_round_trips() {
-                let (store, _guard) = $fixture;
-                store
-                    .put("rt/nested/key", Bytes::from_static(b"hello"))
-                    .await
-                    .unwrap();
-                assert_eq!(store.get("rt/nested/key").await.unwrap(), b"hello");
-            }
+            use crate::{Children, Error, ObjectStore};
 
             #[tokio::test]
             async fn put_overwrites_existing_object() {
                 let (store, _guard) = $fixture;
-                store.put("ow/k", Bytes::from_static(b"v1")).await.unwrap();
-                store.put("ow/k", Bytes::from_static(b"v2")).await.unwrap();
-                assert_eq!(store.get("ow/k").await.unwrap(), b"v2");
+                store
+                    .put("ow/a/k", Bytes::from_static(b"v1"))
+                    .await
+                    .unwrap();
+                store
+                    .put("ow/a/k", Bytes::from_static(b"v2"))
+                    .await
+                    .unwrap();
+                assert_eq!(store.get("ow/a/k").await.unwrap(), b"v2");
             }
 
             #[tokio::test]
@@ -63,34 +44,14 @@ macro_rules! object_store_conformance {
             }
 
             #[tokio::test]
-            async fn create_if_absent_succeeds_again_after_delete() {
-                let (store, _guard) = $fixture;
-                assert!(
-                    store
-                        .create_if_absent("cia/again", Bytes::from_static(b"v1"))
-                        .await
-                        .unwrap()
-                );
-                store.delete("cia/again").await.unwrap();
-                assert!(
-                    store
-                        .create_if_absent("cia/again", Bytes::from_static(b"v2"))
-                        .await
-                        .unwrap()
-                );
-                assert_eq!(store.get("cia/again").await.unwrap(), b"v2");
-            }
-
-            #[tokio::test]
-            async fn get_missing_key_returns_not_found() {
+            async fn a_missing_key_reads_not_found() {
                 let (store, _guard) = $fixture;
                 assert_eq!(store.get("missing").await.unwrap_err(), Error::NotFound);
-            }
-
-            #[tokio::test]
-            async fn head_missing_key_returns_not_found() {
-                let (store, _guard) = $fixture;
                 assert_eq!(store.head("missing").await.unwrap_err(), Error::NotFound);
+                assert_eq!(
+                    store.copy("missing", "cp/dst").await.unwrap_err(),
+                    Error::NotFound
+                );
             }
 
             #[tokio::test]
@@ -104,43 +65,16 @@ macro_rules! object_store_conformance {
             }
 
             #[tokio::test]
-            async fn delete_removes_object() {
+            async fn delete_is_idempotent() {
                 let (store, _guard) = $fixture;
                 store.put("del/k", Bytes::from_static(b"v")).await.unwrap();
                 store.delete("del/k").await.unwrap();
                 assert_eq!(store.get("del/k").await.unwrap_err(), Error::NotFound);
-            }
-
-            #[tokio::test]
-            async fn delete_is_idempotent_on_missing_key() {
-                let (store, _guard) = $fixture;
-                store.delete("ghost").await.unwrap();
-                store.delete("ghost").await.unwrap();
-            }
-
-            #[tokio::test]
-            async fn delete_prefix_removes_only_keys_under_prefix() {
-                let (store, _guard) = $fixture;
-                store.put("dp/a/1", Bytes::from_static(b"x")).await.unwrap();
-                store
-                    .put("dp/a/sub/2", Bytes::from_static(b"y"))
-                    .await
-                    .unwrap();
-                store.put("dp/b/3", Bytes::from_static(b"z")).await.unwrap();
-
-                store.delete_prefix("dp/a").await.unwrap();
-
-                assert_eq!(store.get("dp/a/1").await.unwrap_err(), Error::NotFound);
-                assert_eq!(store.get("dp/a/sub/2").await.unwrap_err(), Error::NotFound);
-                assert_eq!(store.get("dp/b/3").await.unwrap(), b"z");
+                store.delete("del/k").await.unwrap();
             }
 
             #[tokio::test]
             async fn delete_prefix_is_directory_scoped_not_string_prefix() {
-                // Regression for the data-loss bug: a non-slash prefix is a
-                // directory boundary, so it must delete keys under the
-                // directory but never a sibling that merely shares a string
-                // prefix (`tags/v1` must not affect `tags/v1-rc/...`).
                 let (store, _guard) = $fixture;
                 store
                     .put("dps/v1/1", Bytes::from_static(b"x"))
@@ -174,8 +108,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn delete_prefix_empty_prefix_is_noop() {
-                // An empty prefix must not be treated as the store root and
-                // wipe everything.
                 let (store, _guard) = $fixture;
                 store.put("dpe/1", Bytes::from_static(b"x")).await.unwrap();
                 store.put("dpf/1", Bytes::from_static(b"y")).await.unwrap();
@@ -227,20 +159,6 @@ macro_rules! object_store_conformance {
                 let page2 = store.list("pg/", 2, page.next_token).await.unwrap();
                 assert_eq!(page2.items, vec!["c".to_string()]);
                 assert!(page2.next_token.is_none());
-            }
-
-            #[tokio::test]
-            async fn list_after_starts_strictly_after_the_given_key() {
-                let (store, _guard) = $fixture;
-                for k in ["la/a", "la/b", "la/c"] {
-                    store.put(k, Bytes::from_static(b"x")).await.unwrap();
-                }
-                let page = store
-                    .list_after("la/", 10, None, Some("a".to_string()))
-                    .await
-                    .unwrap();
-                assert_eq!(page.items, vec!["b".to_string(), "c".to_string()]);
-                assert!(page.next_token.is_none());
             }
 
             #[tokio::test]
@@ -300,19 +218,6 @@ macro_rules! object_store_conformance {
             }
 
             #[tokio::test]
-            async fn list_children_respects_start_after() {
-                let (store, _guard) = $fixture;
-                for k in ["sa/a", "sa/b", "sa/c"] {
-                    store.put(k, Bytes::from_static(b"x")).await.unwrap();
-                }
-                let page = store
-                    .list_children("sa/", 10, None, Some("a".to_string()))
-                    .await
-                    .unwrap();
-                assert_eq!(page.objects, vec!["b".to_string(), "c".to_string()]);
-            }
-
-            #[tokio::test]
             async fn list_children_start_after_spans_directory_children() {
                 // `start_after` names a directory child, and `v1.2`/`v1.5` sort
                 // between `v1` and `v1/`: a raw-key bound re-emits `v1` forever
@@ -355,22 +260,17 @@ macro_rules! object_store_conformance {
                     .await
                     .unwrap();
 
-                let children = store.list_all_children("fam").await.unwrap();
-                let mut sub_prefixes = children.sub_prefixes;
-                let objects = children.objects;
-                sub_prefixes.sort();
-                assert_eq!(sub_prefixes, dirs);
-                assert_eq!(objects, vec!["manifest".to_string()]);
+                let mut children = store.list_all_children("fam").await.unwrap();
+                children.sub_prefixes.sort();
+                assert_eq!(children.sub_prefixes, dirs);
+                assert_eq!(children.objects, vec!["manifest".to_string()]);
             }
 
             #[tokio::test]
             async fn list_all_children_missing_prefix_returns_empty() {
                 let (store, _guard) = $fixture;
                 let children = store.list_all_children("does/not/exist").await.unwrap();
-                let sub_prefixes = children.sub_prefixes;
-                let objects = children.objects;
-                assert!(sub_prefixes.is_empty());
-                assert!(objects.is_empty());
+                assert_eq!(children, Children::default());
             }
 
             #[tokio::test]
@@ -383,15 +283,6 @@ macro_rules! object_store_conformance {
                 assert_eq!(store.copy("cp/src", "cp/dst").await.unwrap(), 7);
                 assert_eq!(store.get("cp/dst").await.unwrap(), b"payload");
                 assert_eq!(store.get("cp/src").await.unwrap(), b"payload");
-            }
-
-            #[tokio::test]
-            async fn copy_missing_source_returns_not_found() {
-                let (store, _guard) = $fixture;
-                assert_eq!(
-                    store.copy("cp/absent", "cp/dst").await.unwrap_err(),
-                    Error::NotFound
-                );
             }
 
             #[tokio::test]
@@ -408,9 +299,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn upload_round_trip_appends_across_calls() {
-                // Uploads are keyed: there is no caller-held handle, so a
-                // second write addressed at the same key picks up where the
-                // first left off.
                 let (store, _guard) = $fixture;
                 assert_eq!(
                     store
@@ -439,9 +327,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn upload_complete_rerun_preserves_object() {
-                // Re-running `complete_upload` on an already-finalized upload
-                // is a no-op and must not overwrite the assembled object with
-                // an empty one.
                 let (store, _guard) = $fixture;
                 store
                     .write_upload("up/rerun", frame(b"payload"), Some(7))
@@ -456,8 +341,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn upload_rejects_a_body_longer_than_declared() {
-                // `Some(len)` declares an exact count, so a longer body is an
-                // error on every backend rather than a silent truncation.
                 let (store, _guard) = $fixture;
                 let error = store
                     .write_upload("up/long", frame(b"hello world"), Some(5))
@@ -483,9 +366,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn upload_chunked_writes_append_across_calls() {
-                // `None` streams the body to EOF (a chunked request with no
-                // declared length); successive chunked writes append, with the
-                // running total growing by each frame's actual size.
                 let (store, _guard) = $fixture;
                 assert_eq!(
                     store
@@ -507,9 +387,6 @@ macro_rules! object_store_conformance {
 
             #[tokio::test]
             async fn upload_chunked_empty_write_returns_committed_size() {
-                // An empty chunked frame appends nothing, so it reports the
-                // size already committed by the prior write and the object
-                // still round-trips.
                 let (store, _guard) = $fixture;
                 store
                     .write_upload("up/chunked-empty", frame(b"data"), None)

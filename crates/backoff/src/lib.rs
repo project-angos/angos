@@ -1,79 +1,40 @@
-//! Shared retry-backoff policy: exponential (or constant) growth, capped, with
-//! optional pseudo-random jitter.
-//!
-//! [`Backoff`] is a small, copyable value that maps a zero-indexed retry
-//! `attempt` to a [`Duration`]. It is pure and synchronous; the caller awaits
-//! its own sleep on the returned delay, so the crate carries no async runtime
-//! dependency and is usable from any subsystem.
-//!
-//! The delay for `attempt` is `min(base * multiplier^attempt, max)`. With jitter
-//! enabled a random amount in `[0, delay)` is added, decorrelating concurrent
-//! retries against a shared resource. All arithmetic saturates, so no `attempt`
-//! value can overflow or panic.
+//! Retry backoff: `min(base * 2^attempt, max)`, saturating, with optional
+//! jitter. Pure and synchronous; the caller sleeps on the returned delay.
 
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::time::Duration;
 
-/// An exponential (or constant) backoff policy.
-///
-/// Construct with [`Backoff::exponential`], [`Backoff::constant`], or
-/// [`Backoff::new`] for an explicit multiplier, optionally enable jitter with
-/// [`Backoff::with_jitter`], then read delays with [`Backoff::delay`] (jittered)
-/// or [`Backoff::step`] (deterministic).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Backoff {
     base: Duration,
     max: Duration,
-    multiplier: u32,
     jitter: bool,
 }
 
 impl Backoff {
-    /// A policy growing by `multiplier` per attempt, without jitter.
+    /// Doubles from `base` up to `max`, without jitter.
     #[must_use]
-    pub const fn new(base: Duration, max: Duration, multiplier: u32) -> Self {
+    pub const fn exponential(base: Duration, max: Duration) -> Self {
         Self {
             base,
             max,
-            multiplier,
             jitter: false,
         }
     }
 
-    /// An exponential policy doubling from `base` up to `max`, without jitter.
-    #[must_use]
-    pub const fn exponential(base: Duration, max: Duration) -> Self {
-        Self::new(base, max, 2)
-    }
-
-    /// A constant policy whose delay is always `delay` before jitter.
-    #[must_use]
-    pub const fn constant(delay: Duration) -> Self {
-        Self::new(delay, delay, 1)
-    }
-
-    /// Return the same policy with jitter enabled: each delay gains a random
-    /// amount in `[0, delay)`, so its realized value lands in `[delay, 2*delay)`.
+    /// Adds a random amount in `[0, delay)` to each delay, decorrelating
+    /// concurrent retries against a shared resource.
     #[must_use]
     pub const fn with_jitter(mut self) -> Self {
         self.jitter = true;
         self
     }
 
-    /// The deterministic, pre-jitter delay for a zero-indexed `attempt`:
-    /// `min(base * multiplier^attempt, max)`.
-    #[must_use]
-    pub fn step(&self, attempt: u32) -> Duration {
-        let factor = self.multiplier.checked_pow(attempt).unwrap_or(u32::MAX);
-        self.base.saturating_mul(factor).min(self.max)
-    }
-
-    /// The delay to wait before the given zero-indexed retry `attempt`,
-    /// including jitter when enabled. `attempt` 0 is the delay before the first
-    /// retry.
+    /// The delay before the zero-indexed retry `attempt`.
     #[must_use]
     pub fn delay(&self, attempt: u32) -> Duration {
-        let step = self.step(attempt);
+        let factor = 2u32.checked_pow(attempt).unwrap_or(u32::MAX);
+        let step = self.base.saturating_mul(factor).min(self.max);
         if self.jitter {
             step.saturating_add(Duration::from_millis(jitter_below(
                 u64::try_from(step.as_millis()).unwrap_or(u64::MAX),
@@ -84,14 +45,11 @@ impl Backoff {
     }
 }
 
-/// A non-cryptographic pseudo-random value in `[0, max_exclusive)`, for retry
-/// jitter only. Returns 0 when `max_exclusive` is 0.
+/// A pseudo-random value in `[0, max_exclusive)`, 0 when `max_exclusive` is 0.
 ///
-/// This avoids any RNG dependency by reading a freshly-seeded [`RandomState`]'s
-/// hasher state as an entropy source. The standard library does not guarantee
-/// the seed's quality or distribution, so this must never be relied on for
-/// anything beyond spreading out contended retries; correctness never depends
-/// on the value.
+/// Reads a freshly seeded [`RandomState`] as entropy to avoid an RNG
+/// dependency. Its quality is unspecified, so use it only to spread out
+/// contended retries, never where correctness depends on the value.
 #[must_use]
 pub fn jitter_below(max_exclusive: u64) -> u64 {
     if max_exclusive == 0 {
@@ -125,26 +83,19 @@ mod tests {
     }
 
     #[test]
-    fn step_saturates_without_panicking() {
+    fn delay_saturates_without_panicking() {
         let backoff = Backoff::exponential(Duration::MAX, Duration::from_mins(1));
-        assert_eq!(backoff.step(6), Duration::from_mins(1));
-        assert_eq!(backoff.step(u32::MAX), Duration::from_mins(1));
-    }
-
-    #[test]
-    fn constant_policy_ignores_attempt() {
-        let backoff = Backoff::constant(Duration::from_millis(25));
-        assert_eq!(backoff.step(0), Duration::from_millis(25));
-        assert_eq!(backoff.step(9), Duration::from_millis(25));
+        assert_eq!(backoff.delay(6), Duration::from_mins(1));
+        assert_eq!(backoff.delay(u32::MAX), Duration::from_mins(1));
     }
 
     #[test]
     fn jitter_stays_within_bounds() {
-        let backoff =
-            Backoff::exponential(Duration::from_millis(100), Duration::from_secs(1)).with_jitter();
+        let plain = Backoff::exponential(Duration::from_millis(100), Duration::from_secs(1));
+        let jittered = plain.with_jitter();
         for attempt in 0..8 {
-            let step = backoff.step(attempt);
-            let delay = backoff.delay(attempt);
+            let step = plain.delay(attempt);
+            let delay = jittered.delay(attempt);
             assert!(delay >= step);
             assert!(delay < step + step + Duration::from_millis(1));
         }

@@ -1,20 +1,11 @@
-//! The shared driver for token-paginated listings.
-
 use std::future::Future;
 
 use futures_util::stream::{self, Stream, TryStreamExt};
 
 use crate::types::Page;
 
-/// Drives a token-paginated source as a lazy stream. Each yielded item is one
-/// entry from the underlying source; pages are fetched one at a time as the
-/// stream is polled, so at most one page of items is ever buffered.
-///
-/// `fetch` receives the current continuation token (`None` on the first call)
-/// and returns one [`Page`], whose `next_token` of `None` ends the stream.
-/// Consumers compose reduction and bounded fan-out with `TryStreamExt`
-/// combinators (`try_fold`, `try_buffer_unordered`, `try_for_each_concurrent`,
-/// `try_collect`).
+/// Streams a token-paginated source lazily, one page buffered at a time.
+/// `fetch` gets the continuation token, `None` on the first call.
 pub fn paginated<T, E, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, E>>
 where
     T: Send,
@@ -45,7 +36,6 @@ mod tests {
 
     use super::*;
 
-    /// Three pages of two items each, keyed by the token the fetch received.
     async fn fixture_fetch(token: Option<String>) -> Result<Page<u32>, Infallible> {
         let (items, next_token) = match token.as_deref() {
             None => (vec![1, 2], Some("a".to_string())),

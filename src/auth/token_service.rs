@@ -10,7 +10,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use http::HeaderValue;
 use http::request::Parts;
 use jsonwebtoken::{
@@ -18,11 +17,12 @@ use jsonwebtoken::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::auth::authenticator::AuthConfig;
 use crate::auth::authorization::bearer_token;
-use crate::auth::{AuthMiddleware, AuthResult, Error, sha256_hex};
+use crate::auth::{AuthResult, Error};
 use crate::configuration::Base64String;
 use crate::identity::{ClientIdentity, OidcClaims};
 use angos_secret::Secret;
@@ -102,7 +102,7 @@ fn fingerprint(auth: &AuthConfig, id: Option<&str>, oidc: Option<&OidcClaims>) -
     let provider = oidc
         .and_then(|oidc| auth.oidc.get(&oidc.provider_name))
         .map(|c| json!([c.issuer, c.jwks_uri, c.required_audience, c.required_claims]));
-    sha256_hex(json!([identity, provider]).to_string())
+    hex::encode(Sha256::digest(json!([identity, provider]).to_string()))
 }
 
 /// A signed token and its lifetime in seconds; the field names are the ones OCI
@@ -170,10 +170,9 @@ impl TokenIssuer {
     /// The `WWW-Authenticate` value pointing clients at the token endpoint, using
     /// the configured realm when there is one and the request's own host otherwise.
     pub fn challenge(&self, scheme: &str, host: &str) -> Option<HeaderValue> {
-        if let Some(challenge) = &self.configured_challenge {
-            return Some(challenge.clone());
-        }
-        build_challenge(&format!("{scheme}://{host}{TOKEN_PATH}")).ok()
+        self.configured_challenge
+            .clone()
+            .or_else(|| build_challenge(&format!("{scheme}://{host}{TOKEN_PATH}")).ok())
     }
 }
 
@@ -230,11 +229,8 @@ impl TokenValidator {
             auth: auth.clone(),
         })
     }
-}
 
-#[async_trait]
-impl AuthMiddleware for TokenValidator {
-    async fn authenticate(
+    pub fn authenticate(
         &self,
         parts: &Parts,
         identity: &mut ClientIdentity,
@@ -296,7 +292,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            secret_key: Secret::new(SECRET.to_vec().into()),
+            secret_key: Secret::new(Base64String(SECRET.to_vec())),
             realm: None,
             ttl_secs: default_ttl_secs(),
         }
@@ -352,17 +348,11 @@ mod tests {
         }
     }
 
-    async fn reissue(identity: &ClientIdentity) -> ClientIdentity {
-        let token = issuer()
-            .issue(identity)
-            .expect("issuing must succeed")
-            .token;
+    fn reissue(identity: &ClientIdentity) -> ClientIdentity {
+        let token = issuer().issue(identity).unwrap().token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
         let mut restored = ClientIdentity::default();
-        let result = validator()
-            .authenticate(&parts, &mut restored)
-            .await
-            .expect("a freshly issued token must validate");
+        let result = validator().authenticate(&parts, &mut restored).unwrap();
         assert!(matches!(result, AuthResult::Authenticated));
         restored
     }
@@ -370,30 +360,25 @@ mod tests {
     /// The CEL policy context is built by serializing `ClientIdentity`, so this
     /// equality is the policy contract: a reissued identity must decide every
     /// rule exactly as the original did.
-    #[tokio::test]
-    async fn identity_survives_a_token_round_trip_unchanged() {
-        let original = oidc_identity();
-        let restored = reissue(&original).await;
-
-        assert_eq!(
-            serde_json::to_value(&restored).unwrap(),
-            serde_json::to_value(&original).unwrap()
-        );
+    #[test]
+    fn identity_survives_a_token_round_trip_unchanged() {
+        for original in [oidc_identity(), ClientIdentity::default()] {
+            assert_eq!(
+                serde_json::to_value(reissue(&original)).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn certificate_and_client_ip_never_ride_in_the_token() {
+    #[test]
+    fn certificate_and_client_ip_never_ride_in_the_token() {
         let mut issued_from = oidc_identity();
         issued_from.certificate = ClientCertificate {
             organizations: vec!["IssuerOrg".to_string()],
             common_names: vec!["issuer-cn".to_string()],
         };
         issued_from.client_ip = Some("10.0.0.1".to_string());
-
-        let token = issuer()
-            .issue(&issued_from)
-            .expect("issuing must succeed")
-            .token;
+        let token = issuer().issue(&issued_from).unwrap().token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
         // What the live request established must survive validation untouched.
@@ -405,69 +390,58 @@ mod tests {
             client_ip: Some("192.0.2.7".to_string()),
             ..Default::default()
         };
-        validator()
-            .authenticate(&parts, &mut identity)
-            .await
-            .unwrap();
+        validator().authenticate(&parts, &mut identity).unwrap();
 
         assert_eq!(identity.certificate.organizations, vec!["LiveOrg"]);
         assert_eq!(identity.certificate.common_names, vec!["live-cn"]);
         assert_eq!(identity.client_ip.as_deref(), Some("192.0.2.7"));
     }
 
-    #[tokio::test]
-    async fn anonymous_identity_reissues_as_anonymous() {
-        let restored = reissue(&ClientIdentity::default()).await;
-
-        assert!(restored.id.is_none());
-        assert!(restored.username.is_none());
-        assert!(restored.oidc.is_none());
-    }
-
-    #[tokio::test]
-    async fn rejects_an_expired_token() {
+    /// An expired token, one from another key, and one typed as ours but signed
+    /// with another algorithm (refused because `Validation` pins ours).
+    #[test]
+    fn rejects_expired_and_forged_tokens() {
         // Validation::new leaves a 60s leeway, so the token must be older than that.
-        let claims = TokenClaims {
+        let expired = TokenClaims {
             exp: 1_000_000,
             credential: String::new(),
             id: None,
             username: Some("ci-bot".to_string()),
             oidc: None,
         };
-        let token = encode(&our_header(ALGORITHM), &claims, &issuer().encoding).unwrap();
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
-
-        let error = validator()
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect_err("an expired token must be refused");
-        assert!(matches!(error, Error::Unauthorized(_)));
-    }
-
-    #[tokio::test]
-    async fn rejects_a_token_signed_with_another_secret() {
-        let other = Config {
-            secret_key: Secret::new(vec![9; 32].into()),
+        let other_key = Config {
+            secret_key: Secret::new(Base64String(vec![9; 32])),
             ..config()
         };
-        let token = TokenIssuer::new(&other, &toml::from_str(AUTH).unwrap())
-            .unwrap()
-            .issue(&oidc_identity())
-            .unwrap()
-            .token;
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
+        let tokens = [
+            encode(&our_header(ALGORITHM), &expired, &issuer().encoding).unwrap(),
+            TokenIssuer::new(&other_key, &toml::from_str(AUTH).unwrap())
+                .unwrap()
+                .issue(&oidc_identity())
+                .unwrap()
+                .token,
+            encode(
+                &our_header(Algorithm::ES256),
+                &json!({"exp": 9_999_999_999_u64}),
+                &encoding_key(),
+            )
+            .unwrap(),
+        ];
 
-        let error = validator()
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect_err("a token from another key must be refused");
-        assert!(matches!(error, Error::Unauthorized(_)));
+        for (index, token) in tokens.iter().enumerate() {
+            let parts = parts_with_authorization(&format!("Bearer {token}"));
+            let result = validator().authenticate(&parts, &mut ClientIdentity::default());
+            assert!(
+                matches!(result, Err(Error::Unauthorized(_))),
+                "token {index}: {result:?}"
+            );
+        }
     }
 
     /// Removing either credential, rotating the password, renaming the user or
     /// repointing the provider revokes the tokens minted before.
-    #[tokio::test]
-    async fn rejects_a_token_whose_credential_changed() {
+    #[test]
+    fn rejects_a_token_whose_credential_changed() {
         let token = issuer().issue(&oidc_identity()).unwrap().token;
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
@@ -478,59 +452,41 @@ mod tests {
             ("ci-bot", "ci-robot"),
             ("token.actions.githubusercontent.com", "other.example.com"),
         ] {
-            let error = validator_for(&AUTH.replace(from, to))
-                .authenticate(&parts, &mut ClientIdentity::default())
-                .await
-                .expect_err("a token minted from a changed credential must be refused");
-            assert!(matches!(error, Error::Unauthorized(_)), "{to}: {error:?}");
+            let result = validator_for(&AUTH.replace(from, to))
+                .authenticate(&parts, &mut ClientIdentity::default());
+            assert!(
+                matches!(result, Err(Error::Unauthorized(_))),
+                "{to}: {result:?}"
+            );
         }
     }
 
     /// A provider's own bearer must fall through rather than error, or the OIDC
     /// middlewares never get to see it.
-    #[tokio::test]
-    async fn a_bearer_typed_as_another_scheme_yields_no_credentials() {
+    #[test]
+    fn a_bearer_typed_as_another_scheme_yields_no_credentials() {
         let mut claims = HashMap::new();
         claims.insert("sub".to_string(), json!("someone"));
-        let token = make_token(&claims, KID);
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
+        let parts = parts_with_authorization(&format!("Bearer {}", make_token(&claims, KID)));
 
-        let result = validator()
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect("another scheme's bearer must not fail the request");
-        assert!(matches!(result, AuthResult::NoCredentials));
-    }
-
-    /// The type marks a token as ours, so refusing a forgery that claims the type
-    /// rests on the algorithm `Validation` pins at verification.
-    #[tokio::test]
-    async fn a_token_typed_as_ours_but_signed_otherwise_is_refused() {
-        let mut claims = HashMap::new();
-        claims.insert("exp".to_string(), json!(9_999_999_999_u64));
-        let token = encode(&our_header(Algorithm::ES256), &claims, &encoding_key()).unwrap();
-        let parts = parts_with_authorization(&format!("Bearer {token}"));
-
-        let error = validator()
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await
-            .expect_err("only the token service's own algorithm may verify");
-        assert!(matches!(error, Error::Unauthorized(_)), "got: {error:?}");
+        let result = validator().authenticate(&parts, &mut ClientIdentity::default());
+        assert!(
+            matches!(result, Ok(AuthResult::NoCredentials)),
+            "got: {result:?}"
+        );
     }
 
     /// `alg=none` has no `Algorithm` to decode into, so such a token is dropped
     /// before its type is read and can never authenticate.
-    #[tokio::test]
-    async fn an_unsigned_token_never_authenticates() {
+    #[test]
+    fn an_unsigned_token_never_authenticates() {
         let token = concat!(
             "eyJ0eXAiOiJhbmdvcy10b2tlbitqd3QiLCJhbGciOiJub25lIn0",
             ".eyJleHAiOjk5OTk5OTk5OTl9."
         );
         let parts = parts_with_authorization(&format!("Bearer {token}"));
 
-        let result = validator()
-            .authenticate(&parts, &mut ClientIdentity::default())
-            .await;
+        let result = validator().authenticate(&parts, &mut ClientIdentity::default());
         assert!(
             !matches!(result, Ok(AuthResult::Authenticated)),
             "got: {result:?}"
@@ -542,7 +498,7 @@ mod tests {
     #[test]
     fn neither_half_accepts_a_key_under_32_bytes() {
         let config = Config {
-            secret_key: Secret::new(vec![7; 31].into()),
+            secret_key: Secret::new(Base64String(vec![7; 31])),
             ..config()
         };
 
@@ -581,74 +537,49 @@ mod tests {
         }
     }
 
+    /// A configured realm wins over the request host, keeps a proxy's path
+    /// prefix, and drops userinfo, query and fragment since every anonymous
+    /// client receives it; `service` keeps the port, since clients send it back.
     #[test]
-    fn the_configured_realm_wins_over_the_request_host() {
-        let config = Config {
-            realm: Some("https://registry.example.com/token".to_string()),
-            ..config()
-        };
-        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
-
-        assert_eq!(
-            issuer.challenge("http", "other.example.com").unwrap(),
-            r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#
-        );
-    }
-
-    #[test]
-    fn derives_the_challenge_from_the_request_host_when_no_realm_is_set() {
-        let issuer = issuer();
-
-        assert_eq!(
-            issuer.challenge("https", "registry.example.com").unwrap(),
-            r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#
-        );
-        assert!(issuer.challenge("https", "not a host").is_none());
-    }
-
-    /// A proxy that strips a path prefix before forwarding needs the prefixed
-    /// URL advertised, or clients follow the challenge to a 404.
-    #[test]
-    fn a_prefixed_realm_is_advertised_as_configured() {
-        let config = Config {
-            realm: Some("https://registry.example.com/registry/token".to_string()),
-            ..config()
-        };
-        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
-
-        assert_eq!(
-            issuer.challenge("https", "other.example.com").unwrap(),
-            r#"Bearer realm="https://registry.example.com/registry/token",service="registry.example.com""#
-        );
-    }
-
-    /// The challenge reaches every anonymous client, so anything the realm URL
-    /// carries beyond scheme, authority and path must be dropped.
-    #[test]
-    fn the_challenge_drops_realm_userinfo_and_query() {
-        let config = Config {
-            realm: Some("https://bot:hunter2@registry.example.com/token?x=1#f".to_string()),
-            ..config()
-        };
-        let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
-
-        assert_eq!(
-            issuer.challenge("https", "other.example.com").unwrap(),
-            r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#
-        );
-    }
-
-    /// A client sends `service` back verbatim, so dropping the port would name a
-    /// service the registry is not reachable at.
-    #[test]
-    fn the_service_carries_the_realm_port() {
-        let issuer = issuer();
-
-        assert_eq!(
-            issuer
-                .challenge("https", "registry.example.com:8443")
-                .unwrap(),
-            r#"Bearer realm="https://registry.example.com:8443/token",service="registry.example.com:8443""#
-        );
+    fn challenge_names_the_token_endpoint() {
+        for (realm, host, expected) in [
+            (
+                Some("https://registry.example.com/token"),
+                "other.example.com",
+                r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#,
+            ),
+            (
+                Some("https://registry.example.com/registry/token"),
+                "other.example.com",
+                r#"Bearer realm="https://registry.example.com/registry/token",service="registry.example.com""#,
+            ),
+            (
+                Some("https://bot:hunter2@registry.example.com/token?x=1#f"),
+                "other.example.com",
+                r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#,
+            ),
+            (
+                None,
+                "registry.example.com",
+                r#"Bearer realm="https://registry.example.com/token",service="registry.example.com""#,
+            ),
+            (
+                None,
+                "registry.example.com:8443",
+                r#"Bearer realm="https://registry.example.com:8443/token",service="registry.example.com:8443""#,
+            ),
+        ] {
+            let config = Config {
+                realm: realm.map(str::to_string),
+                ..config()
+            };
+            let issuer = TokenIssuer::new(&config, &AuthConfig::default()).unwrap();
+            assert_eq!(
+                issuer.challenge("https", host).unwrap(),
+                expected,
+                "{realm:?}"
+            );
+        }
+        assert!(issuer().challenge("https", "not a host").is_none());
     }
 }

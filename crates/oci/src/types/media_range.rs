@@ -20,10 +20,8 @@ fn is_media_range(s: &str) -> bool {
         })
 }
 
-/// One member of an `Accept` header: what a client will take, which a
-/// [`MediaType`] cannot express because `*/*` and `type/*` are not media types.
-/// The private field forces construction through the validating constructors, so
-/// a value forwarded to an upstream is always a well-formed media range.
+/// One member of an `Accept` header, always well-formed since it is forwarded
+/// upstream.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MediaRange(String);
 
@@ -45,7 +43,6 @@ impl MediaRange {
     }
 }
 
-/// Every media type is a media range, so no re-validation is needed.
 impl From<MediaType> for MediaRange {
     fn from(media_type: MediaType) -> Self {
         Self(media_type.to_string())
@@ -114,10 +111,8 @@ mod tests {
         }
     }
 
-    /// The `From` impl skips the media-range grammar on the strength of every
-    /// media type already satisfying it. That claim is what is checked here: a
-    /// media-range grammar tightened past the media-type one would make the
-    /// bypass produce values `new` itself rejects.
+    /// The `From` impl skips validation because every media type is a media
+    /// range; a tightened media-range grammar would break that.
     #[test]
     fn a_media_type_converts_without_re_validation() {
         for media_type in [

@@ -21,27 +21,30 @@ use angos_oci::request::{
     BlobMount, GetBlobRequest, GetManifestRequest, MountBlobRequest, PutManifestRequest,
 };
 use angos_oci::{Digest, MediaRange, MediaType, Namespace, Reference, Tag};
+use angos_oci_service::ManifestWritten;
 
 use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::event_webhook::event::{EventActor, EventKind};
 use crate::jobs::Queue;
-use crate::jobs::store::{ClaimMode, JobStore};
-use crate::metrics_provider::initialize_metrics;
+use crate::jobs::store::JobStore;
 use crate::registry::metadata_store::LinkKind;
 use crate::registry::repository_resolver::RepositoryResolver;
 use crate::registry::test_utils::{
     FsTestStack, create_test_repositories, downstream_client, fs_test_stack, put_blob_direct,
-    repository_with_downstream, repository_with_replication, response_digest, single_repo_resolver,
-    sole_pending_payload, test_job_store, upload_blob,
+    put_manifest_direct, repository_with_downstream, repository_with_replication, response_digest,
+    single_repo_resolver, sole_pending_payload, test_downstream, test_job_store, upload_blob,
 };
-use crate::registry::{Registry, RegistryConfig, Repository};
+use crate::registry::{Error, Registry, RegistryConfig, Repository};
 use crate::replication::{
     REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream,
 };
 
+/// A registry wired to a `required`-policy webhook, and the wiremock
+/// endpoint it delivers to.
 struct FsRegistryFixture {
     registry: Arc<Registry>,
+    server: MockServer,
     _temp_dir: TempDir,
 }
 
@@ -57,10 +60,15 @@ fn manifest_and_tag_kinds() -> Vec<EventKind> {
 }
 
 impl FsRegistryFixture {
-    /// Registry wired to a `required`-policy webhook subscribing to `kinds`.
-    fn with_webhook(server_uri: &str, kinds: Vec<EventKind>) -> Self {
+    /// A webhook subscribing to `kinds` whose endpoint answers `status`.
+    async fn new(status: u16, kinds: Vec<EventKind>) -> Self {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
         let webhook = EventWebhookConfig {
-            url: Url::parse(server_uri).unwrap(),
+            url: Url::parse(&server.uri()).unwrap(),
             policy: DeliveryPolicy::Required,
             token: None,
             timeout_ms: 5_000,
@@ -92,20 +100,23 @@ impl FsRegistryFixture {
 
         Self {
             registry,
+            server,
             _temp_dir: dir,
         }
     }
-}
 
-/// The event payloads the wiremock endpoint received, in delivery order.
-async fn received_events(server: &MockServer) -> Vec<Value> {
-    server
-        .received_requests()
-        .await
-        .expect("received_requests")
-        .iter()
-        .map(|request| serde_json::from_slice(&request.body).expect("event payload must be JSON"))
-        .collect()
+    /// The event payloads the endpoint received, in delivery order.
+    async fn events(&self) -> Vec<Value> {
+        self.server
+            .received_requests()
+            .await
+            .expect("received_requests")
+            .iter()
+            .map(|request| {
+                serde_json::from_slice(&request.body).expect("event payload must be JSON")
+            })
+            .collect()
+    }
 }
 
 fn kinds_of(events: &[Value]) -> Vec<String> {
@@ -113,6 +124,30 @@ fn kinds_of(events: &[Value]) -> Vec<String> {
         .iter()
         .map(|e| e["kind"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// Push a minimal OCI manifest by `reference`, also tagging `tags`. The bytes
+/// are the same on every call, so a repeated push names the same digest.
+async fn push_manifest(
+    registry: &Registry,
+    namespace: &Namespace,
+    reference: Reference,
+    tags: Vec<Tag>,
+) -> Result<ManifestWritten, Error> {
+    let (bytes, media_type) = test_manifest_bytes(registry, namespace).await;
+    registry
+        .handle_put_manifest(
+            None,
+            PutManifestRequest {
+                namespace: namespace.clone(),
+                reference,
+                content_type: Some(media_type),
+                tags,
+                source_ts: None,
+            },
+            Cursor::new(bytes),
+        )
+        .await
 }
 
 /// Minimal valid OCI manifest bytes and its media type.
@@ -134,265 +169,33 @@ async fn test_manifest_bytes(registry: &Registry, namespace: &Namespace) -> (Vec
     (bytes, mime)
 }
 
-#[tokio::test]
-async fn tag_push_emits_manifest_push_and_tag_create_events() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
-    let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("handle_put_manifest");
-
-    let events = received_events(&server).await;
-    let kinds = kinds_of(&events);
-    assert_eq!(
-        kinds.len(),
-        2,
-        "a tag push must deliver exactly two events; got {kinds:?}"
-    );
-    assert!(
-        kinds.contains(&"manifest.push".to_string()),
-        "ManifestPush event must be present for tag-based push; got {kinds:?}"
-    );
-    assert!(
-        kinds.contains(&"tag.create".to_string()),
-        "TagCreate event must be present for tag-based push; got {kinds:?}"
-    );
-
-    let tag_create = events.iter().find(|e| e["kind"] == "tag.create").unwrap();
-    assert_eq!(
-        tag_create["tag"], "latest",
-        "TagCreate event must carry the tag name"
-    );
-    assert!(
-        tag_create["reference"].is_string(),
-        "TagCreate event must carry a reference"
-    );
+fn tag(name: &str) -> Reference {
+    Reference::Tag(Tag::new(name).unwrap())
 }
 
 #[tokio::test]
-async fn digest_push_suppresses_tag_create_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
+async fn tag_push_emits_manifest_push_and_a_complete_tag_create_event() {
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    let tag_response = fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("seed").unwrap()),
-                content_type: Some(mime_type.clone()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes.clone()),
-        )
-        .await
-        .expect("seed push")
-        .into_response()
-        .unwrap();
-    let seed_event_count = received_events(&server).await.len();
-
-    let digest = response_digest(&tag_response);
-
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Digest(digest),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("digest push");
-
-    let events = received_events(&server).await.split_off(seed_event_count);
-    let kinds = kinds_of(&events);
-    assert!(
-        !kinds.contains(&"tag.create".to_string()),
-        "TagCreate must NOT be emitted for a digest-based push; got {kinds:?}"
-    );
-    assert_eq!(
-        kinds,
-        vec!["manifest.push".to_string()],
-        "ManifestPush must still be the only event for a digest-based push"
-    );
-}
-
-#[tokio::test]
-async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
-    let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("v1").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("put manifest");
-    let push_event_count = received_events(&server).await.len();
-
-    let reference = Reference::Tag(Tag::new("v1").unwrap());
-    fixture
-        .registry
-        .remove_manifest(None, None, &namespace, &reference)
-        .await
-        .expect("delete_manifest");
-
-    let events = received_events(&server).await.split_off(push_event_count);
-    let kinds = kinds_of(&events);
-    assert!(
-        kinds.contains(&"manifest.delete".to_string()),
-        "ManifestDelete must be emitted for tag-based delete; got {kinds:?}"
-    );
-    assert!(
-        kinds.contains(&"tag.delete".to_string()),
-        "TagDelete must be emitted for tag-based delete; got {kinds:?}"
-    );
-
-    let tag_delete = events.iter().find(|e| e["kind"] == "tag.delete").unwrap();
-    assert_eq!(tag_delete["tag"], "v1", "TagDelete must carry the tag name");
-}
-
-#[tokio::test]
-async fn digest_delete_suppresses_tag_delete_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
-    let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    let push = fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("to-delete").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
-        .await
-        .expect("put manifest")
-        .into_response()
-        .unwrap();
-    let push_event_count = received_events(&server).await.len();
-
-    let digest = response_digest(&push);
-
-    let reference = Reference::Digest(digest);
-    fixture
-        .registry
-        .remove_manifest(None, None, &namespace, &reference)
-        .await
-        .expect("delete_manifest");
-
-    let events = received_events(&server).await.split_off(push_event_count);
-    let kinds = kinds_of(&events);
-    assert!(
-        !kinds.contains(&"tag.delete".to_string()),
-        "TagDelete must NOT be emitted for a digest-based delete; got {kinds:?}"
-    );
-    assert_eq!(
-        kinds,
-        vec!["manifest.delete".to_string()],
-        "ManifestDelete must still be the only event for a digest-based delete"
-    );
-}
-
-#[tokio::test]
-async fn tag_push_event_payload_has_all_required_fields() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
-    let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     let before = Utc::now();
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("stable").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
+    push_manifest(&fixture.registry, &namespace, tag("stable"), Vec::new())
         .await
         .expect("handle_put_manifest");
     let after = Utc::now();
 
-    let events = received_events(&server).await;
-    let tag_create = events
-        .iter()
-        .find(|e| e["kind"] == "tag.create")
-        .expect("TagCreate event must exist for tag push");
+    let events = fixture.events().await;
+    let mut kinds = kinds_of(&events);
+    kinds.sort();
+    assert_eq!(kinds, ["manifest.push", "tag.create"]);
 
+    let tag_create = events.iter().find(|e| e["kind"] == "tag.create").unwrap();
     let id: Uuid = tag_create["id"]
         .as_str()
         .expect("id must be a string")
         .parse()
         .expect("id must parse as a UUID");
     assert_ne!(id, Uuid::nil());
-
     let timestamp: DateTime<Utc> = tag_create["timestamp"]
         .as_str()
         .expect("timestamp must be a string")
@@ -402,7 +205,6 @@ async fn tag_push_event_payload_has_all_required_fields() {
         timestamp >= before && timestamp <= after,
         "Event timestamp {timestamp} must lie between before ({before}) and after ({after})",
     );
-
     assert!(
         !tag_create["repository"]
             .as_str()
@@ -410,11 +212,7 @@ async fn tag_push_event_payload_has_all_required_fields() {
             .is_empty(),
         "no repository in {tag_create}"
     );
-    assert_eq!(
-        tag_create["namespace"],
-        namespace.as_ref(),
-        "Event namespace must match the pushed namespace"
-    );
+    assert_eq!(tag_create["namespace"], namespace.as_ref());
     assert_eq!(tag_create["tag"], "stable");
     assert!(
         tag_create["reference"].is_string(),
@@ -427,34 +225,101 @@ async fn tag_push_event_payload_has_all_required_fields() {
 }
 
 #[tokio::test]
-async fn digest_push_with_tag_params_emits_tag_create_per_tag() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
+async fn digest_push_suppresses_tag_create_event() {
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-    let digest = Digest::sha256_of_bytes(&manifest_bytes);
+    let digest = push_manifest(&fixture.registry, &namespace, tag("seed"), Vec::new())
+        .await
+        .expect("seed push")
+        .digest;
+    let seed_event_count = fixture.events().await.len();
+
+    push_manifest(
+        &fixture.registry,
+        &namespace,
+        Reference::Digest(digest),
+        Vec::new(),
+    )
+    .await
+    .expect("digest push");
+
+    let events = fixture.events().await.split_off(seed_event_count);
+    assert_eq!(
+        kinds_of(&events),
+        ["manifest.push"],
+        "a digest push must emit ManifestPush alone"
+    );
+}
+
+#[tokio::test]
+async fn tag_delete_emits_manifest_delete_and_tag_delete_events() {
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
+    let namespace = Namespace::new("test-repo").unwrap();
+    push_manifest(&fixture.registry, &namespace, tag("v1"), Vec::new())
+        .await
+        .expect("put manifest");
+    let push_event_count = fixture.events().await.len();
 
     fixture
         .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Digest(digest.clone()),
-                content_type: Some(mime_type),
-                tags: vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
+        .remove_manifest(None, None, &namespace, &tag("v1"))
         .await
-        .expect("by-digest push with tag params must succeed");
+        .expect("delete_manifest");
 
-    let events = received_events(&server).await;
+    let events = fixture.events().await.split_off(push_event_count);
+    let kinds = kinds_of(&events);
+    assert!(
+        kinds.contains(&"manifest.delete".to_string()),
+        "ManifestDelete must be emitted for tag-based delete; got {kinds:?}"
+    );
+    let tag_delete = events
+        .iter()
+        .find(|e| e["kind"] == "tag.delete")
+        .unwrap_or_else(|| panic!("TagDelete must be emitted for tag-based delete; got {kinds:?}"));
+    assert_eq!(tag_delete["tag"], "v1", "TagDelete must carry the tag name");
+}
+
+#[tokio::test]
+async fn digest_delete_suppresses_tag_delete_event() {
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
+    let namespace = Namespace::new("test-repo").unwrap();
+    let digest = push_manifest(&fixture.registry, &namespace, tag("to-delete"), Vec::new())
+        .await
+        .expect("put manifest")
+        .digest;
+    let push_event_count = fixture.events().await.len();
+
+    fixture
+        .registry
+        .remove_manifest(None, None, &namespace, &Reference::Digest(digest))
+        .await
+        .expect("delete_manifest");
+
+    let events = fixture.events().await.split_off(push_event_count);
+    assert_eq!(
+        kinds_of(&events),
+        ["manifest.delete"],
+        "a digest delete must emit ManifestDelete alone"
+    );
+}
+
+#[tokio::test]
+async fn digest_push_with_tag_params_emits_tag_create_per_tag() {
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
+    let namespace = Namespace::new("test-repo").unwrap();
+    let (manifest_bytes, _) = test_manifest_bytes(&fixture.registry, &namespace).await;
+    let digest = Digest::sha256_of_bytes(&manifest_bytes);
+
+    push_manifest(
+        &fixture.registry,
+        &namespace,
+        Reference::Digest(digest.clone()),
+        vec![Tag::new("1.2.3").unwrap(), Tag::new("latest").unwrap()],
+    )
+    .await
+    .expect("by-digest push with tag params must succeed");
+
+    let events = fixture.events().await;
     let digest_str = digest.to_string();
     assert!(
         events
@@ -480,199 +345,100 @@ async fn digest_push_with_tag_params_emits_tag_create_per_tag() {
 /// still emit its webhook events.
 #[tokio::test]
 async fn noop_push_still_emits_events() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
+    let fixture = FsRegistryFixture::new(200, manifest_and_tag_kinds()).await;
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(mime_type.clone()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes.clone()),
-        )
+    push_manifest(&fixture.registry, &namespace, tag("latest"), Vec::new())
         .await
         .expect("seed tag push");
-    let seed_event_count = received_events(&server).await.len();
+    let seed_event_count = fixture.events().await.len();
 
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
+    push_manifest(&fixture.registry, &namespace, tag("latest"), Vec::new())
         .await
         .expect("re-assert same tag->digest");
 
-    let events = received_events(&server).await.split_off(seed_event_count);
-    let kinds = kinds_of(&events);
-    assert!(
-        kinds.contains(&"manifest.push".to_string()),
-        "a no-op push must still emit ManifestPush; got {kinds:?}"
-    );
-    assert!(
-        kinds.contains(&"tag.create".to_string()),
-        "a no-op tag push must still emit TagCreate; got {kinds:?}"
+    let mut kinds = kinds_of(&fixture.events().await.split_off(seed_event_count));
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        ["manifest.push", "tag.create"],
+        "a no-op tag push must still emit its events"
     );
 }
 
 #[tokio::test]
 async fn completed_upload_emits_blob_push_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), vec![EventKind::BlobPush]);
+    let fixture = FsRegistryFixture::new(200, vec![EventKind::BlobPush]).await;
     let namespace = Namespace::new("test-repo").unwrap();
 
     let digest = upload_blob(&fixture.registry, &namespace, b"pushed bytes").await;
 
-    let events = received_events(&server).await;
+    let events = fixture.events().await;
     assert_eq!(events.len(), 1, "a completed upload must emit one event");
     assert_eq!(events[0]["kind"], "blob.push");
     assert_eq!(events[0]["digest"], digest.to_string());
 }
 
-/// A satisfied cross-repo mount emits `blob.push` just as an upload does.
+/// A cross-repo mount emits `blob.push` just as an upload does, and since the
+/// intent fires before the attempt, a mount falling back to a session still
+/// leaves its (false-positive) event behind.
 #[tokio::test]
-async fn mount_emits_blob_push_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), vec![EventKind::BlobPush]);
+async fn mount_emits_blob_push_event_even_when_it_falls_back() {
+    let fixture = FsRegistryFixture::new(200, vec![EventKind::BlobPush]).await;
     let source = &Namespace::new("test-repo/source").unwrap();
     let target = &Namespace::new("test-repo/target").unwrap();
 
-    let digest = put_blob_direct(&fixture.registry.blob_store, b"mountable").await;
+    let owned = put_blob_direct(&fixture.registry.blob_store, b"mountable").await;
     fixture
         .registry
         .metadata_store
         .as_ref()
-        .grant(source, &digest)
+        .grant(source, &owned)
         .await
         .unwrap();
+    // Present but unowned by `source`, so its mount falls back to a session.
+    let unowned = put_blob_direct(&fixture.registry.blob_store, b"not owned").await;
 
-    let mount = BlobMount {
-        digest: digest.clone(),
-        from: Some(source.clone()),
-    };
-    let response = fixture
-        .registry
-        .handle_mount_blob(
-            None,
-            MountBlobRequest {
-                namespace: target.clone(),
-                mount,
-            },
-            Some(source.clone()),
-        )
-        .await
-        .unwrap()
-        .into_response()
-        .unwrap();
+    for (digest, status) in [
+        (&owned, StatusCode::CREATED),
+        (&unowned, StatusCode::ACCEPTED),
+    ] {
+        let response = fixture
+            .registry
+            .handle_mount_blob(
+                None,
+                MountBlobRequest {
+                    namespace: target.clone(),
+                    mount: BlobMount {
+                        digest: digest.clone(),
+                        from: Some(source.clone()),
+                    },
+                },
+                Some(source.clone()),
+            )
+            .await
+            .unwrap()
+            .into_response()
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
 
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let events = received_events(&server).await;
-    assert_eq!(events.len(), 1, "a satisfied mount must emit one event");
-    assert_eq!(events[0]["kind"], "blob.push");
-    assert_eq!(events[0]["namespace"], target.as_ref());
-    assert_eq!(events[0]["digest"], digest.to_string());
-}
-
-/// The `blob.push` intent fires before the mount attempt, so the session
-/// fallback still leaves the (false-positive) event behind.
-#[tokio::test]
-async fn mount_fallback_still_emits_intent_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), vec![EventKind::BlobPush]);
-    let source = &Namespace::new("test-repo/source").unwrap();
-    let target = &Namespace::new("test-repo/target").unwrap();
-
-    // Present but unowned by `source`, so the mount falls back to a session.
-    let digest = put_blob_direct(&fixture.registry.blob_store, b"not owned").await;
-    let mount = BlobMount {
-        digest: digest.clone(),
-        from: Some(source.clone()),
-    };
-    let response = fixture
-        .registry
-        .handle_mount_blob(
-            None,
-            MountBlobRequest {
-                namespace: target.clone(),
-                mount,
-            },
-            Some(source.clone()),
-        )
-        .await
-        .unwrap()
-        .into_response()
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let events = received_events(&server).await;
-    assert_eq!(
-        events.len(),
-        1,
-        "the mount intent must be emitted even when the mount falls back"
-    );
-    assert_eq!(events[0]["kind"], "blob.push");
-    assert_eq!(events[0]["digest"], digest.to_string());
+    let events = fixture.events().await;
+    assert_eq!(events.len(), 2, "each mount must emit one event");
+    for (event, digest) in events.iter().zip([&owned, &unowned]) {
+        assert_eq!(event["kind"], "blob.push");
+        assert_eq!(event["namespace"], target.as_ref());
+        assert_eq!(event["digest"], digest.to_string());
+    }
 }
 
 /// Intent-first emission gates the action on a `required` webhook: when the
 /// delivery fails, the push is rejected before anything is stored.
 #[tokio::test]
 async fn failing_required_webhook_blocks_the_write() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), manifest_and_tag_kinds());
+    let fixture = FsRegistryFixture::new(500, manifest_and_tag_kinds()).await;
     let namespace = Namespace::new("test-repo").unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
-    let tag = Tag::new("gated").unwrap();
-    let result = fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(tag.clone()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
-        .await;
+    let result = push_manifest(&fixture.registry, &namespace, tag("gated"), Vec::new()).await;
     assert!(
         result.is_err(),
         "a failing required webhook must reject the push"
@@ -681,7 +447,7 @@ async fn failing_required_webhook_blocks_the_write() {
     fixture
         .registry
         .metadata_store
-        .read_link(&namespace, &LinkKind::Tag(tag))
+        .read_link(&namespace, &LinkKind::Tag(Tag::new("gated").unwrap()))
         .await
         .expect_err("the manifest must not have been stored after the rejected intent");
 }
@@ -712,8 +478,7 @@ impl ReplicationFixture {
         } = fs_test_stack();
         let resolver = single_repo_resolver(REPLICATION_REPO, repository);
 
-        let job_store: Arc<JobStore> =
-            Arc::new(JobStore::new(&metadata_store, "test", ClaimMode::Atomic));
+        let job_store = test_job_store(&metadata_store);
 
         let config = RegistryConfig::new(job_store.clone());
         let registry = Registry::new(blob_store, metadata_store, resolver, config);
@@ -733,32 +498,17 @@ fn mirror_and_additive_downstreams() -> Vec<ReplicationDownstream> {
     vec![
         ReplicationDownstream {
             prune: true,
-            ..ReplicationDownstream::new("mirror".to_string(), client.clone(), 4)
+            ..test_downstream("mirror".to_string(), client.clone())
         },
-        ReplicationDownstream::new("additive".to_string(), client, 4),
+        test_downstream("additive".to_string(), client),
     ]
 }
 
 #[tokio::test]
 async fn fresh_local_tag_push_enqueues_replication_job() {
-    initialize_metrics();
     let fixture = ReplicationFixture::new();
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
-    let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
-
-    fixture
-        .registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(mime_type),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(manifest_bytes),
-        )
+    push_manifest(&fixture.registry, &namespace, tag("latest"), Vec::new())
         .await
         .expect("handle_put_manifest");
 
@@ -786,23 +536,21 @@ async fn fresh_local_tag_push_enqueues_replication_job() {
 
 #[tokio::test]
 async fn tag_delete_enqueues_replication_delete_job() {
-    initialize_metrics();
     let fixture = ReplicationFixture::new();
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
     // Seed through the non-dispatching put_manifest so the delete's job is the
     // only one enqueued.
-    fixture
-        .registry
-        .put_manifest_direct(
-            &namespace,
-            &Reference::Tag(Tag::new("doomed").unwrap()),
-            Some(&mime_type),
-            &manifest_bytes,
-        )
-        .await
-        .expect("seed put_manifest");
+    put_manifest_direct(
+        &fixture.registry,
+        &namespace,
+        &tag("doomed"),
+        Some(&mime_type),
+        &manifest_bytes,
+    )
+    .await
+    .expect("seed put_manifest");
     assert_eq!(
         fixture
             .job_store
@@ -815,12 +563,7 @@ async fn tag_delete_enqueues_replication_delete_job() {
 
     fixture
         .registry
-        .remove_manifest(
-            None,
-            None,
-            &namespace,
-            &Reference::Tag(Tag::new("doomed").unwrap()),
-        )
+        .remove_manifest(None, None, &namespace, &tag("doomed"))
         .await
         .expect("delete_manifest");
 
@@ -844,7 +587,6 @@ async fn tag_delete_enqueues_replication_delete_job() {
 /// `prune = true` downstream; the additive downstream keeps its copy.
 #[tokio::test]
 async fn retention_delete_mirrors_only_to_prune_downstreams() {
-    initialize_metrics();
     let fixture = ReplicationFixture::with_repository(repository_with_replication(
         REPLICATION_REPO,
         mirror_and_additive_downstreams(),
@@ -852,16 +594,15 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
-    fixture
-        .registry
-        .put_manifest_direct(
-            &namespace,
-            &Reference::Tag(Tag::new("expired").unwrap()),
-            Some(&mime_type),
-            &manifest_bytes,
-        )
-        .await
-        .expect("seed put_manifest");
+    put_manifest_direct(
+        &fixture.registry,
+        &namespace,
+        &tag("expired"),
+        Some(&mime_type),
+        &manifest_bytes,
+    )
+    .await
+    .expect("seed put_manifest");
 
     fixture
         .registry
@@ -869,7 +610,7 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
             Some(EventActor::internal("prune")),
             None,
             &namespace,
-            &Reference::Tag(Tag::new("expired").unwrap()),
+            &tag("expired"),
         )
         .await
         .expect("retention delete");
@@ -891,7 +632,6 @@ async fn retention_delete_mirrors_only_to_prune_downstreams() {
 
 #[tokio::test]
 async fn client_delete_mirrors_to_all_downstreams() {
-    initialize_metrics();
     let fixture = ReplicationFixture::with_repository(repository_with_replication(
         REPLICATION_REPO,
         mirror_and_additive_downstreams(),
@@ -899,25 +639,19 @@ async fn client_delete_mirrors_to_all_downstreams() {
     let namespace = Namespace::new(REPLICATION_REPO).unwrap();
     let (manifest_bytes, mime_type) = test_manifest_bytes(&fixture.registry, &namespace).await;
 
-    fixture
-        .registry
-        .put_manifest_direct(
-            &namespace,
-            &Reference::Tag(Tag::new("doomed").unwrap()),
-            Some(&mime_type),
-            &manifest_bytes,
-        )
-        .await
-        .expect("seed put_manifest");
+    put_manifest_direct(
+        &fixture.registry,
+        &namespace,
+        &tag("doomed"),
+        Some(&mime_type),
+        &manifest_bytes,
+    )
+    .await
+    .expect("seed put_manifest");
 
     fixture
         .registry
-        .remove_manifest(
-            None,
-            None,
-            &namespace,
-            &Reference::Tag(Tag::new("doomed").unwrap()),
-        )
+        .remove_manifest(None, None, &namespace, &tag("doomed"))
         .await
         .expect("client delete");
 
@@ -934,12 +668,7 @@ async fn client_delete_mirrors_to_all_downstreams() {
 
 #[tokio::test]
 async fn get_blob_emits_pull_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), vec![EventKind::BlobPull]);
+    let fixture = FsRegistryFixture::new(200, vec![EventKind::BlobPull]).await;
     let namespace = Namespace::new("test-repo/pulled").unwrap();
     let digest = upload_blob(&fixture.registry, &namespace, b"pull event blob").await;
 
@@ -961,7 +690,7 @@ async fn get_blob_emits_pull_event() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let events = received_events(&server).await;
+    let events = fixture.events().await;
     assert_eq!(events.len(), 1, "exactly one pull event must be posted");
     assert_eq!(events[0]["kind"], "blob.pull");
     assert_eq!(events[0]["digest"], digest.to_string());
@@ -969,24 +698,19 @@ async fn get_blob_emits_pull_event() {
 
 #[tokio::test]
 async fn get_manifest_emits_pull_event() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-    let fixture = FsRegistryFixture::with_webhook(&server.uri(), vec![EventKind::ManifestPull]);
+    let fixture = FsRegistryFixture::new(200, vec![EventKind::ManifestPull]).await;
     let namespace = Namespace::new("test-repo/pulled").unwrap();
     let media_type = MediaType::oci_manifest();
     let manifest_bytes =
         br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#.to_vec();
 
-    let seeded = fixture
+    let digest = fixture
         .registry
         .handle_put_manifest(
             None,
             PutManifestRequest {
                 namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                reference: tag("latest"),
                 content_type: Some(media_type.clone()),
                 tags: Vec::new(),
                 source_ts: None,
@@ -995,9 +719,7 @@ async fn get_manifest_emits_pull_event() {
         )
         .await
         .expect("seeding the manifest must succeed")
-        .into_response()
-        .unwrap();
-    let digest = response_digest(&seeded);
+        .digest;
 
     let response = fixture
         .registry
@@ -1005,7 +727,7 @@ async fn get_manifest_emits_pull_event() {
             None,
             GetManifestRequest {
                 namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
+                reference: tag("latest"),
                 accepted_types: vec![MediaRange::from(media_type)],
             },
             true,
@@ -1015,7 +737,7 @@ async fn get_manifest_emits_pull_event() {
         .into_response()
         .unwrap();
 
-    let events = received_events(&server).await;
+    let events = fixture.events().await;
     assert_eq!(events.len(), 1, "exactly one pull event must be posted");
     assert_eq!(events[0]["kind"], "manifest.pull");
     assert_eq!(events[0]["reference"], "latest");

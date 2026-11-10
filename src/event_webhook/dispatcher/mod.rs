@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use angos_backoff::Backoff;
-use angos_mtls_client::MtlsClientBuilder;
+use angos_mtls_client::build_client;
 use angos_secret::Secret;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -25,7 +25,7 @@ use crate::event_webhook::event::{Event, EventKind};
 use crate::metrics_provider::metrics_provider;
 
 pub struct EventDispatcher {
-    endpoints: HashMap<String, WebhookEndpoint>,
+    endpoints: HashMap<String, Arc<WebhookEndpoint>>,
     /// The webhooks an event goes to: those its repository names, else these.
     global: Vec<String>,
     repositories: HashMap<String, Vec<String>>,
@@ -34,8 +34,10 @@ pub struct EventDispatcher {
     /// dropped, and a configuration reload drops the dispatcher it displaces,
     /// which would cancel that dispatcher's deliveries mid-flight.
     in_flight: TaskTracker,
-    delivery_backoff: Backoff,
 }
+
+const DELIVERY_BACKOFF: Backoff =
+    Backoff::exponential(Duration::from_millis(100), Duration::from_secs(10));
 
 struct WebhookEndpoint {
     client: Client,
@@ -57,38 +59,15 @@ impl WebhookEndpoint {
             Some(filters) => filters.iter().any(|p| p.is_match(repository)),
         }
     }
-
-    fn delivery(
-        &self,
-        name: &str,
-        body: Bytes,
-        event_kind_header: &'static str,
-        backoff: Backoff,
-    ) -> Delivery {
-        Delivery {
-            client: self.client.clone(),
-            url: self.url.to_string(),
-            token: self.token.clone(),
-            body,
-            event_kind_header,
-            name: name.to_string(),
-            max_retries: self.max_retries,
-            backoff,
-        }
-    }
 }
 
-/// One resolved webhook POST, owned so the same value serves the synchronous
-/// policies and the spawned async task.
+/// One webhook POST, owned so the same value serves the synchronous policies
+/// and the spawned async task.
 struct Delivery {
-    client: Client,
-    url: String,
-    token: Option<Secret<String>>,
+    endpoint: Arc<WebhookEndpoint>,
+    name: String,
     body: Bytes,
     event_kind_header: &'static str,
-    name: String,
-    max_retries: u32,
-    backoff: Backoff,
 }
 
 impl Delivery {
@@ -112,13 +91,14 @@ impl Delivery {
     }
 
     async fn send_request(&self) -> Result<(), String> {
-        let mut request = self
+        let endpoint = &self.endpoint;
+        let mut request = endpoint
             .client
-            .post(self.url.as_str())
+            .post(endpoint.url.clone())
             .header("content-type", "application/json")
             .header("X-Registry-Event", self.event_kind_header);
 
-        if let Some(token) = &self.token {
+        if let Some(token) = &endpoint.token {
             let token = token.expose();
             let signature = compute_signature(token, &self.body)?;
             request = request
@@ -147,7 +127,7 @@ impl Delivery {
 
         loop {
             if attempt > 0 {
-                sleep(self.backoff.delay(attempt - 1)).await;
+                sleep(DELIVERY_BACKOFF.delay(attempt - 1)).await;
             }
 
             let last_err = match self.send_request().await {
@@ -155,23 +135,17 @@ impl Delivery {
                 Err(e) => e,
             };
 
-            if attempt == self.max_retries {
-                let first_err = first_err.as_deref().unwrap_or(&last_err);
-                return Err(format_retry_failure(
-                    self.max_retries + 1,
-                    first_err,
-                    &last_err,
-                ));
+            if attempt == self.endpoint.max_retries {
+                let attempts = attempt + 1;
+                return Err(match first_err {
+                    Some(first) if first != last_err => format!(
+                        "after {attempts} attempt(s); first error: {first}; last error: {last_err}"
+                    ),
+                    _ => format!("after {attempts} attempt(s): {last_err}"),
+                });
             }
             first_err.get_or_insert(last_err);
             attempt += 1;
-        }
-    }
-
-    /// The spawned-task body for the async policy: deliver and log a failure.
-    async fn deliver_logged(self) {
-        if let Err(e) = self.send_and_record().await {
-            warn!("Async webhook '{}' failed: {e}", self.name);
         }
     }
 }
@@ -181,14 +155,6 @@ fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("failed to initialize HMAC for the webhook signature: {e}"))?;
     mac.update(body);
     Ok(hex::encode(mac.finalize().into_bytes()))
-}
-
-fn format_retry_failure(attempts: u32, first: &str, last: &str) -> String {
-    if first == last {
-        format!("after {attempts} attempt(s): {first}")
-    } else {
-        format!("after {attempts} attempt(s); first error: {first}; last error: {last}")
-    }
 }
 
 impl EventDispatcher {
@@ -209,19 +175,19 @@ impl EventDispatcher {
         let mut endpoints = HashMap::with_capacity(webhooks.len());
 
         for (name, config) in webhooks {
-            let client = MtlsClientBuilder::new()
-                .with_timeout(Duration::from_millis(config.timeout_ms))
-                .with_tls(&config.tls)
-                .build()
-                .map_err(|e| {
-                    Error::Initialization(format!(
-                        "Failed to create HTTP client for webhook '{name}': {e}"
-                    ))
-                })?;
+            let client = build_client(
+                Client::builder().timeout(Duration::from_millis(config.timeout_ms)),
+                &config.tls,
+            )
+            .map_err(|e| {
+                Error::Initialization(format!(
+                    "Failed to create HTTP client for webhook '{name}': {e}"
+                ))
+            })?;
 
             endpoints.insert(
                 name,
-                WebhookEndpoint {
+                Arc::new(WebhookEndpoint {
                     client,
                     max_retries: config.max_retries(),
                     url: config.url,
@@ -229,7 +195,7 @@ impl EventDispatcher {
                     token: config.token,
                     events: config.events,
                     repository_filter: config.repository_filter,
-                },
+                }),
             );
         }
 
@@ -239,16 +205,11 @@ impl EventDispatcher {
             repositories,
             shutdown: AtomicBool::new(false),
             in_flight: TaskTracker::new(),
-            delivery_backoff: Backoff::exponential(
-                Duration::from_millis(100),
-                Duration::from_secs(10),
-            ),
         })
     }
 
     /// Build the dispatcher from the configuration, `None` when no webhook is
-    /// defined. The single construction seam shared by the server and the
-    /// maintenance commands.
+    /// defined.
     pub fn from_config(config: &Configuration) -> Result<Option<Arc<Self>>, Error> {
         if config.event_webhook.is_empty() {
             return Ok(None);
@@ -276,21 +237,21 @@ impl EventDispatcher {
         self.in_flight.wait().await;
     }
 
-    fn spawn_async(&self, delivery: Delivery) {
-        if self.shutdown.load(Ordering::Acquire) {
-            warn!(
-                "Async webhook '{}' skipped: dispatcher is shut down",
-                delivery.name
-            );
-            return;
-        }
-        self.in_flight.spawn(delivery.deliver_logged());
-    }
-
-    async fn deliver(&self, endpoint: &WebhookEndpoint, delivery: Delivery) -> Result<(), Error> {
-        match endpoint.policy {
+    async fn deliver(&self, delivery: Delivery) -> Result<(), Error> {
+        match delivery.endpoint.policy {
             DeliveryPolicy::Async => {
-                self.spawn_async(delivery);
+                if self.shutdown.load(Ordering::Acquire) {
+                    warn!(
+                        "Async webhook '{}' skipped: dispatcher is shut down",
+                        delivery.name
+                    );
+                } else {
+                    self.in_flight.spawn(async move {
+                        if let Err(e) = delivery.send_and_record().await {
+                            warn!("Async webhook '{}' failed: {e}", delivery.name);
+                        }
+                    });
+                }
                 Ok(())
             }
             DeliveryPolicy::Required => match delivery.send_and_record().await {
@@ -333,9 +294,13 @@ impl EventDispatcher {
             if !endpoint.matches_event(event.kind(), &event.repository) {
                 continue;
             }
-            let delivery =
-                endpoint.delivery(name, body.clone(), event_kind_header, self.delivery_backoff);
-            if let Err(e) = self.deliver(endpoint, delivery).await
+            let delivery = Delivery {
+                endpoint: endpoint.clone(),
+                name: name.clone(),
+                body: body.clone(),
+                event_kind_header,
+            };
+            if let Err(e) = self.deliver(delivery).await
                 && first_required_failure.is_none()
             {
                 first_required_failure = Some(e);

@@ -1,14 +1,12 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import type { ParentRef, Manifest, ReferrerInfo } from '#lib/api.js';
+	import { blobUrl, type ParentRef, type Manifest, type ReferrerInfo } from '#lib/api.js';
 	import {
 		formatPlatform,
 		formatSize,
-		getTagConfirm,
 		isInteractiveTarget,
 		manifestUrl,
-		tagConfirmKey,
 		getAttestationType,
 		latestScanReport,
 		parseScanSummary,
@@ -47,7 +45,6 @@
 		ondeletebyhash: () => void;
 		deleteconfirmlabel: string;
 		onconfirmchange: (value: string | null) => void;
-		getbloburl: (blobDigest: string) => string;
 	}
 
 	let {
@@ -66,32 +63,33 @@
 		ondeletetag,
 		ondeletebyhash,
 		deleteconfirmlabel,
-		onconfirmchange,
-		getbloburl
+		onconfirmchange
 	}: Props = $props();
 
 	let expandedAnnotations: Set<string> = $state(new Set());
 
+	const ownReferrers = $derived(digest ? (childReferrers.get(digest) ?? []) : []);
+	const platformManifests = $derived(
+		(manifest.manifests ?? []).filter((m) => !m.annotations?.['vnd.docker.reference.digest'])
+	);
+
 	// The reports the Vulnerabilities tab shows: the manifest itself when it is
 	// a report, an image's own report, or one per platform for an index.
-	type Report = { label?: string; digest: string; annotations?: Record<string, string> };
 	const isReport = $derived(manifest.artifactType === 'application/sarif+json');
-	const latestReport = $derived(digest ? latestScanReport(childReferrers.get(digest) ?? []) : null);
-	const reports = $derived.by((): Report[] => {
+	const latestReport = $derived(latestScanReport(ownReferrers));
+	const reports = $derived.by(() => {
 		if (isReport && digest) {
 			return [{ digest, annotations: manifest.annotations }];
 		}
 		if (latestReport) {
 			return [{ digest: latestReport.digest, annotations: latestReport.annotations }];
 		}
-		return (manifest.manifests ?? [])
-			.filter((m) => !m.annotations?.['vnd.docker.reference.digest'])
-			.flatMap((m) => {
-				const report = latestScanReport(childReferrers.get(m.digest) ?? []);
-				return report
-					? [{ label: formatPlatform(m.platform), digest: report.digest, annotations: report.annotations }]
-					: [];
-			});
+		return platformManifests.flatMap((m) => {
+			const report = latestScanReport(childReferrers.get(m.digest) ?? []);
+			return report
+				? [{ label: formatPlatform(m.platform), digest: report.digest, annotations: report.annotations }]
+				: [];
+		});
 	});
 	const vulnTotal = $derived(
 		reports.reduce((sum, report) => sum + (parseScanSummary(report.annotations)?.total ?? 0), 0)
@@ -120,20 +118,16 @@
 	// An anchor naming a tab this manifest lacks falls back to OCI.
 	const current = $derived(tabs.some((tab) => tab.id === active) ? active : 'oci');
 
-	type LayersViewMode = 'auto' | 'files' | 'layers';
-	let layersViewMode: LayersViewMode = $state('auto');
+	let layersViewMode: 'auto' | 'files' | 'layers' = $state('auto');
 
 	const showFilesView = $derived(
-		layersViewMode === 'auto' ? (manifest ? isOrasArtifact(manifest) : false) : layersViewMode === 'files'
+		layersViewMode === 'auto' ? isOrasArtifact(manifest) : layersViewMode === 'files'
 	);
 
 	function toggleAnnotations(key: string) {
-		if (expandedAnnotations.has(key)) {
-			expandedAnnotations.delete(key);
-		} else {
-			expandedAnnotations.add(key);
-		}
-		expandedAnnotations = new Set(expandedAnnotations);
+		const next = new Set(expandedAnnotations);
+		if (!next.delete(key)) next.add(key);
+		expandedAnnotations = next;
 	}
 
 	function handleRowClick(event: MouseEvent, targetDigest: string) {
@@ -169,10 +163,10 @@
 					<td>
 						<TagList
 							{tags}
-							deleteConfirm={getTagConfirm(deleteConfirm)}
+							{deleteConfirm}
 							disabled={deleting}
 							ondelete={ondeletetag}
-							onconfirmchange={(tag) => onconfirmchange(tag ? tagConfirmKey(tag) : null)}
+							{onconfirmchange}
 							getHref={(tag) => manifestUrl(path, tag)}
 						/>
 					</td>
@@ -255,9 +249,9 @@
 	{#if manifest.layers && manifest.layers.length > 0}
 		{#snippet viewToggle()}
 			<div class="view-toggle">
-				<button class:active={layersViewMode === 'auto'} onclick={() => (layersViewMode = 'auto')}>auto</button>
-				<button class:active={layersViewMode === 'files'} onclick={() => (layersViewMode = 'files')}>files</button>
-				<button class:active={layersViewMode === 'layers'} onclick={() => (layersViewMode = 'layers')}>layers</button>
+				{#each ['auto', 'files', 'layers'] as const as mode}
+					<button class:active={layersViewMode === mode} onclick={() => (layersViewMode = mode)}>{mode}</button>
+				{/each}
 			</div>
 		{/snippet}
 		{#if showFilesView}
@@ -278,7 +272,7 @@
 								<td>{layer.mediaType}</td>
 								<td class="nowrap">{formatSize(layer.size)}</td>
 								<td>
-									<a class="download-link" href={getbloburl(layer.digest)} download={getFileName(layer) ?? layer.digest}
+									<a class="download-link" href={blobUrl(path, layer.digest)} download={getFileName(layer) ?? layer.digest}
 										>Download</a
 									>
 								</td>
@@ -338,88 +332,84 @@
 		{/if}
 	{/if}
 
-	{#if manifest.manifests && manifest.manifests.length > 0}
-		{@const platformManifests = manifest.manifests.filter((m) => !m.annotations?.['vnd.docker.reference.digest'])}
-		{#if platformManifests.length > 0}
-			<Card title="Manifests" count={platformManifests.length}>
-				<table>
-					<thead>
-						<tr>
-							<th>Digest</th>
-							<th>Platform</th>
-							<th>Media type</th>
-							<th class="col-narrow">Size</th>
+	{#if platformManifests.length > 0}
+		<Card title="Manifests" count={platformManifests.length}>
+			<table>
+				<thead>
+					<tr>
+						<th>Digest</th>
+						<th>Platform</th>
+						<th>Media type</th>
+						<th class="col-narrow">Size</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#each platformManifests as m}
+						{@const refs = childReferrers.get(m.digest) ?? []}
+						<tr class="child-row clickable" onclick={(e) => handleRowClick(e, m.digest)}>
+							<td class="has-children" class:expanded={refs.length > 0}>
+								<span class="tree-toggle leaf"></span>
+								<DigestLink
+									digest={m.digest}
+									href={manifestUrl(path, m.digest)}
+									annotations={m.annotations}
+									expanded={expandedAnnotations.has(`manifest:${m.digest}`)}
+									ontoggle={() => toggleAnnotations(`manifest:${m.digest}`)}
+								/>
+							</td>
+							<td>
+								<PlatformBadge platform={m.platform} />
+							</td>
+							<td>{m.mediaType}</td>
+							<td class="nowrap">{formatSize(m.size)}</td>
 						</tr>
-					</thead>
-					<tbody>
-						{#each platformManifests as m}
-							{@const refs = childReferrers.get(m.digest) ?? []}
-							<tr class="child-row clickable" onclick={(e) => handleRowClick(e, m.digest)}>
-								<td class="has-children" class:expanded={refs.length > 0}>
-									<span class="tree-toggle leaf"></span>
-									<DigestLink
-										digest={m.digest}
-										href={manifestUrl(path, m.digest)}
-										annotations={m.annotations}
-										expanded={expandedAnnotations.has(`manifest:${m.digest}`)}
-										ontoggle={() => toggleAnnotations(`manifest:${m.digest}`)}
-									/>
+						{#if m.annotations && expandedAnnotations.has(`manifest:${m.digest}`)}
+							<tr class="annotations-row">
+								<td colspan="4">
+									<AnnotationList annotations={m.annotations} format="inline" />
 								</td>
-								<td>
-									<PlatformBadge platform={m.platform} />
-								</td>
-								<td>{m.mediaType}</td>
-								<td class="nowrap">{formatSize(m.size)}</td>
 							</tr>
-							{#if m.annotations && expandedAnnotations.has(`manifest:${m.digest}`)}
-								<tr class="annotations-row">
-									<td colspan="4">
-										<AnnotationList annotations={m.annotations} format="inline" />
-									</td>
-								</tr>
-							{/if}
-							{@const moreRefs = childReferrersNext.has(m.digest)}
-							{#each refs as ref, ridx}
-								{@const isLastRef = ridx === refs.length - 1 && !moreRefs}
-								<tr class="child-row clickable" onclick={(e) => handleRowClick(e, ref.digest)}>
-									<td class="tree-branch" class:has-next={!isLastRef}>
-										<span class="tree-toggle leaf"></span>
-										<DigestLink digest={ref.digest} href={manifestUrl(path, ref.digest)} />
-									</td>
-									<td class="nowrap">
-										<AttestationBadge type={getAttestationType(ref)} />
-										<ScanSummary annotations={ref.annotations} compact />
-									</td>
-									<td></td>
-									<td></td>
-								</tr>
-							{/each}
-							{#if moreRefs}
-								<tr class="child-row">
-									<td class="tree-branch">
-										<span class="tree-toggle leaf"></span>
-										<button
-											class="secondary"
-											onclick={() => onloadmorereferrers(m.digest)}
-											disabled={loadingReferrers === m.digest}
-										>
-											Load more referrers
-										</button>
-									</td>
-									<td></td>
-									<td></td>
-									<td></td>
-								</tr>
-							{/if}
+						{/if}
+						{@const moreRefs = childReferrersNext.has(m.digest)}
+						{#each refs as ref, ridx}
+							{@const isLastRef = ridx === refs.length - 1 && !moreRefs}
+							<tr class="child-row clickable" onclick={(e) => handleRowClick(e, ref.digest)}>
+								<td class="tree-branch" class:has-next={!isLastRef}>
+									<span class="tree-toggle leaf"></span>
+									<DigestLink digest={ref.digest} href={manifestUrl(path, ref.digest)} />
+								</td>
+								<td class="nowrap">
+									<AttestationBadge type={getAttestationType(ref)} />
+									<ScanSummary annotations={ref.annotations} compact />
+								</td>
+								<td></td>
+								<td></td>
+							</tr>
 						{/each}
-					</tbody>
-				</table>
-			</Card>
-		{/if}
+						{#if moreRefs}
+							<tr class="child-row">
+								<td class="tree-branch">
+									<span class="tree-toggle leaf"></span>
+									<button
+										class="secondary"
+										onclick={() => onloadmorereferrers(m.digest)}
+										disabled={loadingReferrers === m.digest}
+									>
+										Load more referrers
+									</button>
+								</td>
+								<td></td>
+								<td></td>
+								<td></td>
+							</tr>
+						{/if}
+					{/each}
+				</tbody>
+			</table>
+		</Card>
 	{/if}
 
-	{#if digest && (childReferrers.get(digest) ?? []).length > 0}
-		{@const ownReferrers = childReferrers.get(digest) ?? []}
+	{#if ownReferrers.length > 0}
 		<Card title="Referrers" count={ownReferrers.length}>
 			<table>
 				<thead>
@@ -477,7 +467,7 @@
 	<!-- Keyed on the reference so navigating to another manifest drops the
 	     history fetched for the previous one. -->
 	{#key reference}
-		<PullHistory namespace={path} target={reference} open />
+		<PullHistory namespace={path} target={reference} />
 	{/key}
 {:else if current === 'vulnerabilities'}
 	<VulnTab namespace={path} {reports} platform={rest} ownManifest={isReport ? manifest : null} ownDigest={digest} />

@@ -1,8 +1,6 @@
 use std::error::Error as StdError;
 use std::{fmt, io};
 
-use crate::circuit_breaker::CircuitBreakerError;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     Configuration(String),
@@ -40,27 +38,15 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<CircuitBreakerError> for Error {
-    fn from(err: CircuitBreakerError) -> Self {
-        Error::Io(err.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_from_io_error_not_found() {
-        let io_err = io::Error::new(io::ErrorKind::NotFound, "missing file");
-        let err: Error = io_err.into();
-        assert!(matches!(err, Error::NotFound(_)));
-    }
-
-    #[test]
-    fn test_from_io_error_other() {
-        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
-        let err: Error = io_err.into();
-        assert!(matches!(err, Error::Io(_)));
+    fn test_from_io_error_keeps_not_found_apart() {
+        let missing: Error = io::Error::new(io::ErrorKind::NotFound, "missing").into();
+        assert!(matches!(missing, Error::NotFound(_)));
+        let denied: Error = io::Error::new(io::ErrorKind::PermissionDenied, "denied").into();
+        assert!(matches!(denied, Error::Io(_)));
     }
 }

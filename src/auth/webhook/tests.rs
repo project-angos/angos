@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use http::Method;
 use http::request::Builder;
+use reqwest::Client;
 use reqwest::redirect::Policy;
 use url::Url;
 use wiremock::matchers::{header, method};
@@ -17,42 +18,37 @@ use crate::auth::webhook::headers::{build_header_value, build_headers};
 use crate::auth::webhook::{Config, WebhookAuthorizer};
 use crate::identity::{Action, ClientIdentity};
 use crate::test_fixtures::requests::parts_with_uri;
-use angos_mtls_client::{ClientTls, MtlsClientBuilder};
+use angos_mtls_client::{ClientTls, build_client};
 use angos_secret::Secret;
 
+/// `cache_ttl` configured a decision cache that is gone; a configuration
+/// carrying it must keep loading, like every other key of a removed subsystem.
 #[test]
-fn test_config_deserialize() {
-    let valid_config = r#"
+fn config_parses_auth_and_ignores_cache_ttl() {
+    let config: Config = toml::from_str(
+        r#"
         url = "https://example.com"
         timeout_ms = 1000
         basic_auth = { username = "user", password = "pass" }
-    "#;
-
-    let config: Config = toml::from_str(valid_config).unwrap();
-
-    assert_eq!(config.url.as_str(), "https://example.com/");
-    assert_eq!(config.timeout_ms, 1000);
+        cache_ttl = 60
+    "#,
+    )
+    .unwrap();
     assert!(
         matches!(config.auth, Some(WebhookAuth::BasicAuth { username, password }) if username == "user" && password.expose() == "pass")
     );
-    assert_eq!(config.tls, ClientTls::default());
-    assert!(config.forward_headers.is_empty());
 
-    let valid_config = r#"
+    let config: Config = toml::from_str(
+        r#"
         url = "https://example.com"
         timeout_ms = 1000
         bearer_token = "hello-token"
-    "#;
-
-    let config: Config = toml::from_str(valid_config).unwrap();
-
-    assert_eq!(config.url.as_str(), "https://example.com/");
-    assert_eq!(config.timeout_ms, 1000);
+    "#,
+    )
+    .unwrap();
     assert!(
         matches!(config.auth, Some(WebhookAuth::BearerToken(token)) if token.expose() == "hello-token")
     );
-    assert_eq!(config.tls, ClientTls::default());
-    assert!(config.forward_headers.is_empty());
 }
 
 #[test]
@@ -189,223 +185,95 @@ fn test_build_headers_optional_and_multi_valued_fields() {
     assert_eq!(orgs, ["org1", "org2"]);
 }
 
-fn build_test_config(url: Url) -> Config {
-    Config {
-        url,
-        timeout_ms: 1000,
-        auth: Some(WebhookAuth::BearerToken(Secret::new("token".to_string()))),
-        tls: ClientTls::default(),
-        forward_headers: vec![ForwardHeader::try_from("X-Custom-Header".to_string()).unwrap()],
-    }
-}
-
-fn build_test_webhook(config: Config) -> WebhookAuthorizer {
+fn build_test_webhook(url: &str, auth: Option<WebhookAuth>) -> WebhookAuthorizer {
     initialize_metrics();
-    let client = MtlsClientBuilder::new()
-        .with_redirect_policy(Policy::none())
-        .with_timeout(Duration::from_millis(config.timeout_ms))
-        .build()
-        .unwrap();
+    let config = Config {
+        url: Url::parse(url).unwrap(),
+        timeout_ms: 1000,
+        auth,
+        tls: ClientTls::default(),
+        forward_headers: Vec::new(),
+    };
+    let client = build_client(
+        Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_millis(config.timeout_ms)),
+        &config.tls,
+    )
+    .unwrap();
     WebhookAuthorizer::new("test".to_string(), config, client)
 }
 
 #[tokio::test]
-async fn test_authorize_success() {
-    let mock_server = MockServer::start().await;
+async fn the_request_carries_the_configured_credential_and_context_headers() {
+    for (auth, authorization) in [
+        (
+            WebhookAuth::BearerToken(Secret::new("test-token".to_string())),
+            "Bearer test-token",
+        ),
+        (
+            WebhookAuth::BasicAuth {
+                username: "testuser".to_string(),
+                password: Secret::new("testpass".to_string()),
+            },
+            "Basic dGVzdHVzZXI6dGVzdHBhc3M=",
+        ),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("Authorization", authorization))
+            .and(header("X-Forwarded-Method", "GET"))
+            .and(header("X-Registry-Action", "get-api-version"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
-    config.auth = None;
-
-    let webhook = build_test_webhook(config);
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
+        let webhook = build_test_webhook(&mock_server.uri(), Some(auth));
+        let parts = parts_with_uri("https://example.com/v2/");
+        let allowed = webhook
+            .authorize(&Action::ApiVersion, &ClientIdentity::new(None), &parts)
+            .await;
+        assert!(allowed.unwrap(), "{authorization}");
+    }
 }
 
+/// 2xx allows, 401/403 are decisions the webhook made, and any other status is
+/// an unavailable webhook, which fails closed with an error.
 #[tokio::test]
-async fn test_authorize_with_bearer_token() {
-    let mock_server = MockServer::start().await;
+async fn the_status_decides_the_outcome() {
+    for (status, expected) in [
+        (200, Some(true)),
+        (401, Some(false)),
+        (403, Some(false)),
+        (404, None),
+        (500, None),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
 
-    Mock::given(method("GET"))
-        .and(header("Authorization", "Bearer test-token"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
-    config.auth = Some(WebhookAuth::BearerToken(Secret::new(
-        "test-token".to_string(),
-    )));
-
-    let webhook = build_test_webhook(config);
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
-}
-
-#[tokio::test]
-async fn test_authorize_with_basic_auth() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
-    config.auth = Some(WebhookAuth::BasicAuth {
-        username: "testuser".to_string(),
-        password: Secret::new("testpass".to_string()),
-    });
-
-    let webhook = build_test_webhook(config);
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
-}
-
-#[tokio::test]
-async fn test_authorize_sends_correct_headers() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(header("X-Forwarded-Method", "GET"))
-        .and(header("X-Registry-Action", "get-api-version"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
-    let webhook = build_test_webhook(config);
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
-    let request = Builder::new()
-        .method(Method::GET)
-        .uri("https://example.com/v2/")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    assert!(webhook.authorize(&action, &identity, &parts).await.unwrap());
+        let webhook = build_test_webhook(&mock_server.uri(), None);
+        let parts = parts_with_uri("https://example.com/v2/");
+        let result = webhook
+            .authorize(&Action::ApiVersion, &ClientIdentity::new(None), &parts)
+            .await;
+        assert_eq!(result.ok(), expected, "status {status}");
+    }
 }
 
 #[tokio::test]
 async fn test_authorize_returns_err_on_unreachable_url() {
-    let mut config = build_test_config(Url::parse("http://127.0.0.1:1").unwrap());
-    config.auth = None;
-
-    let webhook = build_test_webhook(config);
-
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-
+    let webhook = build_test_webhook("http://127.0.0.1:1", None);
     let parts = parts_with_uri("https://example.com/v2/");
 
-    let result = webhook.authorize(&action, &identity, &parts).await;
-    let err = result.expect_err("unreachable URL must produce Err, not Ok(false)");
-    let msg = err.to_string();
+    let err = webhook
+        .authorize(&Action::ApiVersion, &ClientIdentity::new(None), &parts)
+        .await
+        .expect_err("unreachable URL must produce Err, not Ok(false)");
     assert!(
-        msg.contains("unreachable"),
-        "transport-failure error must mention unreachability so it is distinguishable from explicit deny in logs: {msg}"
+        err.to_string().contains("unreachable"),
+        "a transport failure must read differently from an unavailable status: {err}"
     );
-}
-
-fn build_webhook_against(mock_server: &MockServer) -> WebhookAuthorizer {
-    let mut config = build_test_config(Url::parse(&mock_server.uri()).unwrap());
-    config.auth = None;
-    build_test_webhook(config)
-}
-
-// 401/403 are decisions the webhook made: Ok(false), not Err.
-async fn assert_explicit_deny(status: u16) {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(status))
-        .mount(&mock_server)
-        .await;
-
-    let webhook = build_webhook_against(&mock_server);
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(
-        !webhook.authorize(&action, &identity, &parts).await.unwrap(),
-        "status {status} must be an explicit deny"
-    );
-}
-
-// Any other status is an unavailable webhook: Err, not Ok(false).
-async fn assert_unavailable_fails_closed(status: u16) {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(status))
-        .mount(&mock_server)
-        .await;
-
-    let webhook = build_webhook_against(&mock_server);
-    let action = Action::ApiVersion;
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("https://example.com/v2/");
-
-    assert!(
-        webhook.authorize(&action, &identity, &parts).await.is_err(),
-        "status {status} must return Err, not Ok(false)"
-    );
-}
-
-#[tokio::test]
-async fn test_authorize_403_is_explicit_deny() {
-    assert_explicit_deny(403).await;
-}
-
-#[tokio::test]
-async fn test_authorize_401_is_explicit_deny() {
-    assert_explicit_deny(401).await;
-}
-
-#[tokio::test]
-async fn test_authorize_500_is_unavailable() {
-    assert_unavailable_fails_closed(500).await;
-}
-
-#[tokio::test]
-async fn test_authorize_404_is_unavailable() {
-    assert_unavailable_fails_closed(404).await;
-}
-
-/// `cache_ttl` configured a decision cache that is gone; a configuration
-/// carrying it must keep loading, like every other key of a removed subsystem.
-#[test]
-fn cache_ttl_parses_and_is_ignored() {
-    let config: Config = toml::from_str(
-        r#"
-        url = "https://example.com"
-        timeout_ms = 1000
-        bearer_token = "hello-token"
-        cache_ttl = 60
-    "#,
-    )
-    .expect("a configuration carrying cache_ttl must still load");
-    assert_eq!(config.timeout_ms, 1000);
 }

@@ -21,28 +21,25 @@ const SNAPSHOT_CONCURRENCY: usize = 32;
 /// opens a real multipart with no staged remainder left behind.
 const MULTIPART_SEED_BYTES: usize = 5 * 1024 * 1024;
 
-/// A ground-truth store snapshot: one `key -> sha256(content)` entry per
-/// object. Gates diff snapshots byte-level instead of trusting scrub's own
-/// accounting.
+/// `key -> sha256(content)` for every object.
 pub type Snapshot = BTreeMap<String, String>;
 
-/// Direct byte-level access to the object store under test, fs or s3,
-/// bypassing the registry API entirely.
+/// Direct byte-level access to the object store under test, bypassing the
+/// registry API.
 pub struct GateStore {
-    store: Arc<dyn ObjectStore>,
-    s3: bool,
+    pub objects: Arc<dyn ObjectStore>,
+    /// The multipart gates are skipped on fs, which has no multipart protocol.
+    pub is_s3: bool,
 }
 
 impl GateStore {
-    /// Construct from the environment contract: `GATE_MODE=fs` with
-    /// `GATE_DATA_ROOT`, or `GATE_MODE=s3` with `GATE_ENDPOINT` and
-    /// `GATE_BUCKET` (credentials default to the CI rustfs ones).
+    /// S3 credentials default to the CI rustfs ones.
     pub fn from_env() -> GateResult<Self> {
         let mode = require_env("GATE_MODE")?;
-        let store: Arc<dyn ObjectStore> = match mode.as_str() {
+        let objects: Arc<dyn ObjectStore> = match mode.as_str() {
             "fs" => {
                 let root = require_env("GATE_DATA_ROOT")?;
-                Arc::new(FsBackend::builder(Path::new(&root)).build())
+                Arc::new(FsBackend::new(Path::new(&root), false))
             }
             "s3" => {
                 let config = BackendConfig {
@@ -66,58 +63,32 @@ impl GateStore {
             }
         };
         Ok(Self {
-            store,
-            s3: mode == "s3",
+            objects,
+            is_s3: mode == "s3",
         })
     }
 
-    /// Whether the store under test speaks a multipart protocol (s3); the
-    /// multipart gates are skipped on fs, which has none.
-    pub fn is_s3(&self) -> bool {
-        self.s3
-    }
-
-    /// Whether an object exists at `key` (a directory placeholder on fs also
-    /// counts: a hollow container surviving a repair is itself a defect).
+    /// A directory placeholder on fs counts: a hollow container surviving a
+    /// repair is itself a defect.
     pub async fn exists(&self, key: &str) -> GateResult<bool> {
-        match self.store.head(key).await {
+        match self.objects.head(key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// The object's bytes, or `None` if it does not exist.
     pub async fn body(&self, key: &str) -> GateResult<Option<Vec<u8>>> {
-        match self.store.get(key).await {
+        match self.objects.get(key).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(StorageError::NotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Write raw bytes at `key`, creating or replacing the object.
-    pub async fn put(&self, key: &str, body: &[u8]) -> GateResult<()> {
-        self.store.put(key, Bytes::copy_from_slice(body)).await?;
-        Ok(())
-    }
-
-    /// Delete the object at `key`; a missing key counts as success.
-    pub async fn delete(&self, key: &str) -> GateResult<()> {
-        self.store.delete(key).await?;
-        Ok(())
-    }
-
-    /// Delete every object under the directory `prefix`.
-    pub async fn delete_prefix(&self, prefix: &str) -> GateResult<()> {
-        self.store.delete_prefix(prefix).await?;
-        Ok(())
-    }
-
-    /// Every key under `prefix`, across pages.
     pub async fn keys_under(&self, prefix: &str) -> GateResult<Vec<String>> {
         paginated(|token| async move {
-            Ok::<_, GateError>(self.store.list(prefix, LIST_PAGE_SIZE, token).await?)
+            Ok::<_, GateError>(self.objects.list(prefix, LIST_PAGE_SIZE, token).await?)
         })
         .try_collect()
         .await
@@ -129,26 +100,20 @@ impl GateStore {
     pub async fn seed_orphan_multipart(&self, key: &str) -> GateResult<()> {
         let body = Bytes::from(vec![0u8; MULTIPART_SEED_BYTES]);
         let len = body.len() as u64;
-        self.store
+        self.objects
             .write_upload(key, Box::pin(stream::once(async { Ok(body) })), Some(len))
             .await?;
         Ok(())
     }
 
-    /// Discard the upload at `key` and all backend state it owns.
-    pub async fn abort_upload(&self, key: &str) -> GateResult<()> {
-        self.store.abort_upload(key).await?;
-        Ok(())
-    }
-
-    /// Count of in-flight multipart uploads store-wide (always 0 on fs).
+    /// In-flight multipart uploads store-wide, always 0 on fs.
     pub async fn multipart_count(&self) -> GateResult<usize> {
         let mut count = 0;
         let mut key_marker: Option<String> = None;
         let mut id_marker: Option<String> = None;
         loop {
             let page = self
-                .store
+                .objects
                 .list_multipart_uploads(key_marker.as_deref(), id_marker.as_deref())
                 .await?;
             count += page.uploads.len();
@@ -161,15 +126,13 @@ impl GateStore {
         Ok(count)
     }
 
-    /// Hash every object in the store. Content is re-read and re-hashed on
-    /// every call so the snapshot trusts nothing cached; keys stream off the
-    /// listing straight into up to `SNAPSHOT_CONCURRENCY` concurrent reads.
+    /// Re-reads and re-hashes every object, trusting nothing cached.
     pub async fn snapshot(&self) -> GateResult<Snapshot> {
         paginated(|token| async move {
-            Ok::<_, GateError>(self.store.list("", LIST_PAGE_SIZE, token).await?)
+            Ok::<_, GateError>(self.objects.list("", LIST_PAGE_SIZE, token).await?)
         })
         .map_ok(|key| {
-            let store = Arc::clone(&self.store);
+            let store = Arc::clone(&self.objects);
             async move {
                 let body = store.get(&key).await?;
                 Ok((key, sha256_hex(&body)))
@@ -193,11 +156,10 @@ pub fn snapshot_diff(a: &Snapshot, b: &Snapshot) -> Vec<String> {
         .collect();
     diff.extend(b.keys().filter(|key| !a.contains_key(*key)).cloned());
     diff.sort();
-    diff.dedup();
     diff
 }
 
-/// Persist a snapshot as sorted `key<TAB>hash` lines for failure forensics.
+/// Sorted `key<TAB>hash` lines, for failure forensics.
 pub fn write_snapshot(path: &Path, snap: &Snapshot) -> GateResult<()> {
     let out = snap
         .iter()
@@ -208,11 +170,8 @@ pub fn write_snapshot(path: &Path, snap: &Snapshot) -> GateResult<()> {
     Ok(())
 }
 
-/// Hex-encoded sha256 of `data`, the digest form the OCI API uses.
 pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    hex::encode(Sha256::digest(data))
 }
 
 fn require_env(name: &str) -> GateResult<String> {

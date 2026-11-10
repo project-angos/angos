@@ -1,6 +1,5 @@
 <script lang="ts">
-	import type { Descriptor, LayerEntry, LayerListing } from '#lib/api.js';
-	import { fetchLayerEntries } from '#lib/api.js';
+	import { fetchLayerEntries, type Descriptor, type LayerEntry, type LayerListing } from '#lib/api.js';
 	import { goto } from '$app/navigation';
 	import { tick, untrack } from 'svelte';
 	import {
@@ -21,13 +20,11 @@
 		secretKinds,
 		sortedChildren,
 		type FsMatcher,
-		type FsNode,
-		type FsTree
+		type FsNode
 	} from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FsIcon from './FsIcon.svelte';
-	import FsRow from './FsRow.svelte';
 	import LoadingState from './LoadingState.svelte';
 	import ErrorState from './ErrorState.svelte';
 
@@ -113,7 +110,7 @@
 		return () => clearTimeout(timer);
 	});
 
-	const tree = $derived.by((): FsTree | null =>
+	const tree = $derived(
 		listings.length === layers.length && listings.every(Boolean)
 			? mergeLayers(listings as LayerListing[])
 			: null
@@ -293,11 +290,6 @@
 		goto(`#filesystem/${encoded}${layer === null ? '' : `@L${layer + 1}`}`, { reset: false });
 	}
 
-	function open(node: FsNode) {
-		cursor = node;
-		show(node.path, inTree(node) ? null : node.layer);
-	}
-
 	function close() {
 		goto('#filesystem', { reset: false });
 	}
@@ -305,7 +297,7 @@
 	/** What a click or Enter does: a folder opens in place, or in the tree from a list, anything else in the preview. */
 	function activate(node: FsNode) {
 		cursor = node;
-		if (node.kind !== 'dir') open(node);
+		if (node.kind !== 'dir') show(node.path, inTree(node) ? null : node.layer);
 		else if (view === 'icons') cwd = node.path;
 		else if (view === 'tree') toggle(node.path);
 		else {
@@ -376,6 +368,16 @@
 		else if (pane?.contains(e.target as Node)) navigate(e);
 	}}
 />
+
+{#snippet pathButton(node: FsNode, label: string)}
+	<button
+		type="button"
+		tabindex={fsSame(node, rover) ? 0 : -1}
+		class="link fs-path"
+		class:cursor={fsSame(node, rover)}
+		onclick={() => activate(node)}>{label}</button
+	>
+{/snippet}
 
 <Card title="Filesystem" count={tree ? total : undefined}>
 	{#if error}
@@ -448,19 +450,32 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each rows.slice(0, TREE_ROWS) as row (row.node.path)}
-								<FsRow
-									{...row}
-									{matcher}
-									selected={inTree(target) ? (target?.path ?? null) : null}
-									cursor={rover?.path ?? null}
-									ontoggle={(path) => {
-										cursor = fsNodeAt(tree.root, path);
-										toggle(path);
-									}}
-									onopen={activate}
-									{layerlabel}
-								/>
+							{#each rows.slice(0, TREE_ROWS) as { node, depth, guides, hasNext, open } (node.path)}
+								<tr
+									class="clickable"
+									class:dim={filtering && !fsMatches(matcher, node)}
+									class:selected={inTree(target) && target?.path === node.path}
+									class:cursor={rover?.path === node.path}
+									tabindex={rover?.path === node.path ? 0 : -1}
+									onclick={() => activate(node)}
+								>
+									<td class="fs-name" style="--depth: {depth}" title={node.path}>
+										{#each guides as guide, i}
+											{#if guide}<span class="fs-guide" style="--col: {i}"></span>{/if}
+										{/each}
+										{#if depth > 0}<span class="fs-elbow" class:last={!hasNext} style="--col: {depth - 1}"></span>{/if}
+										{#if open && node.children.size > 0}<span class="fs-spine" style="--col: {depth}"></span>{/if}
+										<FsIcon kind={node.kind} {open} />
+										<span class="fs-label">{node.name}</span>
+										{#if node.entry?.link}<span class="fs-link">→ {node.entry.link}</span>{/if}
+									</td>
+									<td class="nowrap fs-extra">{node.kind === 'file' ? formatSize(node.entry?.size ?? 0) : ''}</td>
+									<td class="mono fs-extra">{node.entry ? formatMode(node.entry.mode) : ''}</td>
+									<td class="nowrap fs-extra">
+										{node.entry ? new Date(node.entry.mtime * 1000).toISOString().slice(0, 10) : ''}
+									</td>
+									<td><span class="badge">{layerlabel(node.layer)}</span></td>
+								</tr>
 							{/each}
 							{#if rows.length > TREE_ROWS}
 								<tr>
@@ -529,13 +544,7 @@
 							{#each secrets as node (`${node.layer}:${node.path}`)}
 								<tr class:selected={fsSame(node, file)}>
 									<td>
-										<button
-											type="button"
-											tabindex={fsSame(node, rover) ? 0 : -1}
-											class="link fs-path"
-											class:cursor={fsSame(node, rover)}
-											onclick={() => activate(node)}>{node.path}</button
-										>
+										{@render pathButton(node, node.path)}
 										{#if !inTree(node)}<span class="badge" title="Gone from the image, still in its layer">removed</span>{/if}
 									</td>
 									<td>
@@ -566,13 +575,7 @@
 							{#each risky as { node, risks } (node.path)}
 								<tr class:selected={fsSame(node, file)}>
 									<td>
-										<button
-											type="button"
-											tabindex={fsSame(node, rover) ? 0 : -1}
-											class="link fs-path"
-											class:cursor={fsSame(node, rover)}
-											onclick={() => activate(node)}>{node.path}{node.kind === 'dir' ? '/' : ''}</button
-										>
+										{@render pathButton(node, node.kind === 'dir' ? `${node.path}/` : node.path)}
 									</td>
 									<td>
 										{#each risks as risk}
@@ -634,15 +637,7 @@
 								{#each tree.wasted.slice(0, WASTE_ROWS) as waste}
 									<tr class:selected={fsSame(waste.node, file)}>
 										<td>
-											<button
-												type="button"
-												tabindex={fsSame(waste.node, rover) ? 0 : -1}
-												class="link fs-path"
-												class:cursor={fsSame(waste.node, rover)}
-												onclick={() => activate(waste.node)}
-											>
-												{waste.node.path}
-											</button>
+											{@render pathButton(waste.node, waste.node.path)}
 										</td>
 										<td><span class="badge waste-{waste.change}">{waste.change}</span></td>
 										<td class="nowrap">
@@ -679,15 +674,7 @@
 										<td>
 											{#each duplicate.nodes as node}
 												<div class="waste-copy">
-													<button
-														type="button"
-														tabindex={fsSame(node, rover) ? 0 : -1}
-														class="link fs-path"
-														class:cursor={fsSame(node, rover)}
-														onclick={() => activate(node)}
-													>
-														{node.path}
-													</button>
+													{@render pathButton(node, node.path)}
 													<span class="badge">{layerlabel(node.layer)}</span>
 												</div>
 											{/each}
@@ -726,3 +713,9 @@
 		</div>
 	{/if}
 </Card>
+
+<style>
+	tr.dim {
+		color: var(--muted);
+	}
+</style>

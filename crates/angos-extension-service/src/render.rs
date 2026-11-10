@@ -1,5 +1,3 @@
-//! Spec-correct hyper rendering for the `_angos/` responses, behind `hyper`.
-
 use http::header::{
     CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, VARY,
 };
@@ -17,14 +15,9 @@ use crate::{
 
 type Rendered = Result<Response<ResponseBody>, RenderError>;
 
-/// `200 OK` JSON of a plain info body.
 macro_rules! json_body {
     ($($ty:ty),+ $(,)?) => {$(
         impl $ty {
-            /// `200 OK` with this body as JSON.
-            ///
-            /// # Errors
-            /// Fails when the body cannot be serialized.
             pub fn into_response(self) -> Rendered {
                 json_response(StatusCode::OK, &self)
             }
@@ -42,37 +35,24 @@ json_body!(
 );
 
 impl JobsBody {
-    /// `200 OK` JSON, with a `Link` to the next page when the listing has more.
-    ///
-    /// # Errors
-    /// Fails when the body cannot be serialized or a header value built.
     pub fn into_response(self) -> Rendered {
         paginated_json(&self, self.next.as_deref())
     }
 }
 
 impl FailedJobsBody {
-    /// `200 OK` JSON, with a `Link` to the next page when the listing has more.
-    ///
-    /// # Errors
-    /// Fails when the body cannot be serialized or a header value built.
     pub fn into_response(self) -> Rendered {
         paginated_json(&self, self.next.as_deref())
     }
 }
 
 impl LayerEntries {
-    /// `200 OK` with the listing, marked `Content-Encoding: gzip` when it is
-    /// gzipped, or `202 Accepted` while the layer is still being indexed.
-    ///
-    /// # Errors
-    /// Fails when the response cannot be built.
     pub fn into_response(self) -> Rendered {
         match self {
             LayerEntries::Indexing => Ok(build_response(
                 StatusCode::ACCEPTED,
                 HeaderMap::new(),
-                ResponseBody::empty(),
+                ResponseBody::Empty,
             )?),
             LayerEntries::Ready { body, gzip } => {
                 let mut headers = json_headers();
@@ -91,13 +71,6 @@ impl LayerEntries {
 }
 
 impl<R: AsyncRead + Send + 'static> LayerFile<R> {
-    /// `200 OK` streaming the file, or `206 Partial Content` the range asked
-    /// for, with its `Content-Type` and byte `Content-Length`, sandboxed, plus a
-    /// `Content-Disposition: attachment` when a download was asked for.
-    /// `frame_size` is the streamed read-buffer size.
-    ///
-    /// # Errors
-    /// Fails when a header value cannot be built.
     pub fn into_response(self, frame_size: usize) -> Rendered {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::try_from(self.content_type)?);

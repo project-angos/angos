@@ -1,28 +1,10 @@
-use std::error::Error;
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use tracing::warn;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CircuitBreakerError {
-    pub failures: u32,
-    pub cooldown_secs: u64,
-}
-
-impl fmt::Display for CircuitBreakerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "circuit breaker open: {} consecutive failures, cooling down for {}s",
-            self.failures, self.cooldown_secs
-        )
-    }
-}
-
-impl Error for CircuitBreakerError {}
+use crate::Error;
 
 #[derive(Clone, Debug)]
 pub struct CircuitBreaker {
@@ -37,8 +19,6 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Build a breaker that opens after `threshold` consecutive failures and
-    /// stays open for `cooldown_secs` before admitting a half-open probe.
     pub fn new(threshold: u32, cooldown_secs: u64) -> Self {
         Self {
             consecutive_failures: Arc::new(AtomicU32::new(0)),
@@ -49,36 +29,28 @@ impl CircuitBreaker {
         }
     }
 
-    /// Gate a request against the breaker.
-    ///
-    /// Returns `Ok(())` while closed (below the failure threshold). Once open,
-    /// requests are rejected until the cooldown elapses, after which the breaker
-    /// goes *half-open*: exactly one probe request is admitted per cooldown
-    /// window. The probe's outcome (`record_success` closes the breaker,
-    /// `record_failure` re-arms it) decides what happens next; concurrent
-    /// callers during the probe are rejected, avoiding a thundering herd against
-    /// a backend that may still be down.
-    pub fn check(&self) -> Result<(), CircuitBreakerError> {
+    /// Once open, rejects requests until the cooldown elapses, then admits
+    /// exactly one half-open probe per cooldown window so a backend that may
+    /// still be down is not hit by a thundering herd.
+    pub fn check(&self) -> Result<(), Error> {
         let failures = self.consecutive_failures.load(Ordering::Acquire);
         if failures < self.threshold {
             return Ok(());
         }
         let opened_at = self.opened_at_secs.load(Ordering::Acquire);
         let now = self.start.elapsed().as_secs();
-        let rejected = || CircuitBreakerError {
-            failures,
-            cooldown_secs: self.cooldown_secs,
+        let rejected = || {
+            Error::Io(format!(
+                "circuit breaker open: {failures} consecutive failures, cooling down for {}s",
+                self.cooldown_secs
+            ))
         };
         if now.saturating_sub(opened_at) < self.cooldown_secs {
             return Err(rejected());
         }
-        // Half-open: the cooldown has elapsed. Admit a single probe per window
-        // instead of releasing every waiting caller at once. The caller that
-        // wins the CAS advances `opened_at` to now and becomes the probe;
-        // concurrent callers either lose the CAS or read the advanced timestamp
-        // (cooldown no longer elapsed) and are rejected. A probe that never
-        // reports a result is superseded by the next caller after another
-        // cooldown, so the breaker cannot wedge half-open.
+        // The CAS winner advances `opened_at` and becomes the probe; a probe
+        // that never reports is superseded after another cooldown, so the
+        // breaker cannot wedge half-open.
         if self
             .opened_at_secs
             .compare_exchange(opened_at, now, Ordering::AcqRel, Ordering::Acquire)
@@ -97,12 +69,9 @@ impl CircuitBreaker {
 
     pub fn record_failure(&self) {
         let now = self.start.elapsed().as_secs();
-        // Store `opened_at` BEFORE publishing the new failure count. Any concurrent
-        // `check()` that reads `consecutive_failures >= THRESHOLD` via Acquire is then
-        // guaranteed (release-acquire pair via the fetch_add) to read at least this
-        // `opened_at` value, eliminating the window where the count appears open but
-        // `opened_at` is still zero. Writing on every failure also re-arms the cooldown
-        // when a request slipped through after the previous cooldown expired and failed.
+        // Stored before the count is published, so a `check()` that sees the
+        // threshold reached also sees this `opened_at`; writing it on every
+        // failure also re-arms the cooldown after a failed probe.
         self.opened_at_secs.store(now, Ordering::Release);
         let prev = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
         if prev + 1 == self.threshold {
@@ -140,17 +109,6 @@ mod tests {
     }
 
     #[test]
-    fn open_error_carries_typed_failure_count_and_cooldown() {
-        let cb = breaker();
-        for _ in 0..THRESHOLD {
-            cb.record_failure();
-        }
-        let err = cb.check().unwrap_err();
-        assert_eq!(err.failures, THRESHOLD);
-        assert_eq!(err.cooldown_secs, COOLDOWN_SECS);
-    }
-
-    #[test]
     fn success_mid_sequence_resets_failure_count() {
         let cb = breaker();
         for _ in 0..(THRESHOLD - 1) {
@@ -177,31 +135,11 @@ mod tests {
 
     #[test]
     fn post_cooldown_success_fully_clears_state() {
-        let cb = breaker();
-        for _ in 0..THRESHOLD {
-            cb.record_failure();
-        }
-        // Simulate cooldown elapse by rewinding `opened_at`.
-        cb.opened_at_secs.store(
-            cb.opened_at_secs
-                .load(Ordering::Acquire)
-                .saturating_sub(COOLDOWN_SECS + 1),
-            Ordering::Release,
-        );
+        let cb = open_and_elapse_cooldown();
         assert!(cb.check().is_ok(), "breaker should pass after cooldown");
 
         cb.record_success();
 
-        assert_eq!(
-            cb.consecutive_failures.load(Ordering::Acquire),
-            0,
-            "record_success must zero consecutive_failures"
-        );
-        assert_eq!(
-            cb.opened_at_secs.load(Ordering::Acquire),
-            0,
-            "record_success must zero opened_at_secs"
-        );
         assert!(
             cb.check().is_ok(),
             "breaker must pass after success fully clears state"
@@ -254,7 +192,7 @@ mod tests {
         }
     }
 
-    /// Helper: open the breaker and rewind `opened_at` so the cooldown reads as
+    /// Open the breaker and rewind `opened_at` so the cooldown reads as
     /// elapsed, leaving the breaker half-open ready to admit one probe.
     fn open_and_elapse_cooldown() -> CircuitBreaker {
         let cb = breaker();

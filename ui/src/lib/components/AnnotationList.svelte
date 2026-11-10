@@ -9,28 +9,24 @@
 	let { annotations, format = 'rows' }: Props = $props();
 </script>
 
-{#if format === 'rows'}
-	{#each Object.entries(annotations) as [key, value]}
+{#snippet text(value: string)}
+	{#if isUrl(value)}
+		<a href={value} target="_blank" rel="noopener">{value}</a>
+	{:else}
+		{value}
+	{/if}
+{/snippet}
+
+{#each Object.entries(annotations) as [key, value]}
+	{#if format === 'rows'}
 		<tr class="annotations-row">
 			<td class="label">{getAnnotationLabel(key)}</td>
-			<td>
-				{#if isUrl(value)}
-					<a href={value} target="_blank" rel="noopener">{value}</a>
-				{:else}
-					{value}
-				{/if}
-			</td>
+			<td>{@render text(value)}</td>
 		</tr>
-	{/each}
-{:else}
-	{#each Object.entries(annotations) as [key, value]}
+	{:else}
 		<span class="annotation">
 			<span class="annotation-key">{getAnnotationLabel(key)}:</span>
-			{#if isUrl(value)}
-				<a href={value} target="_blank" rel="noopener">{value}</a>
-			{:else}
-				{value}
-			{/if}
+			{@render text(value)}
 		</span>
-	{/each}
-{/if}
+	{/if}
+{/each}

@@ -48,7 +48,7 @@ export interface ManifestEntry {
 	last_pulled_at?: string;
 }
 
-export interface PullEntry {
+interface PullEntry {
 	client: string;
 	/** Absent on pulls recorded before the address was. */
 	client_ip?: string;
@@ -70,7 +70,7 @@ export interface PullHistory {
 	next?: number;
 }
 
-export interface ReferrersPage {
+interface ReferrersPage {
 	referrers: ReferrerInfo[];
 	next?: string;
 }
@@ -87,7 +87,6 @@ export type RevisionSort = 'tag' | 'digest';
 /** Rows the UI asks a listing for at a time. */
 export const PAGE = 150;
 
-/** A listing's `total` rows across every page, and where the next page starts. */
 interface Paged {
 	total: number;
 	next?: number;
@@ -102,7 +101,7 @@ export interface RepositoryInfo {
 }
 
 /** The counts are absent when the registry is configured not to compute them. */
-export interface NamespaceInfo {
+interface NamespaceInfo {
 	name: string;
 	tag_count?: number;
 	manifest_count?: number;
@@ -166,7 +165,7 @@ export interface FailedJobsResponse {
 	next?: string;
 }
 
-export type JobState = 'pending' | 'failed';
+type JobState = 'pending' | 'failed';
 
 export type JobQueue = 'cache' | 'replication' | 'scan' | 'index';
 export const JOB_QUEUES: JobQueue[] = ['cache', 'replication', 'scan', 'index'];
@@ -212,27 +211,12 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<FetchRe
 	}
 }
 
-async function deleteResource(url: string): Promise<string | null> {
+async function send(url: string, method: 'DELETE' | 'POST'): Promise<string | null> {
 	try {
-		const response = await authedFetch(url, { method: 'DELETE' });
-		if (!response.ok) {
-			return `HTTP ${response.status}`;
-		}
-		return null;
+		const response = await authedFetch(url, { method });
+		return response.ok ? null : `HTTP ${response.status}`;
 	} catch (e) {
-		return e instanceof Error ? e.message : 'Delete failed';
-	}
-}
-
-async function postAction(url: string): Promise<string | null> {
-	try {
-		const response = await authedFetch(url, { method: 'POST' });
-		if (!response.ok) {
-			return `HTTP ${response.status}`;
-		}
-		return null;
-	} catch (e) {
-		return e instanceof Error ? e.message : 'Request failed';
+		return e instanceof Error ? e.message : method === 'DELETE' ? 'Delete failed' : 'Request failed';
 	}
 }
 
@@ -306,7 +290,6 @@ export async function fetchRevisions(
 	);
 }
 
-/** One revision with what it holds, its platform manifests and referrers. */
 export async function fetchRevision(
 	namespace: string,
 	digest: string
@@ -348,7 +331,7 @@ function jobsQuery(queue: JobQueue, n: number, after?: string): string {
 
 export async function fetchJobs(
 	queue: JobQueue,
-	n = 100,
+	n: number,
 	after?: string
 ): Promise<FetchResult<JobsResponse>> {
 	return fetchJson<JobsResponse>(`/v2/_angos/jobs/list?${jobsQuery(queue, n, after)}`);
@@ -356,14 +339,14 @@ export async function fetchJobs(
 
 export async function fetchFailedJobs(
 	queue: JobQueue,
-	n = 100,
+	n: number,
 	after?: string
 ): Promise<FetchResult<FailedJobsResponse>> {
 	return fetchJson<FailedJobsResponse>(`/v2/_angos/jobs/failed?${jobsQuery(queue, n, after)}`);
 }
 
 export async function retryJob(queue: JobQueue, storageKey: string): Promise<string | null> {
-	return postAction(`/v2/_angos/jobs/failed?queue=${queue}&key=${encodeURIComponent(storageKey)}`);
+	return send(`/v2/_angos/jobs/failed?queue=${queue}&key=${encodeURIComponent(storageKey)}`, 'POST');
 }
 
 export async function deleteJob(
@@ -371,9 +354,7 @@ export async function deleteJob(
 	state: JobState,
 	storageKey: string
 ): Promise<string | null> {
-	return deleteResource(
-		`/v2/_angos/jobs/${state}?queue=${queue}&key=${encodeURIComponent(storageKey)}`
-	);
+	return send(`/v2/_angos/jobs/${state}?queue=${queue}&key=${encodeURIComponent(storageKey)}`, 'DELETE');
 }
 
 export interface ManifestResult {
@@ -433,11 +414,11 @@ export async function fetchReferrers(
 }
 
 export async function deleteManifest(namespace: string, reference: string): Promise<string | null> {
-	return deleteResource(`/v2/${namespace}/manifests/${reference}`);
+	return send(`/v2/${namespace}/manifests/${reference}`, 'DELETE');
 }
 
 export async function cancelUpload(namespace: string, uuid: string): Promise<string | null> {
-	return deleteResource(`/v2/${namespace}/blobs/uploads/${uuid}`);
+	return send(`/v2/${namespace}/blobs/uploads/${uuid}`, 'DELETE');
 }
 
 // A plain URL, followed by the browser rather than fetched, so it carries no
@@ -482,7 +463,7 @@ export type SecretKind =
 	| 'aws-access-key'
 	| 'kubeconfig';
 
-export interface FileContent {
+interface FileContent {
 	sha256: string;
 	sha512: string;
 	mime_type: string;
@@ -504,7 +485,7 @@ export interface LayerListing {
 	entries: LayerEntry[];
 }
 
-export interface LayerEntriesResult {
+interface LayerEntriesResult {
 	listing: LayerListing | null;
 	/** The registry is indexing the layer; ask again shortly. */
 	pending: boolean;
@@ -527,7 +508,7 @@ export async function fetchLayerEntries(namespace: string, digest: string): Prom
 }
 
 /** What `file` would say of an ELF binary, and the libraries it needs. */
-export interface ElfDetails {
+interface ElfDetails {
 	type: string;
 	machine: string;
 	bits: number;
@@ -546,12 +527,12 @@ export interface ElfDetails {
 }
 
 /** A PEM block: a certificate decoded, anything else by its label alone. */
-export interface PemBlock {
+interface PemBlock {
 	label: string;
 	certificate?: Certificate;
 }
 
-export interface Certificate {
+interface Certificate {
 	subject: string;
 	issuer: string;
 	not_before: string;

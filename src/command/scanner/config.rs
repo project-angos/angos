@@ -19,7 +19,7 @@ fn default_max_concurrent_scans() -> NonZeroUsize {
 
 /// The registry the scanner pulls images from: its URL, and the identity the
 /// scanner subprocess authenticates with.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(try_from = "ScannerRegistryFields")]
 pub struct ScannerRegistry {
     pub url: String,
@@ -45,7 +45,7 @@ impl TryFrom<ScannerRegistryFields> for ScannerRegistry {
 }
 
 /// The `[scanner]` section `angos scanner` reads.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ScannerConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,

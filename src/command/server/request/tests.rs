@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
-use hyper::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RANGE};
-use hyper::{HeaderMap, Request};
+use hyper::HeaderMap;
+use hyper::header::{HeaderName, HeaderValue};
 
 use angos_oci::header::X_ANGOS_SOURCE_TIMESTAMP;
 use angos_oci::http_range::{ByteWindow, RequestRange};
@@ -9,20 +9,44 @@ use angos_oci::{MediaRange, MediaType};
 use crate::command::server::error::Error;
 use crate::command::server::request::{RequestHeaders, X_ANGOS_NO_REDIRECT};
 
-/// end-5 spells a chunk's window `<start>-<end>`. The `bytes=` unit is the
-/// `Range` header's, so a chunk carrying one is malformed rather than tolerated.
-#[test]
-fn test_chunk_range_refuses_the_range_unit() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=0-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        headers.append(
+            name.parse::<HeaderName>().unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    headers
+}
 
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(
-        matches!(result, Err(Error::RangeNotSatisfiable(_))),
-        "a bytes=-prefixed chunk window must be refused, got: {result:?}"
+/// end-5 pins a chunk's window to `^[0-9]+-[0-9]+$`: the `Range` header's
+/// `bytes=` unit and an open-ended window are malformed, not tolerated.
+#[test]
+fn chunk_range_reads_only_a_closed_unitless_window() {
+    for value in ["bytes=0-499", "0-"] {
+        let result = RequestHeaders::new(&headers(&[("content-range", value)])).chunk_range();
+        assert!(
+            matches!(result, Err(Error::RangeNotSatisfiable(_))),
+            "'{value}' must be refused, got: {result:?}"
+        );
+    }
+
+    let window = RequestHeaders::new(&headers(&[("content-range", "100-200")]))
+        .chunk_range()
+        .unwrap();
+    assert_eq!(
+        window,
+        Some(ByteWindow {
+            start: 100,
+            end: Some(200),
+        })
+    );
+    assert_eq!(
+        RequestHeaders::new(&HeaderMap::new())
+            .chunk_range()
+            .unwrap(),
+        None
     );
 }
 
@@ -30,185 +54,62 @@ fn test_chunk_range_refuses_the_range_unit() {
 /// know, ignored: the whole blob is served, as for a multi-range request. Only
 /// a range that parses and cannot be met is a `416`.
 #[test]
-fn test_unreadable_blob_range_is_ignored() {
+fn blob_range_ignores_what_it_cannot_read() {
     for value in [
-        // A doubled unit, an absent one, an inverted window, and a
-        // non-numeric bound.
         "bytes=bytes=0-5",
         "100-200",
         "bytes=500-499",
         "bytes=abc-100",
         "items=0-5",
+        "bytes=0-10,20-30",
     ] {
-        let request = Request::builder().header(RANGE, value).body(()).unwrap();
-        let (parts, ()) = request.into_parts();
-
-        let range = RequestHeaders::new(&parts.headers)
+        let range = RequestHeaders::new(&headers(&[("range", value)]))
             .blob_range()
             .expect("an unreadable range must not fail the request");
         assert!(range.is_none(), "'{value}' must be ignored, got: {range:?}");
     }
+
+    for value in ["bytes=0-499", "Bytes=0-499"] {
+        let range = RequestHeaders::new(&headers(&[("range", value)]))
+            .blob_range()
+            .unwrap();
+        assert_eq!(
+            range,
+            Some(RequestRange::FromTo(ByteWindow {
+                start: 0,
+                end: Some(499),
+            })),
+            "{value}"
+        );
+    }
 }
 
 #[test]
-fn test_blob_range_with_bytes_prefix() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=0-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
+fn content_length_must_parse_and_agree() {
+    let content_length =
+        |pairs: &[(&str, &str)]| RequestHeaders::new(&headers(pairs)).content_length();
 
-    let range = RequestHeaders::new(&parts.headers)
-        .blob_range()
-        .unwrap()
-        .unwrap();
+    assert_eq!(content_length(&[]).unwrap(), None);
     assert_eq!(
-        range,
-        RequestRange::FromTo(ByteWindow {
-            start: 0,
-            end: Some(499),
-        })
+        content_length(&[("content-length", "42")]).unwrap(),
+        Some(42)
     );
-}
-
-#[test]
-fn test_blob_range_unit_is_case_insensitive() {
-    let request = Request::builder()
-        .header(RANGE, "Bytes=0-499")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .blob_range()
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        range,
-        RequestRange::FromTo(ByteWindow {
-            start: 0,
-            end: Some(499),
-        })
-    );
-}
-
-#[test]
-fn test_range_without_bytes_prefix() {
-    let request = Request::builder()
-        .header(RANGE, "100-200")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .chunk_range(RANGE)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        range,
-        ByteWindow {
-            start: 100,
-            end: Some(200),
-        }
-    );
-}
-
-/// end-5 pins a chunk's window to `^[0-9]+-[0-9]+$`, so a value naming no last
-/// byte is refused rather than read as an open-ended one.
-#[test]
-fn test_chunk_range_refuses_an_open_ended_window() {
-    let request = Request::builder().header(RANGE, "0-").body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).chunk_range(RANGE);
-    assert!(
-        matches!(result, Err(Error::RangeNotSatisfiable(_))),
-        "an open-ended chunk window must be refused, got: {result:?}"
-    );
-}
-
-#[test]
-fn test_range_missing_header() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers)
-        .chunk_range(RANGE)
-        .unwrap();
-    assert_eq!(range, None);
-}
-
-#[test]
-fn test_blob_range_multiple_ranges_not_supported() {
-    let request = Request::builder()
-        .header(RANGE, "bytes=0-10,20-30")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let range = RequestHeaders::new(&parts.headers).blob_range().unwrap();
-    assert_eq!(range, None);
-}
-
-#[test]
-fn test_content_length_missing() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let content_length = RequestHeaders::new(&parts.headers)
-        .content_length()
-        .unwrap();
-    assert_eq!(content_length, None);
-}
-
-#[test]
-fn test_content_length_valid() {
-    let request = Request::builder()
-        .header(CONTENT_LENGTH, "42")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let content_length = RequestHeaders::new(&parts.headers)
-        .content_length()
-        .unwrap();
-    assert_eq!(content_length, Some(42));
-}
-
-#[test]
-fn test_content_length_invalid() {
-    let request = Request::builder()
-        .header(CONTENT_LENGTH, "not-a-number")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).content_length();
-    assert!(matches!(result, Err(Error::BadRequest(_))));
-}
-
-#[test]
-fn test_content_length_conflicting_duplicates() {
-    let request = Request::builder()
-        .header(CONTENT_LENGTH, "42")
-        .header(CONTENT_LENGTH, "43")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = RequestHeaders::new(&parts.headers).content_length();
-    assert!(matches!(result, Err(Error::BadRequest(_))));
+    for pairs in [
+        &[("content-length", "not-a-number")][..],
+        &[("content-length", "42"), ("content-length", "43")][..],
+    ] {
+        assert!(matches!(content_length(pairs), Err(Error::BadRequest(_))));
+    }
 }
 
 #[test]
 fn test_content_type_valid() {
-    let request = Request::builder()
-        .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let content_type = RequestHeaders::new(&parts.headers).content_type().unwrap();
+    let content_type = RequestHeaders::new(&headers(&[(
+        "content-type",
+        "application/vnd.oci.image.manifest.v1+json",
+    )]))
+    .content_type()
+    .unwrap();
     assert_eq!(
         content_type,
         Some(MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap())
@@ -216,80 +117,34 @@ fn test_content_type_valid() {
 }
 
 #[test]
-fn test_source_timestamp_present() {
-    let request = Request::builder()
-        .header(X_ANGOS_SOURCE_TIMESTAMP, "2026-06-03T12:00:00Z")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
+fn source_timestamp_is_utc_and_none_when_unreadable() {
+    let noon = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+    for (value, expected) in [
+        ("2026-06-03T12:00:00Z", Some(noon)),
+        ("  2026-06-03T14:00:00+02:00  ", Some(noon)),
+        ("   ", None),
+        ("not-a-timestamp", None),
+    ] {
+        let source_ts =
+            RequestHeaders::new(&headers(&[(X_ANGOS_SOURCE_TIMESTAMP.as_str(), value)]))
+                .source_timestamp();
+        assert_eq!(source_ts, expected, "'{value}'");
+    }
     assert_eq!(
-        source_ts,
-        Some(Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap())
+        RequestHeaders::new(&HeaderMap::new()).source_timestamp(),
+        None
     );
-}
-
-#[test]
-fn test_source_timestamp_with_offset_normalises_to_utc() {
-    let request = Request::builder()
-        .header(X_ANGOS_SOURCE_TIMESTAMP, "  2026-06-03T14:00:00+02:00  ")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
-    assert_eq!(
-        source_ts,
-        Some(Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap())
-    );
-}
-
-#[test]
-fn test_source_timestamp_missing() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
-    assert_eq!(source_ts, None);
-}
-
-#[test]
-fn test_source_timestamp_empty_is_none() {
-    let request = Request::builder()
-        .header(X_ANGOS_SOURCE_TIMESTAMP, "   ")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
-    assert_eq!(source_ts, None);
-}
-
-#[test]
-fn test_source_timestamp_garbage_is_none() {
-    let request = Request::builder()
-        .header(X_ANGOS_SOURCE_TIMESTAMP, "not-a-timestamp")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let source_ts = RequestHeaders::new(&parts.headers).source_timestamp();
-    assert_eq!(source_ts, None);
 }
 
 #[test]
 fn test_source_timestamp_future_is_clamped_to_now() {
-    let request = Request::builder()
-        .header(X_ANGOS_SOURCE_TIMESTAMP, "3000-01-01T00:00:00Z")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
     let before = Utc::now();
-    let source_ts = RequestHeaders::new(&parts.headers)
-        .source_timestamp()
-        .expect("a parseable timestamp returns Some");
+    let source_ts = RequestHeaders::new(&headers(&[(
+        X_ANGOS_SOURCE_TIMESTAMP.as_str(),
+        "3000-01-01T00:00:00Z",
+    )]))
+    .source_timestamp()
+    .expect("a parseable timestamp returns Some");
     let after = Utc::now();
 
     assert!(
@@ -298,45 +153,24 @@ fn test_source_timestamp_future_is_clamped_to_now() {
     );
 }
 
+/// OCI clients never send the header, so they keep the redirect fast path.
 #[test]
-fn test_redirect_not_suppressed_without_header() {
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    assert!(
-        !RequestHeaders::new(&parts.headers).redirect_suppressed(),
-        "a request without the header keeps the redirect fast path (OCI clients)"
-    );
-}
-
-#[test]
-fn test_redirect_suppressed_for_truthy_values() {
-    for value in ["1", "true", "TRUE", "yes"] {
-        let request = Request::builder()
-            .header(X_ANGOS_NO_REDIRECT, value)
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
-
-        assert!(
-            RequestHeaders::new(&parts.headers).redirect_suppressed(),
-            "'{value}' must suppress the redirect so the browser UI gets an inline body"
-        );
-    }
-}
-
-#[test]
-fn test_redirect_not_suppressed_for_falsey_values() {
-    for value in ["0", "false", "FALSE", ""] {
-        let request = Request::builder()
-            .header(X_ANGOS_NO_REDIRECT, value)
-            .body(())
-            .unwrap();
-        let (parts, ()) = request.into_parts();
-
-        assert!(
-            !RequestHeaders::new(&parts.headers).redirect_suppressed(),
-            "'{value}' must not suppress the redirect"
+fn redirect_is_suppressed_only_by_a_truthy_value() {
+    assert!(!RequestHeaders::new(&HeaderMap::new()).redirect_suppressed());
+    for (value, suppressed) in [
+        ("1", true),
+        ("true", true),
+        ("TRUE", true),
+        ("yes", true),
+        ("0", false),
+        ("false", false),
+        ("FALSE", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            RequestHeaders::new(&headers(&[(X_ANGOS_NO_REDIRECT, value)])).redirect_suppressed(),
+            suppressed,
+            "'{value}'"
         );
     }
 }
@@ -346,24 +180,19 @@ fn test_redirect_not_suppressed_for_falsey_values() {
 /// dropped rather than relayed malformed.
 #[test]
 fn wildcard_accept_members_survive_and_malformed_ones_are_dropped() {
-    let request = Request::builder()
-        .header(ACCEPT, "*/*, application/*, not-a-range, application/json")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let accepted = RequestHeaders::new(&parts.headers).accepted_content_types();
+    let accepted = RequestHeaders::new(&headers(&[(
+        "accept",
+        "*/*, application/*, not-a-range, application/json",
+    )]))
+    .accepted_content_types();
     let result: Vec<&str> = accepted.iter().map(MediaRange::as_str).collect();
     assert_eq!(result, vec!["*/*", "application/*", "application/json"]);
 }
 
 #[test]
 fn accepts_gzip_honours_a_zero_quality() {
-    let accepts = |value: &str| {
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT_ENCODING, HeaderValue::from_str(value).unwrap());
-        RequestHeaders::new(&headers).accepts_gzip()
-    };
+    let accepts =
+        |value: &str| RequestHeaders::new(&headers(&[("accept-encoding", value)])).accepts_gzip();
     assert!(accepts("gzip, deflate, br, zstd"));
     assert!(accepts("br;q=1.0, GZIP;q=0.5"));
     assert!(!accepts("gzip;q=0"));

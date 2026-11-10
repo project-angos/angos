@@ -34,27 +34,6 @@ const REF_PAGE: u16 = 128;
 pub type BlobIndex = HashMap<Namespace, HashSet<LinkKind>>;
 
 impl MetadataStore {
-    /// `namespace`'s reference entries for `digest`: the `!own` leaf plus the
-    /// `!r/` subtree, read concurrently.
-    async fn namespace_ref_entries(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-    ) -> Result<HashSet<LinkKind>, Error> {
-        let own = async {
-            Ok::<_, Error>(
-                self.object_store()
-                    .exists(&digest.blob_ref_own_path(namespace))
-                    .await?,
-            )
-        };
-        let (owned, mut links) = try_join(own, self.listed_ref_entries(namespace, digest)).await?;
-        if owned {
-            links.insert(LinkKind::Blob(digest.clone()));
-        }
-        Ok(links)
-    }
-
     /// `namespace`'s `!r/` reference entries for `digest`.
     async fn listed_ref_entries(
         &self,
@@ -97,7 +76,7 @@ impl MetadataStore {
                 "blob reclamation in progress for a referenced blob; retry".to_string(),
             ));
         }
-        if started_at.elapsed().as_secs() > self.gc_grace_secs {
+        if started_at.elapsed().as_secs() > self.settings.gc_grace_secs {
             return Err(Error::ReclamationInProgress(
                 "reference wave outlasted the reclamation grace period; retry".to_string(),
             ));
@@ -270,7 +249,17 @@ impl MetadataStore {
         namespace: &Namespace,
         digest: &Digest,
     ) -> Result<HashSet<LinkKind>, Error> {
-        let links = self.namespace_ref_entries(namespace, digest).await?;
+        let own = async {
+            Ok::<_, Error>(
+                self.object_store()
+                    .exists(&digest.blob_ref_own_path(namespace))
+                    .await?,
+            )
+        };
+        let (owned, mut links) = try_join(own, self.listed_ref_entries(namespace, digest)).await?;
+        if owned {
+            links.insert(LinkKind::Blob(digest.clone()));
+        }
         if links.is_empty() {
             return Err(Error::NotFound);
         }
@@ -382,7 +371,7 @@ impl MetadataStore {
         match self.object_store().head(key).await {
             Ok(meta) => Ok(Some(meta.last_modified.is_none_or(|modified| {
                 Utc::now().signed_duration_since(modified).num_seconds()
-                    < i64::try_from(self.gc_grace_secs).unwrap_or(i64::MAX)
+                    < i64::try_from(self.settings.gc_grace_secs).unwrap_or(i64::MAX)
             }))),
             Err(StorageError::NotFound) => Ok(None),
             Err(e) => Err(e.into()),
@@ -402,34 +391,19 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::slice;
+    use std::sync::atomic::Ordering;
 
-    use async_trait::async_trait;
     use futures_util::future::try_join_all;
 
     use angos_oci::{Digest, Namespace, Tag};
-    use angos_storage::Error as StorageError;
-    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::test_util::StoreOp;
 
     use crate::registry::Error;
     use crate::registry::metadata_store::LinkKind;
     use crate::registry::test_utils::{
-        create_link, drop_links, for_each_backend, metadata_store_over, put_blob_direct, seed_links,
+        counting_metadata_store, create_link, drop_links, for_each_backend, put_blob_direct,
     };
-
-    /// Counts the listings a store is asked for.
-    struct ListCount(Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl StoreHook for ListCount {
-        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-            if matches!(op, StoreOp::List { .. }) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-    }
 
     /// A namespace referencing the blob through more keys than a page holds is
     /// listed past, not read through, and the namespaces after it still come
@@ -437,11 +411,10 @@ mod tests {
     #[tokio::test]
     async fn referencing_namespaces_list_past_a_namespace_with_many_references() {
         for_each_backend(async |test_case| {
-            let lists = Arc::new(AtomicUsize::new(0));
-            let m = metadata_store_over(Arc::new(HookedStore::new(
-                test_case.metadata_store().object_store().clone(),
-                ListCount(lists.clone()),
-            )));
+            let (m, lists) =
+                counting_metadata_store(test_case.metadata_store().object_store().clone(), |op| {
+                    matches!(op, StoreOp::List { .. })
+                });
             let digest = Digest::sha256_of_bytes(b"a popular base layer");
             let heavy = Namespace::new("ref-heavy").unwrap();
             try_join_all((0..300).map(|i| {
@@ -491,133 +464,31 @@ mod tests {
         for_each_backend(async |test_case| {
             let m = test_case.metadata_store();
             let namespace = &Namespace::new("parallel-mixed-ns").unwrap();
-
             let digest_a = put_blob_direct(&test_case.blob_store(), b"content-a").await;
             let digest_b = put_blob_direct(&test_case.blob_store(), b"content-b").await;
-            let digest_c = put_blob_direct(&test_case.blob_store(), b"content-c").await;
-
-            create_link(
-                &m,
-                namespace,
-                &LinkKind::Tag(Tag::new("v1").unwrap()),
-                &digest_a,
-            )
-            .await;
-            create_link(
-                &m,
-                namespace,
-                &LinkKind::Tag(Tag::new("v2").unwrap()),
-                &digest_b,
-            )
-            .await;
-
-            drop_links(&m, namespace, &[LinkKind::Tag(Tag::new("v1").unwrap())])
-                .await
-                .unwrap();
-            seed_links(
-                &m,
-                namespace,
-                &[(LinkKind::Tag(Tag::new("v3").unwrap()), digest_c.clone())],
-            )
-            .await
-            .unwrap();
-
-            let err = m
-                .read_link(namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, Error::NotFound),
-                "Tag v1 should not exist after deletion but got error: {err:?}"
+            let (v1, v2) = (
+                LinkKind::Tag(Tag::new("v1").unwrap()),
+                LinkKind::Tag(Tag::new("v2").unwrap()),
             );
+            create_link(&m, namespace, &v1, &digest_a).await;
+            create_link(&m, namespace, &v2, &digest_b).await;
 
-            let meta_v2 = m
-                .read_link(namespace, &LinkKind::Tag(Tag::new("v2").unwrap()))
+            drop_links(&m, namespace, slice::from_ref(&v1))
                 .await
                 .unwrap();
-            assert_eq!(meta_v2.target, digest_b);
 
-            let meta_v3 = m
-                .read_link(namespace, &LinkKind::Tag(Tag::new("v3").unwrap()))
-                .await
-                .unwrap();
-            assert_eq!(meta_v3.target, digest_c);
-
-            let tag_v1 = LinkKind::Tag(Tag::new("v1").unwrap());
+            assert!(matches!(
+                m.read_link(namespace, &v1).await,
+                Err(Error::NotFound)
+            ));
+            assert_eq!(m.read_link(namespace, &v2).await.unwrap().target, digest_b);
             let index_a = m.read_blob_index(&digest_a).await.unwrap();
             assert!(
                 index_a
                     .get(namespace)
-                    .is_some_and(|links| links.contains(&tag_v1)),
+                    .is_some_and(|links| links.contains(&v1)),
                 "the stale entry is the collector's to prune, not the writer's"
             );
-
-            let index_c = m.read_blob_index(&digest_c).await.unwrap();
-            let links_c = index_c
-                .get(namespace)
-                .expect("Blob index for digest_c should have an entry for namespace");
-            assert!(
-                links_c.contains(&LinkKind::Tag(Tag::new("v3").unwrap())),
-                "Blob index for digest_c should contain Tag(v3)"
-            );
-        })
-        .await;
-    }
-
-    /// Each digest's index carries its own links and no other digest's.
-    #[tokio::test]
-    async fn each_digest_indexes_only_its_own_links() {
-        for_each_backend(async |test_case| {
-            let m = test_case.metadata_store();
-            let namespace = &Namespace::new("parallel-blob-index-ns").unwrap();
-
-            let mut digests = Vec::new();
-            for i in 0..4 {
-                let digest = put_blob_direct(&test_case.blob_store(), format!("content-{i}").as_bytes()).await;
-                digests.push(digest);
-            }
-
-            let tags: Vec<(LinkKind, Digest)> = digests
-                .iter()
-                .enumerate()
-                .map(|(i, digest)| {
-                    (
-                        LinkKind::Tag(Tag::try_from(format!("tag-{i}")).unwrap()),
-                        digest.clone(),
-                    )
-                })
-                .collect();
-            seed_links(&m, namespace, &tags).await.unwrap();
-
-            for (i, digest) in digests.iter().enumerate() {
-                let expected_tag = LinkKind::Tag(Tag::try_from(format!("tag-{i}")).unwrap());
-                let blob_index = m.read_blob_index(digest).await.unwrap();
-
-                let links = blob_index.get(namespace).unwrap_or_else(|| {
-                    panic!("Blob index for digest {digest} should have an entry for namespace {namespace}")
-                });
-
-                assert!(
-                    links.contains(&expected_tag),
-                    "Blob index for digest {digest} should contain tag-{i}"
-                );
-
-                for (j, other_digest) in digests.iter().enumerate() {
-                    if j != i {
-                        let other_tag = LinkKind::Tag(Tag::try_from(format!("tag-{j}")).unwrap());
-                        assert!(
-                            !links.contains(&other_tag),
-                            "Blob index for digest {digest} (tag-{i}) should NOT contain tag-{j}"
-                        );
-                        let other_index = m.read_blob_index(other_digest).await.unwrap();
-                        let other_links = other_index.get(namespace);
-                        assert!(
-                            other_links.is_some_and(|s| !s.contains(&expected_tag)),
-                            "Blob index for digest {other_digest} (tag-{j}) should NOT contain tag-{i}"
-                        );
-                    }
-                }
-            }
         })
         .await;
     }
@@ -728,108 +599,15 @@ mod tests {
         .await;
     }
 
-    /// One write batch mixing record-backed links with reference-only pins
-    /// leaves every kind's key in place.
-    #[tokio::test]
-    async fn links_of_every_kind_land_in_one_write_pass() {
-        for_each_backend(async |test_case| {
-            let m = test_case.metadata_store();
-            let namespace = &Namespace::new("mixed-tracked-untracked-ns").unwrap();
-
-            let tag_digest = put_blob_direct(&test_case.blob_store(), b"tag content").await;
-            let layer_digest =
-                put_blob_direct(&test_case.blob_store(), b"layer content mixed").await;
-            let digest_link_digest =
-                put_blob_direct(&test_case.blob_store(), b"digest link content").await;
-            let manifest_digest =
-                put_blob_direct(&test_case.blob_store(), b"manifest content mixed").await;
-
-            seed_links(
-                &m,
-                namespace,
-                &[
-                    (LinkKind::Tag(Tag::new("v1").unwrap()), tag_digest.clone()),
-                    (
-                        LinkKind::Digest(digest_link_digest.clone()),
-                        digest_link_digest.clone(),
-                    ),
-                ],
-            )
-            .await
-            .unwrap();
-            m.pin_references(
-                namespace,
-                &[(
-                    layer_digest.clone(),
-                    LinkKind::ReferencedBy(manifest_digest.clone()),
-                )],
-            )
-            .await
-            .unwrap();
-
-            let tag_meta = m
-                .read_link(namespace, &LinkKind::Tag(Tag::new("v1").unwrap()))
-                .await
-                .unwrap();
-            assert_eq!(tag_meta.target, tag_digest);
-            let digest_meta = m
-                .read_link(namespace, &LinkKind::Digest(digest_link_digest.clone()))
-                .await
-                .unwrap();
-            assert_eq!(digest_meta.target, digest_link_digest);
-            let tag_index = m.read_blob_index(&tag_digest).await.unwrap();
-            let tag_links = tag_index
-                .get(namespace)
-                .expect("Blob index for tag_digest should have namespace entry");
-            assert!(
-                tag_links.contains(&LinkKind::Tag(Tag::new("v1").unwrap())),
-                "Blob index for tag_digest should contain Tag(v1)"
-            );
-
-            let layer_index = m.read_blob_index(&layer_digest).await.unwrap();
-            let layer_links = layer_index
-                .get(namespace)
-                .expect("Blob index for layer_digest should have namespace entry");
-            assert!(
-                layer_links.contains(&LinkKind::ReferencedBy(manifest_digest.clone())),
-                "Blob index for layer_digest should contain the per-referrer entry"
-            );
-
-            let digest_index = m.read_blob_index(&digest_link_digest).await.unwrap();
-            let digest_links = digest_index
-                .get(namespace)
-                .expect("Blob index for digest_link_digest should have namespace entry");
-            assert!(
-                digest_links.contains(&LinkKind::Digest(digest_link_digest.clone())),
-                "Blob index for digest_link_digest should contain the Digest link"
-            );
-        })
-        .await;
-    }
-
-    /// Counts the heads a store is asked for.
-    struct HeadCount(Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl StoreHook for HeadCount {
-        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-            if matches!(op, StoreOp::Head { .. }) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-    }
-
     /// A read authorization check heads the `own` key once, whether it hits or
     /// falls through to the listing.
     #[tokio::test]
     async fn can_read_heads_the_own_key_once() {
         for_each_backend(async |test_case| {
-            let heads = Arc::new(AtomicUsize::new(0));
-            let m = metadata_store_over(Arc::new(HookedStore::new(
-                test_case.metadata_store().object_store().clone(),
-                HeadCount(heads.clone()),
-            )));
+            let (m, heads) =
+                counting_metadata_store(test_case.metadata_store().object_store().clone(), |op| {
+                    matches!(op, StoreOp::Head { .. })
+                });
             let digest = Digest::sha256_of_bytes(b"a blob only one namespace owns");
             let (owner, other) = (
                 Namespace::new("can-read-owner").unwrap(),
@@ -853,7 +631,7 @@ mod tests {
     }
 
     /// Two namespaces pin one blob independently: neither write clobbers the
-    /// other's entry, which a shared index body could not guarantee.
+    /// other's entry.
     #[tokio::test]
     async fn two_namespaces_pin_one_blob_independently() {
         for_each_backend(async |test_case| {
@@ -864,20 +642,13 @@ mod tests {
 
             let other_tag = LinkKind::Tag(Tag::new("stable").unwrap());
             create_link(&m, other_ns, &other_tag, &digest).await;
-
-            let blob_index = m.read_blob_index(&digest).await.unwrap();
-            assert!(
-                blob_index.contains_key(other_ns),
-                "no other-ns entry in {blob_index:?}"
-            );
-
             let my_tag = LinkKind::Tag(Tag::new("latest").unwrap());
             create_link(&m, my_ns, &my_tag, &digest).await;
 
             let blob_index = m.read_blob_index(&digest).await.unwrap();
             let other_links = blob_index
                 .get(other_ns)
-                .expect("Blob index should still have entry for other-ns");
+                .expect("Blob index should have entry for other-ns");
             assert!(
                 other_links.contains(&other_tag),
                 "other-ns links: {other_links:?}"

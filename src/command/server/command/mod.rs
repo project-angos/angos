@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use argh::FromArgs;
+use async_trait::async_trait;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::command::bootstrap;
 use crate::command::server::ServerContext;
@@ -15,11 +16,11 @@ use crate::command::server::error::Error;
 use crate::command::server::listeners::insecure::InsecureListener;
 use crate::command::server::listeners::tls::TlsListener;
 use crate::configuration::listeners::ServerTlsConfig;
+use crate::configuration::watcher::ConfigNotifier;
 use crate::configuration::{Configuration, ServerConfig};
 use crate::jobs::Queue;
 use crate::jobs::store::{QueueDepthRefresh, queue_depth_refresh_loop};
 
-mod notifier;
 pub mod setup;
 
 pub enum ServiceListener {
@@ -175,14 +176,6 @@ impl Command {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn as_insecure(&self) -> Option<&InsecureListener> {
-        match &self.listener {
-            ServiceListener::Insecure(listener) => Some(listener),
-            ServiceListener::Secure(_) => None,
-        }
-    }
-
     pub async fn shutdown_with_timeout(&self, grace: Duration) {
         // Stops accepting first, so the in-flight exchanges drain against a
         // server nothing new is arriving at.
@@ -205,6 +198,25 @@ impl Command {
 
     pub async fn run(&self) -> Result<(), Error> {
         self.listener.serve().await
+    }
+}
+
+#[async_trait]
+impl ConfigNotifier for Command {
+    async fn notify_config_change(&self, config: &Configuration) -> bool {
+        match self.notify_config_change(config).await {
+            Ok(()) => true,
+            Err(e) => {
+                error!("Failed to apply configuration: {e}");
+                false
+            }
+        }
+    }
+
+    fn notify_tls_config_change(&self, tls: &ServerTlsConfig) {
+        if let Err(e) = self.notify_tls_config_change(tls) {
+            error!("Failed to reload TLS configuration: {e}");
+        }
     }
 }
 

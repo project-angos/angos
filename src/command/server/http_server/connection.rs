@@ -58,12 +58,15 @@ pub async fn serve_request<S>(
     // no timer installed: a client dribbling one header byte at a time would
     // otherwise hold the connection for the whole `query_timeout`. It also
     // closes an idle keep-alive after the same 30 seconds.
+    let peer_certificate = peer_certificate.map(|cert| PeerCertificate(Arc::new(cert)));
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .serve_connection(
             stream,
             service_fn(move |mut request| {
-                inject_peer_certificate(&mut request, peer_certificate.as_deref());
+                if let Some(cert) = &peer_certificate {
+                    request.extensions_mut().insert(cert.clone());
+                }
                 request.extensions_mut().insert(remote_address);
                 request.extensions_mut().insert(scheme);
                 handle_request(context.load_full(), request)
@@ -73,14 +76,8 @@ pub async fn serve_request<S>(
 
     let _in_flight_guard = InFlightGuard::new();
 
-    let query_timeout = timeouts.query;
-    let grace_period = timeouts.grace;
-
-    // Phase 1: serve until the connection finishes, its query timeout (a
-    // wall-clock deadline from connection start, not an activity-reset
-    // watchdog) fires, or the server shuts down. Either signal starts a
-    // graceful shutdown, so the connection stops taking new requests on the
-    // keepalive but still drains the in-flight one.
+    // The query timeout is a wall-clock deadline from connection start, not an
+    // activity-reset watchdog.
     tokio::select! {
         res = conn.as_mut() => {
             match res {
@@ -89,7 +86,7 @@ pub async fn serve_request<S>(
             }
             return;
         }
-        () = sleep(query_timeout) => {
+        () = sleep(timeouts.query) => {
             debug!("query timeout reached, signalling graceful shutdown");
             conn.as_mut().graceful_shutdown();
         }
@@ -99,8 +96,6 @@ pub async fn serve_request<S>(
         }
     }
 
-    // Phase 2: graceful shutdown. Wait for the connection to drain, or for the
-    // grace period to elapse and drop the connection.
     tokio::select! {
         res = conn.as_mut() => {
             match res {
@@ -108,7 +103,7 @@ pub async fn serve_request<S>(
                 Err(error) => debug!("connection error during graceful shutdown: {error}"),
             }
         }
-        () = sleep(grace_period) => {
+        () = sleep(timeouts.grace) => {
             debug!("grace period expired, dropping connection");
         }
     }
@@ -133,7 +128,6 @@ async fn handle_request(
     // `?ns=`; serving it from the repository mirroring that namespace is what
     // lets such a client use angos without prefixing the paths it requests.
     let proxy_namespace = context.apply_proxy_namespace(route.as_mut(), request.uri());
-    // Labels both HTTP metrics below.
     let route_label = route.as_ref().map_or("unknown", Route::metric_label);
 
     let trace_id = current_trace_id(&Span::current());
@@ -173,8 +167,6 @@ async fn handle_request(
         response.headers_mut().insert(OCI_NAMESPACE, value);
     }
 
-    // `as_secs_f64()` rather than `as_millis() as f64`: the latter trips the
-    // precision-loss lint, and the conversion is lossless at request scale.
     let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
     let status = response.status();
 
@@ -227,26 +219,12 @@ pub fn method_label(method: &Method) -> &str {
     }
 }
 
-/// Extracts the `OpenTelemetry` trace ID from the given tracing span.
-///
-/// Returns `None` if the span has no `OpenTelemetry` bridge context (e.g. the
-/// span is disabled, or no `OpenTelemetry` layer is registered with the subscriber).
+/// `None` when no `OpenTelemetry` layer is registered or the span is disabled.
 pub fn current_trace_id(span: &Span) -> Option<String> {
     let context = span.context();
     let otel_span = context.span();
     let span_context = otel_span.span_context();
-    if span_context.is_valid() {
-        Some(span_context.trace_id().to_string())
-    } else {
-        None
-    }
-}
-
-/// Attaches the peer TLS certificate (if present) as a request extension so
-/// downstream authenticators can inspect it.
-pub fn inject_peer_certificate<B>(request: &mut Request<B>, cert_data: Option<&[u8]>) {
-    if let Some(cert_data) = cert_data {
-        let peer_certificate = PeerCertificate(Arc::new(cert_data.to_vec()));
-        request.extensions_mut().insert(peer_certificate);
-    }
+    span_context
+        .is_valid()
+        .then(|| span_context.trace_id().to_string())
 }

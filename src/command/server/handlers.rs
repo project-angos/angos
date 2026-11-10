@@ -23,7 +23,7 @@ use crate::identity::ClientIdentity;
 use crate::metrics_provider::metrics_provider;
 use crate::registry::Registry;
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct UiConfigBody {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,7 +32,7 @@ pub struct UiConfigBody {
 
 /// What a browser needs to run the authorization code flow itself. Every field
 /// is public by nature: the client is a public one, holding no secret.
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub struct UiOidcBody {
     pub issuer: String,
     pub client_id: String,
@@ -133,9 +133,7 @@ pub fn handle_healthz() -> Result<Response<ResponseBody>, Error> {
     json_response(StatusCode::OK, &body)
 }
 
-/// A backend that cannot be listed is reported as `503 not_ready`. The cause
-/// is logged, not returned: `/readyz` is exposed anonymously, and a storage
-/// error names the bucket and endpoint.
+/// A backend that cannot be listed is reported as `503 not_ready`.
 pub async fn handle_readyz(registry: &Registry) -> Result<Response<ResponseBody>, Error> {
     let (status, body) = match registry.check_ready().await {
         Ok(()) => (

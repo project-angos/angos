@@ -15,9 +15,7 @@ impl From<SerializationError> for Error {
 /// The outcome of evaluating an access policy against a request.
 #[derive(Debug)]
 pub enum PolicyDecision {
-    /// Access is granted.
     Allow,
-    /// Access is denied by a matching rule.
     Deny,
     /// A rule could not be evaluated; the request is denied and the error is carried for logging.
     Indeterminate(PolicyError),

@@ -1,15 +1,10 @@
 use std::io::Error as IoError;
-use std::num::TryFromIntError;
-use std::string::FromUtf8Error;
 
-use chrono::format::ParseError as ChronoParseError;
 use http::StatusCode;
 use serde_json::Error as SerdeJsonError;
 use sha2::digest::common::hazmat::DeserializeStateError;
 use tracing::warn;
-use x509_parser::error::X509Error;
 
-use angos_cache::Error as CacheError;
 use angos_oci::Error as OciError;
 use angos_oci::http_range::Error as HttpRangeError;
 use angos_oci::response::{
@@ -19,9 +14,7 @@ use angos_oci::response::{
 use angos_oci_client::Error as ClientError;
 use angos_storage::Error as StorageError;
 
-use crate::configuration::Error as ConfigurationError;
 use crate::jobs::store::Error as JobStoreError;
-use crate::policy::Error as PolicyError;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -91,12 +84,6 @@ pub enum Error {
     /// state can act on it instead of retrying.
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
-
-    // Typed variants preserving the source error chain.
-    #[error("configuration error during operations: {0}")]
-    Configuration(#[from] ConfigurationError),
-    #[error("cache error during operations: {0}")]
-    Cache(#[from] CacheError),
     #[error("I/O error during operations: {0}")]
     Io(#[from] IoError),
     #[error("(de)serialization error during operations: {0}")]
@@ -104,6 +91,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// The code the OCI spec gives a malformed manifest. The blanket
+    /// `From<OciError>` answers `NameInvalid` instead, so every manifest body
+    /// must go through here.
+    pub fn manifest_invalid(error: &OciError) -> Self {
+        warn!("Rejecting manifest: {error}");
+        Error::ManifestInvalid(error.to_string())
+    }
+
     /// How this outcome answers on the distribution API: its status, its
     /// error code and the message worth sending. A 4xx code must come from the
     /// spec's set, so each case picks the closest of those.
@@ -167,8 +162,6 @@ impl Error {
             | Error::EventDelivery(_)
             | Error::Internal(_)
             | Error::Corrupt(_)
-            | Error::Configuration(_)
-            | Error::Cache(_)
             | Error::Io(_)
             | Error::Serde(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_CODE),
         };
@@ -193,8 +186,6 @@ impl Error {
             Error::BlobReferenced
             | Error::ManifestBodyTooLarge { .. }
             | Error::BlobBodyTooLarge { .. }
-            | Error::Configuration(_)
-            | Error::Cache(_)
             | Error::Io(_)
             | Error::Serde(_) => Some(self.to_string()),
             Error::BlobUnknown
@@ -227,32 +218,6 @@ impl From<StorageError> for Error {
 impl From<DeserializeStateError> for Error {
     fn from(error: DeserializeStateError) -> Self {
         Error::Corrupt(format!("hash state deserialization error: {error}"))
-    }
-}
-
-impl From<FromUtf8Error> for Error {
-    fn from(error: FromUtf8Error) -> Self {
-        Error::Corrupt(error.to_string())
-    }
-}
-
-impl From<TryFromIntError> for Error {
-    fn from(error: TryFromIntError) -> Self {
-        Error::Internal(error.to_string())
-    }
-}
-
-impl From<ChronoParseError> for Error {
-    fn from(error: ChronoParseError) -> Self {
-        Error::Corrupt(error.to_string())
-    }
-}
-
-// Every policy error collapses into the string-carrying `Initialization`, a
-// semantic mapping `#[from]` could not express.
-impl From<PolicyError> for Error {
-    fn from(error: PolicyError) -> Self {
-        Error::Initialization(error.to_string())
     }
 }
 
@@ -297,56 +262,14 @@ impl From<OciError> for Error {
     }
 }
 
-impl Error {
-    /// The code the OCI spec gives a malformed manifest. The blanket
-    /// `From<OciError>` answers `NameInvalid` instead, so every manifest body
-    /// must go through here.
-    pub fn manifest_invalid(error: &OciError) -> Self {
-        warn!("Rejecting manifest: {error}");
-        Error::ManifestInvalid(error.to_string())
-    }
-}
-
-impl From<X509Error> for Error {
-    fn from(_: X509Error) -> Self {
-        Error::Unauthorized("Invalid client certificate".to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
-
     use super::*;
-
-    #[test]
-    fn from_storage_not_found_routes_to_not_found() {
-        let err: Error = StorageError::NotFound.into();
-        assert!(matches!(err, Error::NotFound));
-    }
 
     #[test]
     fn from_oci_error_routes_to_name_invalid() {
         let err: Error = OciError::Digest("bad digest".to_string()).into();
         assert!(matches!(err, Error::NameInvalid));
-    }
-
-    #[test]
-    fn from_x509_error_routes_to_unauthorized() {
-        let err: Error = X509Error::InvalidCertificate.into();
-        assert!(matches!(err, Error::Unauthorized(_)));
-        assert!(err.to_string().contains("Invalid client certificate"));
-    }
-
-    /// The reclaim paths key off `Corrupt` to tell undecodable stored bytes
-    /// from a transient read.
-    #[test]
-    fn decoding_stored_bytes_fails_as_corrupt() {
-        let not_utf8 = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
-        assert!(matches!(Error::from(not_utf8), Error::Corrupt(_)));
-
-        let not_rfc3339 = DateTime::parse_from_rfc3339("not-a-timestamp").unwrap_err();
-        assert!(matches!(Error::from(not_rfc3339), Error::Corrupt(_)));
     }
 
     /// A backend read that failed is transient, and must stay distinct from

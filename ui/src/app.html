@@ -7,14 +7,11 @@
 		<link rel="icon" href="/favicon-32x32.png" type="image/png" />
 		<script>
 			(function() {
-				const stored = localStorage.getItem('theme-preference');
-				let theme = 'dark';
-				if (stored === 'light') {
-					theme = 'light';
-				} else if (stored === 'system' || !stored) {
+				let theme = localStorage.getItem('theme-preference') || 'system';
+				if (theme === 'system') {
 					theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 				}
-				document.documentElement.setAttribute('data-theme', theme);
+				document.documentElement.setAttribute('data-theme', theme === 'light' ? 'light' : 'dark');
 			})();
 		</script>
 		%sveltekit.head%

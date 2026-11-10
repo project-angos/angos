@@ -1,15 +1,6 @@
-//! Angos's own registry API, the `_angos/` extension endpoints the web UI and
-//! operators use: the repository/namespace/manifest listings, upload and pull
-//! history, the layer filesystem index, and the durable-job administration.
-//!
-//! None of this is in the OCI or Docker spec, so it lives in its own crate,
-//! keeping [`angos_oci_service`](../angos_oci_service/index.html) exactly the
-//! Distribution spec. The types here are the extension's wire interface; the
-//! registry crate fills them in.
-//!
-//! `Queue` and `JobState` are declared here as the job-administration
-//! interface's own vocabulary; these convert into the job engine's copies at
-//! the boundary.
+//! The wire contract of the `_angos/` extension endpoints the web UI and
+//! operators use. None of it is in the OCI or Docker spec, so it stays out of
+//! `angos_oci_service`; the registry crate supplies the behaviour.
 
 use std::collections::HashMap;
 use std::num::NonZeroU16;
@@ -28,9 +19,6 @@ pub use endpoint::{Endpoint, parse};
 #[cfg(feature = "hyper")]
 mod render;
 
-// Repository / namespace listings
-
-/// The direction a listing is sorted in, `?order=`.
 #[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
@@ -48,7 +36,6 @@ pub struct PageRequest {
     pub n: Option<NonZeroU16>,
 }
 
-/// The column the revision listing is sorted by, `?sort=`.
 #[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RevisionSort {
@@ -113,8 +100,6 @@ pub struct ListNamespacesRequest {
     pub order: SortOrder,
     pub page: PageRequest,
 }
-
-// Manifest (revision) listing
 
 #[derive(Serialize, Debug, Clone)]
 pub struct ParentRef {
@@ -185,8 +170,6 @@ pub enum RevisionSelection {
     Digest(Digest),
 }
 
-// Uploads / pull history
-
 #[derive(Serialize, Debug)]
 pub struct UploadEntry {
     #[serde(rename = "uuid")]
@@ -230,15 +213,13 @@ pub struct PullsBody {
     pub next: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ListPullsRequest {
     pub namespace: Namespace,
     pub reference: Reference,
     /// The page of pulls, newest first.
     pub page: PageRequest,
 }
-
-// Layer filesystem index
 
 /// A tar entry's kind in a layer listing.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +347,7 @@ pub struct LayerFileRequest {
     pub range: Option<RequestRange>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LayerFileDetailsRequest {
     pub namespace: Namespace,
     pub digest: Digest,
@@ -436,20 +417,17 @@ pub struct LayerFile<R> {
     pub reader: R,
 }
 
-// Durable-job administration
-
-/// The queue a job belongs to, the job-administration interface's own copy of
-/// the engine's queue set.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+/// The interface's own copy of the job engine's queue set.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Queue {
+    #[default]
     Cache,
     Replication,
     Scan,
     Index,
 }
 
-/// Whether a job is pending or dead-lettered.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
@@ -457,8 +435,7 @@ pub enum JobState {
     Failed,
 }
 
-/// The storage key a job mutation addresses: one path-free token, so it is
-/// never empty and never holds a `/`.
+/// A job's storage key: never empty and never holding a `/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobKey(String);
 
@@ -480,20 +457,20 @@ impl TryFrom<String> for JobKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ListJobsRequest {
     pub queue: Queue,
     pub n: Option<NonZeroU16>,
     pub after: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RetryJobRequest {
     pub queue: Queue,
     pub storage_key: JobKey,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeleteJobRequest {
     pub queue: Queue,
     pub state: JobState,

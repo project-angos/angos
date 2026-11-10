@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use angos_mtls_client::ClientTls;
 use angos_oci::Namespace;
 
-use crate::cache_fill::handler::{CACHE_ACTOR, CacheFillJobHandler, build_envelope};
+use crate::cache_fill::{CACHE_ACTOR, CacheFillJobHandler, build_envelope};
 use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::event_webhook::event::EventKind;

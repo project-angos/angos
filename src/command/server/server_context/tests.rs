@@ -1,115 +1,41 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use hyper::header::{HOST, HeaderMap, HeaderValue};
 use hyper::{Request, StatusCode, Uri};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use angos_cache::{Cache, Config as CacheConfig};
 use angos_oci::{Digest, Namespace, Reference, Tag};
 use angos_oci_service::{Endpoint as OciEndpoint, ManifestEndpoint};
 
-use crate::command::bootstrap;
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::server::router::Route;
 use crate::command::server::server_context::{
     ServerContext, build_ui_config, resolve_forwarded_ip,
 };
 use crate::configuration::{Configuration, TrustedProxy};
-use crate::event_webhook::config::EventWebhookConfig;
 use crate::event_webhook::dispatcher::EventDispatcher;
-use crate::event_webhook::event::Event;
-use crate::identity::{Action, ClientIdentity, RequestScheme};
-use crate::metrics_provider;
-use crate::policy::{AccessMode, PolicyConfig};
-use crate::registry::metadata_store::{MetadataStore, Settings};
-use crate::registry::repository_resolver::RepositoryResolver;
+use crate::event_webhook::event::{Event, EventSubject};
+use crate::identity::RequestScheme;
 use crate::registry::test_utils::test_job_store;
-use crate::registry::{Error as RegistryError, Registry, RegistryConfig, Repository};
+use crate::registry::{Error as RegistryError, Registry, RegistryConfig};
 use crate::test_fixtures::configuration::{load_config, minimal_config};
 
-#[derive(Default)]
-pub struct TestConfigOptions<'a> {
-    pub access_policy: Option<PolicyConfig<AccessMode>>,
-    pub webhooks: Vec<TestWebhook<'a>>,
-}
-
-pub struct TestWebhook<'a> {
-    pub name: &'a str,
-    pub url: &'a str,
-}
-
-pub fn create_test_config_with(options: TestConfigOptions<'_>) -> Configuration {
-    metrics_provider::initialize_metrics();
-    let mut config = minimal_config();
-    if let Some(access_policy) = options.access_policy {
-        config.global.access_policy = access_policy;
-    }
-    for webhook in options.webhooks {
-        let webhook_config = format!(
-            r#"
-            url = "{}"
-            policy = "optional"
-            events = ["manifest.push"]
-        "#,
-            webhook.url
-        );
-        config.global.event_webhooks.push(webhook.name.to_string());
-        config.event_webhook.insert(
-            webhook.name.to_string(),
-            toml::from_str::<EventWebhookConfig>(&webhook_config).unwrap(),
-        );
-    }
-    config
-}
-
 pub async fn create_test_server_context() -> ServerContext {
-    let config = create_test_config_with(TestConfigOptions::default());
-    create_test_server_context_from_config(&config).await
+    create_test_server_context_from_config(&minimal_config()).await
 }
 
-pub async fn create_test_server_context_with(options: TestConfigOptions<'_>) -> ServerContext {
-    let config = create_test_config_with(options);
-    create_test_server_context_from_config(&config).await
-}
-
-/// The in-memory cache a test context shares with its authenticator and
-/// authorizer.
-fn test_cache() -> Arc<Cache> {
-    CacheConfig::Memory.to_backend().expect("memory cache")
-}
-
+/// Builds the registry over a test job queue, so no in-process loop drains it.
 pub async fn create_test_server_context_from_config(config: &Configuration) -> ServerContext {
-    let registry = create_test_registry(config).await;
-    ServerContext::new(config, &test_cache(), registry).unwrap()
-}
-
-pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
-    let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
-    let auth_cache = config.cache.to_backend().unwrap();
-    let storage_config = config.resolve_registry_storage();
-    let store = bootstrap::build_object_store(&storage_config).unwrap();
-    let metadata_store = Arc::new(MetadataStore::new(store, Settings::default()));
-
-    let mut repositories_map = HashMap::new();
-    for (name, repo_config) in &config.repository {
-        let repo = Repository::new(
-            name,
-            repo_config,
-            &auth_cache,
-            config.global.max_manifest_size_bytes(),
-        )
-        .await
-        .unwrap();
-        repositories_map.insert(name.clone(), repo);
-    }
-    let resolver = Arc::new(
-        RepositoryResolver::new(Arc::new(repositories_map))
-            .expect("test repositories must not have overlapping prefixes"),
-    );
+    let cache = config.cache.to_backend().unwrap();
+    let StoreContext {
+        blob_store,
+        metadata_store,
+        repositories,
+    } = bootstrap::build_context(config, &cache).await.unwrap();
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
@@ -120,42 +46,28 @@ pub async fn create_test_registry(config: &Configuration) -> Arc<Registry> {
         event_dispatcher: EventDispatcher::from_config(config).unwrap(),
         ..RegistryConfig::new(test_job_store(&metadata_store))
     };
-
-    Registry::new(blob_backend, metadata_store, resolver, registry_config)
+    let registry = Registry::new(blob_store, metadata_store, repositories, registry_config);
+    ServerContext::new(config, &cache, registry).unwrap()
 }
 
 pub fn create_test_event() -> Event {
     let digest: Digest = "sha256:abc1230000000000000000000000000000000000000000000000000000000000"
         .parse()
         .expect("test digest should parse");
-    Event::push_manifest(
+    Event::new(
+        EventSubject::ManifestPush {
+            digest: digest.clone(),
+            reference: Reference::Digest(digest),
+        },
         &Namespace::new("test/repo").expect("test namespace should parse"),
         "test-repo",
-        &digest,
-        &Reference::Digest(digest.clone()),
         None,
     )
 }
 
 #[tokio::test]
-async fn test_authenticate_request_no_credentials() {
-    let config = minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authenticate_request(&parts, None).await;
-
-    let identity = result.unwrap();
-    assert!(identity.username.is_none());
-}
-
-#[tokio::test]
 async fn test_authenticate_request_with_basic_auth() {
-    let argon_config = Params::default();
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_config);
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
     let password_hash = argon.hash_password(b"testpass").unwrap().to_string();
 
     let config = load_config(&format!(
@@ -165,109 +77,44 @@ async fn test_authenticate_request_with_basic_auth() {
         password = "{password_hash}"
     "#
     ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
+    let context = create_test_server_context_from_config(&config).await;
 
-    let auth_header = format!(
-        "Basic {}",
-        base64::prelude::BASE64_STANDARD.encode("testuser:testpass")
-    );
+    let auth_header = format!("Basic {}", BASE64_STANDARD.encode("testuser:testpass"));
     let request = Request::builder()
         .header("Authorization", auth_header)
         .body(())
         .unwrap();
     let (parts, ()) = request.into_parts();
 
-    let result = context.authenticate_request(&parts, None).await;
-
-    let identity = result.unwrap();
+    let identity = context.authenticate_request(&parts, None).await.unwrap();
     assert_eq!(identity.username, Some("testuser".to_string()));
     assert_eq!(identity.id, Some("testuser".to_string()));
 }
 
+/// Only a peer inside `trusted_proxies` may name the client IP via headers.
 #[tokio::test]
-async fn test_authenticate_request_ignores_x_forwarded_for_from_untrusted_peer() {
-    let config = minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
+async fn x_forwarded_for_is_believed_only_from_a_trusted_proxy() {
+    for (global, expected) in [
+        ("", "127.0.0.1"),
+        (r#"trusted_proxies = ["127.0.0.1"]"#, "192.168.1.100"),
+    ] {
+        let context = create_test_server_context_from_config(&load_config(global)).await;
+        let request = Request::builder()
+            .header("X-Forwarded-For", "192.168.1.100")
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+        let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-    let request = Request::builder()
-        .header("X-Forwarded-For", "192.168.1.100, 10.0.0.1")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-    let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-    let result = context
-        .authenticate_request(&parts, Some(remote_addr))
-        .await;
-
-    let identity = result.unwrap();
-    assert_eq!(
-        identity.client_ip,
-        Some("127.0.0.1".to_string()),
-        "a peer outside trusted_proxies must not spoof its IP via headers"
-    );
+        let identity = context
+            .authenticate_request(&parts, Some(remote_addr))
+            .await
+            .unwrap();
+        assert_eq!(identity.client_ip.as_deref(), Some(expected), "{global}");
+    }
 }
 
-#[tokio::test]
-async fn test_authenticate_request_x_forwarded_for_from_trusted_proxy_overrides_remote_address() {
-    let config = load_config(r#"trusted_proxies = ["127.0.0.1"]"#);
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let request = Request::builder()
-        .header("X-Forwarded-For", "192.168.1.100")
-        .body(())
-        .unwrap();
-    let (parts, ()) = request.into_parts();
-    let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-    let result = context
-        .authenticate_request(&parts, Some(remote_addr))
-        .await;
-
-    let identity = result.unwrap();
-    assert_eq!(identity.client_ip, Some("192.168.1.100".to_string()));
-}
-
-#[tokio::test]
-async fn test_authorize_request_with_global_policy() {
-    let config = load_config(
-        r#"
-        [global.access_policy]
-        default = "allow"
-        rules = []
-
-        [repository.test]
-        namespace_pattern = "^test/.*"
-
-        [repository.test.access_policy]
-        default = "allow"
-        rules = []
-    "#,
-    );
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let route = Action::GetManifest {
-        namespace: Namespace::new("test/repo").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-    let identity = ClientIdentity::new(None);
-    let request = Request::builder().body(()).unwrap();
-    let (parts, ()) = request.into_parts();
-
-    let result = context.authorize_request(&route, &identity, &parts).await;
-
-    assert!(result.is_ok());
-}
-
-/// A pull naming a mirrored registry in `?ns=` is served from the repository
-/// that mirrors it, so a client addressing the upstream's own paths reaches the
-/// cache without prefixing them.
-#[tokio::test]
-async fn proxy_namespace_resolves_to_the_mirroring_repository() {
+async fn docker_hub_context() -> ServerContext {
     let config = load_config(
         r#"
         [repository."docker-hub"]
@@ -277,7 +124,15 @@ async fn proxy_namespace_resolves_to_the_mirroring_repository() {
         url = "https://registry-1.docker.io"
     "#,
     );
-    let context = create_test_server_context_from_config(&config).await;
+    create_test_server_context_from_config(&config).await
+}
+
+/// A pull naming a mirrored registry in `?ns=` is served from the repository
+/// that mirrors it, so a client addressing the upstream's own paths reaches the
+/// cache without prefixing them.
+#[tokio::test]
+async fn proxy_namespace_resolves_to_the_mirroring_repository() {
+    let context = docker_hub_context().await;
 
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
@@ -305,16 +160,7 @@ async fn proxy_namespace_resolves_to_the_mirroring_repository() {
 /// prefixing it again would look for `docker-hub/docker-hub/...`.
 #[tokio::test]
 async fn proxy_namespace_leaves_an_already_prefixed_request() {
-    let config = load_config(
-        r#"
-        [repository."docker-hub"]
-        namespace = "docker.io"
-
-        [[repository."docker-hub".upstream]]
-        url = "https://registry-1.docker.io"
-    "#,
-    );
-    let context = create_test_server_context_from_config(&config).await;
+    let context = docker_hub_context().await;
 
     let uri: Uri = "/v2/docker-hub/library/nginx/tags/list?ns=docker.io"
         .parse()
@@ -342,16 +188,7 @@ async fn proxy_namespace_leaves_an_already_prefixed_request() {
 /// arrived, and no `OCI-Namespace` is echoed to claim otherwise.
 #[tokio::test]
 async fn an_unclaimed_proxy_namespace_is_ignored() {
-    let config = load_config(
-        r#"
-        [repository."docker-hub"]
-        namespace = "docker.io"
-
-        [[repository."docker-hub".upstream]]
-        url = "https://registry-1.docker.io"
-    "#,
-    );
-    let context = create_test_server_context_from_config(&config).await;
+    let context = docker_hub_context().await;
 
     let uri: Uri = "/v2/library/nginx/tags/list?ns=quay.io".parse().unwrap();
     let mut route = Route::Oci(OciEndpoint::ListTags {
@@ -378,16 +215,7 @@ async fn an_unclaimed_proxy_namespace_is_ignored() {
 /// namespace it spelled out rather than landing in the mirror's cache.
 #[tokio::test]
 async fn proxy_namespace_leaves_a_write_alone() {
-    let config = load_config(
-        r#"
-        [repository."docker-hub"]
-        namespace = "docker.io"
-
-        [[repository."docker-hub".upstream]]
-        url = "https://registry-1.docker.io"
-    "#,
-    );
-    let context = create_test_server_context_from_config(&config).await;
+    let context = docker_hub_context().await;
 
     let uri: Uri = "/v2/library/nginx/manifests/latest?ns=docker.io"
         .parse()
@@ -416,16 +244,7 @@ async fn proxy_namespace_leaves_a_write_alone() {
 /// request is refused instead.
 #[tokio::test]
 async fn proxy_namespace_refuses_a_name_it_cannot_map() {
-    let config = load_config(
-        r#"
-        [repository."docker-hub"]
-        namespace = "docker.io"
-
-        [[repository."docker-hub".upstream]]
-        url = "https://registry-1.docker.io"
-    "#,
-    );
-    let context = create_test_server_context_from_config(&config).await;
+    let context = docker_hub_context().await;
 
     // One character short of the cap, so any prefix overflows it.
     let long = "a".repeat(255);
@@ -454,35 +273,8 @@ async fn proxy_namespace_refuses_a_name_it_cannot_map() {
 }
 
 #[tokio::test]
-async fn test_server_context_new_with_event_webhooks() {
-    let config = load_config(
-        r#"
-        [event_webhook.test_hook]
-        url = "https://example.com/webhook"
-        policy = "optional"
-        events = ["manifest.push"]
-    "#,
-    );
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    assert!(context.registry.has_event_dispatcher());
-}
-
-#[tokio::test]
-async fn test_server_context_new_without_event_webhooks() {
-    let config = minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    assert!(!context.registry.has_event_dispatcher());
-}
-
-#[tokio::test]
 async fn test_dispatch_event_with_no_dispatcher() {
-    let config = minimal_config();
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
+    let context = create_test_server_context().await;
 
     let event = create_test_event();
 
@@ -490,134 +282,51 @@ async fn test_dispatch_event_with_no_dispatcher() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_dispatch_event_required_webhook_failure_returns_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-        event_webhooks = ["test_hook"]
-
-        [event_webhook.test_hook]
-        url = "{}/webhook"
-        policy = "required"
-        events = ["manifest.push"]
-    "#,
-        mock_server.uri()
-    ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
-
-    let event = create_test_event();
-
-    let result = context.registry.dispatch_events(&[event]).await;
-    assert!(matches!(result, Err(RegistryError::EventDelivery(_))));
-}
-
-fn proxies(sources: &[&str]) -> Vec<TrustedProxy> {
-    sources.iter().map(|s| s.parse().unwrap()).collect()
-}
-
+/// Only proxies append on the right, some as a new field line, so the rightmost
+/// untrusted entry is the client. A malformed entry breaks the chain rather than
+/// falling back to the client-settable `X-Real-IP`.
 #[test]
-fn test_resolve_forwarded_ip_takes_rightmost_untrusted_entry() {
-    // 10.0.0.1 is an intermediate trusted proxy and the entry it appended is
-    // the client; the leftmost entries are client-supplied and must not win.
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-Forwarded-For",
-        "1.2.3.4, 192.168.1.100, 10.0.0.1".parse().unwrap(),
+fn resolve_forwarded_ip_takes_the_rightmost_untrusted_entry() {
+    let trusted: Vec<TrustedProxy> = vec!["10.0.0.0/8".parse().unwrap()];
+    let resolve = |forwarded: &[&str], real_ip: Option<&str>, proxies: &[TrustedProxy]| {
+        let mut headers = HeaderMap::new();
+        for line in forwarded {
+            headers.append("X-Forwarded-For", line.parse().unwrap());
+        }
+        if let Some(real_ip) = real_ip {
+            headers.insert("X-Real-IP", real_ip.parse().unwrap());
+        }
+        resolve_forwarded_ip(&headers, proxies)
+    };
+    let real_ip = Some("192.168.1.200");
+
+    assert_eq!(
+        resolve(&["1.2.3.4, 192.168.1.100, 10.0.0.1"], None, &trusted).as_deref(),
+        Some("192.168.1.100")
     );
     assert_eq!(
-        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
-        Some("192.168.1.100".to_string())
+        resolve(&["10.0.0.5", "203.0.113.9"], None, &trusted).as_deref(),
+        Some("203.0.113.9")
     );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_whitespace() {
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Forwarded-For", "  192.168.1.100  ".parse().unwrap());
+    assert_eq!(resolve(&["not-an-ip, 10.0.0.1"], real_ip, &trusted), None);
     assert_eq!(
-        resolve_forwarded_ip(&headers, &[]),
-        Some("192.168.1.100".to_string())
+        resolve(&["10.0.0.2, 10.0.0.1"], real_ip, &trusted).as_deref(),
+        real_ip
     );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_missing_header() {
-    let headers = HeaderMap::new();
-    assert_eq!(resolve_forwarded_ip(&headers, &[]), None);
-}
-
-#[test]
-fn test_resolve_forwarded_ip_reads_every_field_line_last_first() {
-    // A proxy appending its own field line leaves the client's line first.
-    let mut headers = HeaderMap::new();
-    headers.append("X-Forwarded-For", "10.0.0.5".parse().unwrap());
-    headers.append("X-Forwarded-For", "203.0.113.9".parse().unwrap());
     assert_eq!(
-        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
-        Some("203.0.113.9".to_string())
+        resolve(&["192.168.1.100"], real_ip, &[]).as_deref(),
+        Some("192.168.1.100")
     );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_rejects_non_ip_entry() {
-    // A forged non-IP entry must not become the client IP; it breaks the
-    // chain rather than passing through verbatim or falling back to X-Real-IP.
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Forwarded-For", "not-an-ip, 10.0.0.1".parse().unwrap());
-    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
+    assert_eq!(resolve(&[], real_ip, &[]).as_deref(), real_ip);
+    assert_eq!(resolve(&[], None, &[]), None);
     assert_eq!(
-        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
-        None
+        resolve(&["  192.168.1.100  "], None, &[]).as_deref(),
+        Some("192.168.1.100")
     );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_canonicalises_mapped_ipv4() {
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Forwarded-For", "::ffff:192.168.1.100".parse().unwrap());
     assert_eq!(
-        resolve_forwarded_ip(&headers, &[]),
-        Some("192.168.1.100".to_string())
-    );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_x_real_ip_fallback() {
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
-    assert_eq!(
-        resolve_forwarded_ip(&headers, &[]),
-        Some("192.168.1.200".to_string())
-    );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_all_entries_trusted_falls_back_to_x_real_ip() {
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Forwarded-For", "10.0.0.2, 10.0.0.1".parse().unwrap());
-    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
-    assert_eq!(
-        resolve_forwarded_ip(&headers, &proxies(&["10.0.0.0/8"])),
-        Some("192.168.1.200".to_string())
-    );
-}
-
-#[test]
-fn test_resolve_forwarded_ip_x_forwarded_for_takes_precedence() {
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Forwarded-For", "192.168.1.100".parse().unwrap());
-    headers.insert("X-Real-IP", "192.168.1.200".parse().unwrap());
-    assert_eq!(
-        resolve_forwarded_ip(&headers, &[]),
-        Some("192.168.1.100".to_string())
+        resolve(&["::ffff:192.168.1.100"], None, &[]).as_deref(),
+        Some("192.168.1.100"),
+        "a mapped IPv4 reads as its dotted form"
     );
 }
 
@@ -643,8 +352,7 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
     "#,
         mock_server.uri()
     ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
+    let context = create_test_server_context_from_config(&config).await;
 
     let events = vec![
         create_test_event(),
@@ -653,7 +361,10 @@ async fn dispatch_events_first_failure_does_not_abort_batch() {
     ];
     let result = context.registry.dispatch_events(&events).await;
 
-    assert!(result.is_err(), "a delivery failure must surface overall");
+    assert!(
+        matches!(result, Err(RegistryError::EventDelivery(_))),
+        "a delivery failure must surface overall"
+    );
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(
         requests.len(),
@@ -681,8 +392,7 @@ async fn dispatch_events_all_success_returns_ok() {
     "#,
         mock_server.uri()
     ));
-    let registry = create_test_registry(&config).await;
-    let context = ServerContext::new(&config, &test_cache(), registry).unwrap();
+    let context = create_test_server_context_from_config(&config).await;
 
     let events = vec![create_test_event(), create_test_event()];
     let result = context.registry.dispatch_events(&events).await;

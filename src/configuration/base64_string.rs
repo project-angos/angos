@@ -11,17 +11,11 @@ use zeroize::Zeroize;
 /// happens to carry. It has no `Debug`, so it cannot reach a log by accident;
 /// wrap it in [`Secret`](angos_secret::Secret) to have it zeroized on drop.
 #[derive(Clone, Zeroize)]
-pub struct Base64String(Vec<u8>);
+pub struct Base64String(pub Vec<u8>);
 
 impl Base64String {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
-    }
-}
-
-impl From<Vec<u8>> for Base64String {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
     }
 }
 

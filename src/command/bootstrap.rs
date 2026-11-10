@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::info;
@@ -9,19 +8,18 @@ use angos_s3_client::Error as S3Error;
 use angos_storage::fs::Backend as StorageFsBackend;
 use angos_storage::{Error as StorageError, ObjectStore};
 
-use crate::configuration::{Configuration, GlobalConfig, ResolvedStorageConfig};
+use crate::configuration::{Configuration, GlobalConfig};
 use crate::event_webhook::Error as EventWebhookError;
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::jobs::store::{Error as JobStoreError, JobStore};
 use crate::policy::ImagePolicy;
-use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::{MetadataStore, PullHistoryConfig, Settings};
+use crate::registry::blob_store::{BlobStore, BlobStoreConfig};
+use crate::registry::metadata_store::{MetadataStore, Settings};
 use crate::registry::repository_resolver::{OverlapError, RepositoryResolver};
 use crate::registry::{
     Error as RegistryError, Registry, RegistryConfig, Repository, prime_pull_through, repository,
 };
 
-/// Errors produced by the shared CLI bootstrap helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("storage backend failed: {0}")]
@@ -56,48 +54,21 @@ impl From<S3Error> for Error {
 }
 
 /// Build the object store shared by the metadata store and the job store.
-pub fn build_object_store(config: &ResolvedStorageConfig) -> Result<Arc<dyn ObjectStore>, Error> {
-    let object: Arc<dyn ObjectStore> = match config {
-        ResolvedStorageConfig::FS(config) => {
+pub fn build_object_store(config: &BlobStoreConfig) -> Result<Arc<dyn ObjectStore>, Error> {
+    Ok(match config {
+        BlobStoreConfig::FS(config) => {
             info!("Using filesystem storage backend");
-            Arc::new(
-                StorageFsBackend::builder(&config.root_dir)
-                    .sync_to_disk(config.sync_to_disk)
-                    .build(),
-            )
+            Arc::new(StorageFsBackend::new(&config.root_dir, config.sync_to_disk))
         }
-        ResolvedStorageConfig::S3(config) => {
+        BlobStoreConfig::S3(config) => {
             info!("Using S3 storage backend");
             Arc::new(config.build()?)
         }
-    };
-
-    Ok(object)
+    })
 }
 
-pub fn metadata_store(
-    config: &ResolvedStorageConfig,
-    namespace_walk_concurrency: NonZeroUsize,
-    gc_grace_secs: u64,
-    pull_history: PullHistoryConfig,
-) -> Result<Arc<MetadataStore>, Error> {
-    let store = build_object_store(config)?;
-
-    Ok(Arc::new(MetadataStore::new(
-        store,
-        Settings {
-            namespace_walk_concurrency,
-            gc_grace_secs,
-            pull_history,
-            // No configuration knob: the linger is bounded by the writer
-            // backoff the store itself defines.
-            ..Settings::default()
-        },
-    )))
-}
-
-/// The storage and repository handles every maintenance command boots with.
-pub struct MaintenanceContext {
+/// The storage and repository handles every command boots with.
+pub struct StoreContext {
     pub blob_store: Arc<BlobStore>,
     pub metadata_store: Arc<MetadataStore>,
     pub repositories: Arc<RepositoryResolver>,
@@ -105,22 +76,36 @@ pub struct MaintenanceContext {
 
 /// Build the auth cache, blob backend, metadata store and repositories a
 /// maintenance command shares.
-pub async fn maintenance_context(config: &Configuration) -> Result<MaintenanceContext, Error> {
-    let auth_cache = config.cache.to_backend()?;
+pub async fn maintenance_context(config: &Configuration) -> Result<StoreContext, Error> {
+    build_context(config, &config.cache.to_backend()?).await
+}
+
+/// Build the blob backend, metadata store and repositories, the latter over the
+/// caller's `auth_cache`.
+pub async fn build_context(
+    config: &Configuration,
+    auth_cache: &Arc<Cache>,
+) -> Result<StoreContext, Error> {
+    let global = &config.global;
     let blob_store = Arc::new(
         config
             .blob_store
             .build_backend()?
-            .with_namespace_walk_concurrency(config.global.namespace_walk_concurrency),
+            .with_namespace_walk_concurrency(global.namespace_walk_concurrency),
     );
-    let metadata_store = metadata_store(
-        &config.resolve_registry_storage(),
-        config.global.namespace_walk_concurrency,
-        config.global.gc_grace_secs,
-        config.global.pull_history,
-    )?;
-    let repositories = repositories(&config.repository, &auth_cache, &config.global).await?;
-    Ok(MaintenanceContext {
+    let metadata_store = Arc::new(MetadataStore::new(
+        build_object_store(&config.resolve_registry_storage())?,
+        Settings {
+            namespace_walk_concurrency: global.namespace_walk_concurrency,
+            gc_grace_secs: global.gc_grace_secs,
+            pull_history: global.pull_history,
+            // No configuration knob: the linger is bounded by the writer
+            // backoff the store itself defines.
+            ..Settings::default()
+        },
+    ));
+    let repositories = repositories(&config.repository, auth_cache, global).await?;
+    Ok(StoreContext {
         blob_store,
         metadata_store,
         repositories,
@@ -136,17 +121,15 @@ pub fn registry(
     resolver: Arc<RepositoryResolver>,
     job_store: Arc<JobStore>,
 ) -> Result<Arc<Registry>, Error> {
-    let dispatcher = EventDispatcher::from_config(config)?;
-    let registry = Registry::new(
+    Ok(Registry::new(
         blob_store,
         metadata_store,
         resolver,
         RegistryConfig {
-            event_dispatcher: dispatcher,
+            event_dispatcher: EventDispatcher::from_config(config)?,
             ..RegistryConfig::new(job_store)
         },
-    );
-    Ok(registry)
+    ))
 }
 
 /// `global` supplies the manifest size bound and the scan and index policies
@@ -183,8 +166,7 @@ pub async fn repositories(
             prime_pull_through(repository.name.as_ref());
         }
     }
-    let resolver = RepositoryResolver::new(Arc::new(map))?;
-    Ok(Arc::new(resolver))
+    Ok(Arc::new(RepositoryResolver::new(Arc::new(map))?))
 }
 
 #[cfg(test)]
@@ -281,27 +263,17 @@ mod tests {
 
     #[tokio::test]
     async fn repositories_overlapping_prefixes_fails() {
-        let mut configs = HashMap::new();
-        configs.insert(
-            "team".to_string(),
-            repository::Config {
-                access_policy: Some(PolicyConfig {
-                    default: Some(AccessMode::Allow),
-                    ..PolicyConfig::default()
-                }),
-                ..repository::Config::default()
-            },
-        );
-        configs.insert(
-            "team/app".to_string(),
-            repository::Config {
-                access_policy: Some(PolicyConfig {
-                    default: Some(AccessMode::Allow),
-                    ..PolicyConfig::default()
-                }),
-                ..repository::Config::default()
-            },
-        );
+        let allow = || repository::Config {
+            access_policy: Some(PolicyConfig {
+                default: Some(AccessMode::Allow),
+                ..PolicyConfig::default()
+            }),
+            ..repository::Config::default()
+        };
+        let configs = HashMap::from([
+            ("team".to_string(), allow()),
+            ("team/app".to_string(), allow()),
+        ]);
         let cache = CacheConfig::Memory.to_backend().unwrap();
         let result = repositories(&configs, &cache, &GlobalConfig::default()).await;
         assert!(matches!(result, Err(Error::Overlap(_))));

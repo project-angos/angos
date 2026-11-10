@@ -4,7 +4,7 @@ use hyper::header::{ALLOW, CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTIC
 use hyper::{Response, StatusCode};
 
 use angos_oci::response::{ErrorCode, RECLAMATION_IN_PROGRESS_CODE};
-use angos_transport::ResponseBody;
+use angos_transport::{ResponseBody, json_response};
 
 use crate::command::server::error::Error;
 
@@ -18,16 +18,9 @@ pub fn error_to_response(
     request_id: Option<&str>,
     challenge: Option<HeaderValue>,
 ) -> Response<ResponseBody> {
-    let Ok(body) = serde_json::to_vec(&error.error_body(request_id)) else {
-        return fallback_500();
-    };
-    let body = Bytes::from(body);
-
-    let mut response = Response::builder()
-        .status(error.status_code())
-        .header(CONTENT_TYPE, "application/json")
-        .body(ResponseBody::Fixed(Full::new(body)))
-        .unwrap_or_else(|_| fallback_500());
+    let mut response =
+        json_response::<_, Error>(error.status_code(), &error.error_body(request_id))
+            .unwrap_or_else(|_| fallback_500());
     response.extensions_mut().insert(error.to_string());
 
     if matches!(error, Error::Custom { code, .. } if code == RECLAMATION_IN_PROGRESS_CODE) {

@@ -7,7 +7,7 @@ use argon2::{
 use serde::Deserialize;
 
 use crate::auth::basic_auth::{Config, REJECTION_FLOOR, TIMING_GUARD_HASH};
-use crate::auth::{AuthMiddleware, AuthResult, BasicAuthValidator, Error};
+use crate::auth::{AuthResult, BasicAuthValidator, Error};
 use crate::identity::ClientIdentity;
 use crate::test_fixtures::requests::{empty_parts, parts_with_basic_auth};
 
@@ -27,10 +27,10 @@ fn hash_password_for_test(password: &str) -> String {
         .to_string()
 }
 
-fn build_test_toml() -> String {
+fn build_test_config() -> TestConfig {
     let hash1 = hash_password_for_test("password1");
     let hash2 = hash_password_for_test("password2");
-    format!(
+    toml::from_str(&format!(
         r#"
 [identity.id_1]
 username = "user1"
@@ -40,11 +40,8 @@ password = "{hash1}"
 username = "user2"
 password = "{hash2}"
 "#
-    )
-}
-
-fn build_test_config() -> TestConfig {
-    toml::from_str(&build_test_toml()).expect("Failed to parse test config")
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -106,10 +103,14 @@ fn the_timing_guard_falls_back_to_the_constant_without_identities() {
 /// nor one configured hash's cost from another's.
 #[tokio::test]
 async fn a_rejection_is_held_to_the_floor() {
-    let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity).unwrap();
+    let configured = BasicAuthValidator::new(&build_test_config().identity).unwrap();
+    let empty = BasicAuthValidator::new(&HashMap::new()).unwrap();
 
-    for (username, password) in [("no-such-user", "password1"), ("user1", "wrong-password")] {
+    for (auth, username, password) in [
+        (&configured, "no-such-user", "password1"),
+        (&configured, "user1", "wrong-password"),
+        (&empty, "user1", "password1"),
+    ] {
         let parts = parts_with_basic_auth(username, password);
         let started = Instant::now();
 
@@ -128,47 +129,20 @@ async fn a_rejection_is_held_to_the_floor() {
     }
 }
 
-#[test]
-fn test_validate_credentials() {
-    let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity).unwrap();
-
-    let user1_id = auth.validate_credentials("user1", "password1");
-    assert_eq!(user1_id, Some("id_1".to_string()));
-
-    let user2_id = auth.validate_credentials("user2", "password2");
-    assert_eq!(user2_id, Some("id_2".to_string()));
-
-    let invalid_user = auth.validate_credentials("invalid_user", "password1");
-    assert_eq!(invalid_user, None);
-
-    let invalid_pass = auth.validate_credentials("user1", "wrong_password");
-    assert_eq!(invalid_pass, None);
-}
-
 #[tokio::test]
-async fn test_authenticate() {
-    let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity).unwrap();
+async fn valid_credentials_set_the_identity() {
+    let auth = BasicAuthValidator::new(&build_test_config().identity).unwrap();
 
-    let parts = parts_with_basic_auth("user1", "password1");
     let mut identity = ClientIdentity::default();
-    let result = auth.authenticate(&parts, &mut identity).await.unwrap();
-    assert!(matches!(result, AuthResult::Authenticated));
-    assert_eq!(identity.username, Some("user1".to_string()));
-    assert_eq!(identity.id, Some("id_1".to_string()));
-}
+    let result = auth
+        .authenticate(&parts_with_basic_auth("user2", "password2"), &mut identity)
+        .await;
+    assert!(matches!(result, Ok(AuthResult::Authenticated)));
+    assert_eq!(identity.username.as_deref(), Some("user2"));
+    assert_eq!(identity.id.as_deref(), Some("id_2"));
 
-#[tokio::test]
-async fn test_authenticate_without_authorization_header_returns_no_credentials() {
-    let config = build_test_config();
-    let auth = BasicAuthValidator::new(&config.identity).unwrap();
-
-    let parts = empty_parts();
-    let mut identity = ClientIdentity::default();
-    let result = auth.authenticate(&parts, &mut identity).await.unwrap();
-
-    assert!(matches!(result, AuthResult::NoCredentials));
+    let result = auth.authenticate(&empty_parts(), &mut identity).await;
+    assert!(matches!(result, Ok(AuthResult::NoCredentials)));
 }
 
 #[test]
@@ -184,14 +158,4 @@ password = "not-a-valid-argon2-hash"
         result.is_err(),
         "invalid Argon2 hash must fail at deserialization"
     );
-}
-
-#[tokio::test]
-async fn test_empty_identity_map_rejects_presented_credentials() {
-    let auth = BasicAuthValidator::new(&HashMap::new()).unwrap();
-
-    let parts = parts_with_basic_auth("user1", "password1");
-    let mut identity = ClientIdentity::default();
-    let result = auth.authenticate(&parts, &mut identity).await;
-    assert!(matches!(result, Err(Error::Unauthorized(_))));
 }

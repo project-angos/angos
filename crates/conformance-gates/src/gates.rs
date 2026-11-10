@@ -2,6 +2,7 @@ use std::fs::{canonicalize, read_to_string, write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::{TimeDelta, Utc};
 use reqwest::StatusCode;
 use tokio::time::sleep;
@@ -46,6 +47,20 @@ impl GateContext {
             .run_logged(&["scrub"], &self.state_dir.join(log_name))
             .await?;
         output.parse()
+    }
+
+    /// Scrubs until a run acts on nothing, `runs` being the scrub runs so far.
+    async fn scrub_to_fixpoint(&self, log_name: &str, mut runs: u32) -> GateResult<u32> {
+        loop {
+            let summary = self.scrub_logged(log_name).await?;
+            runs += 1;
+            if summary.is_all_zero() {
+                return Ok(runs);
+            }
+            ensure(runs < FIXPOINT_MAX_RUNS, || {
+                format!("no fixpoint after {runs} runs ({log_name})")
+            })?;
+        }
     }
 
     async fn snapshot_to(&self, name: &str) -> GateResult<Snapshot> {
@@ -162,7 +177,7 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     // The quarantine's contents were verified above; empty it like the
     // operator would, then require the store to still converge with no
     // actions at all.
-    ctx.store.delete_prefix("_lost_and_found").await?;
+    ctx.store.objects.delete_prefix("_lost_and_found").await?;
     let post_cleanup = ctx.scrub_logged("scrub-post-cleanup.log").await?;
     ensure(post_cleanup.is_all_zero(), || {
         format!("store did not stay converged after the prune sweeps: {post_cleanup}")
@@ -175,11 +190,17 @@ pub async fn corruption(ctx: &GateContext) -> GateResult<()> {
     let original = ctx.store.body(&layer_key).await?.ok_or_else(|| {
         GateError::Failure("gate layer bytes missing before the audit self-test".into())
     })?;
-    ctx.store.put(&layer_key, b"corrupted layer bytes").await?;
+    ctx.store
+        .objects
+        .put(&layer_key, Bytes::from_static(b"corrupted layer bytes"))
+        .await?;
     ensure(ctx.registry.audit_digests(1).await.is_err(), || {
         "the digest audit failed to detect corrupted layer bytes".to_string()
     })?;
-    ctx.store.put(&layer_key, &original).await?;
+    ctx.store
+        .objects
+        .put(&layer_key, Bytes::from(original))
+        .await?;
 
     ctx.registry.audit_digests(AUDIT_FLOOR).await?;
     println!(
@@ -199,24 +220,15 @@ async fn pin_first_run(ctx: &GateContext) -> GateResult<()> {
         .await?;
     let run1: ScrubSummary = run1_log.parse()?;
     println!("{run1}");
-    ensure(run1.quarantined == EXPECTED_QUARANTINED, || {
-        format!(
-            "run 1 quarantined {}, expected {EXPECTED_QUARANTINED}",
-            run1.quarantined
-        )
-    })?;
-    ensure(run1.corrupt == EXPECTED_CORRUPT, || {
-        format!(
-            "run 1 corrupt-deleted {}, expected {EXPECTED_CORRUPT}",
-            run1.corrupt
-        )
-    })?;
-    ensure(run1.failures == EXPECTED_FAILURES_RUN1, || {
-        format!(
-            "run 1 failures {}, expected {EXPECTED_FAILURES_RUN1}",
-            run1.failures
-        )
-    })?;
+    for (what, actual, expected) in [
+        ("quarantined", run1.quarantined, EXPECTED_QUARANTINED),
+        ("corrupt-deleted", run1.corrupt, EXPECTED_CORRUPT),
+        ("failures", run1.failures, EXPECTED_FAILURES_RUN1),
+    ] {
+        ensure(actual == expected, || {
+            format!("run 1 {what} {actual}, expected {expected}")
+        })?;
+    }
     ensure(run1.repairs >= EXPECTED_MIN_REPAIRS, || {
         format!(
             "run 1 repairs {}, expected at least {EXPECTED_MIN_REPAIRS}",
@@ -250,20 +262,9 @@ async fn pin_first_run(ctx: &GateContext) -> GateResult<()> {
 async fn pin_repairs(ctx: &GateContext, probes: &Probes, baseline: &Snapshot) -> GateResult<()> {
     // Cascading repairs (a recreated link derives more state) must reach a
     // fixpoint within a bounded number of runs.
-    let mut attempts = 1;
-    loop {
-        let fix = ctx.scrub_logged("scrub-fix.log").await?;
-        attempts += 1;
-        if fix.is_all_zero() {
-            break;
-        }
-        ensure(attempts < FIXPOINT_MAX_RUNS, || {
-            format!("no fixpoint after {attempts} runs")
-        })?;
-    }
+    let attempts = ctx.scrub_to_fixpoint("scrub-fix.log", 1).await?;
     println!("fixpoint after {attempts} runs");
 
-    // Per-artifact end states.
     for link in probes.recreated_links() {
         ensure(ctx.store.exists(&link).await?, || {
             format!("link not recreated: {link}")
@@ -289,11 +290,7 @@ async fn pin_repairs(ctx: &GateContext, probes: &Probes, baseline: &Snapshot) ->
     )?;
     // Ownership boundary: scrub must have left every age-gated and
     // config-relative artifact for prune, all the way through the fixpoint.
-    for (key, what) in [
-        (probes.grant_only_data(), "grant-only blob bytes"),
-        (probes.grant_only_ref(), "grant-only blob grant"),
-        (probes.byteless_ref(), "byteless index entry"),
-    ] {
+    for (key, what) in probes.age_gated() {
         ensure(ctx.store.exists(&key).await?, || {
             format!("scrub crossed into prune's domain: {what} gone ({key})")
         })?;
@@ -335,10 +332,7 @@ async fn pin_repairs(ctx: &GateContext, probes: &Probes, baseline: &Snapshot) ->
     ] {
         ctx.registry.manifest(ns, GATE_TAG).await?;
         let digest = format!("sha256:{layer_digest}");
-        let (status, bytes) = ctx.registry.blob(ns, &digest).await?;
-        ensure(status == StatusCode::OK, || {
-            format!("{ns} layer GET {status}")
-        })?;
+        let bytes = ctx.registry.blob(ns, &digest).await?;
         ensure(sha256_hex(&bytes) == **layer_digest, || {
             format!("{ns} layer bytes corrupted")
         })?;
@@ -357,16 +351,19 @@ async fn pin_prune_window(ctx: &GateContext, probes: &Probes) -> GateResult<()> 
     let old_uuid = "33333333-0000-4000-8000-000000000000";
     let session_json = format!("v2/repositories/{GATE_NS}/_uploads/{old_uuid}/session.json");
     ctx.store
+        .objects
         .put(
             &session_json,
-            format!(r#"{{"last_activity":"{old_ts}","committed_offset":18,"hash_state":""}}"#)
-                .as_bytes(),
+            Bytes::from(format!(
+                r#"{{"last_activity":"{old_ts}","committed_offset":18,"hash_state":""}}"#
+            )),
         )
         .await?;
     ctx.store
+        .objects
         .put(
             &format!("v2/repositories/{GATE_NS}/_uploads/{old_uuid}/data"),
-            b"stale upload bytes",
+            Bytes::from_static(b"stale upload bytes"),
         )
         .await?;
     ctx.runner
@@ -384,11 +381,7 @@ async fn pin_prune_window(ctx: &GateContext, probes: &Probes) -> GateResult<()> 
     })?;
 
     // The window still shields every age-gated sweep.
-    for (key, what) in [
-        (probes.grant_only_data(), "grant-only blob bytes"),
-        (probes.grant_only_ref(), "grant-only blob grant"),
-        (probes.byteless_ref(), "byteless index entry"),
-    ] {
+    for (key, what) in probes.age_gated() {
         ensure(ctx.store.exists(&key).await?, || {
             format!("prune reaped a young artifact inside the -u window: {what} ({key})")
         })?;
@@ -443,17 +436,7 @@ async fn pin_prune_window(ctx: &GateContext, probes: &Probes) -> GateResult<()> 
     // Prune only revokes the grant; the bytes are the collector's to
     // reclaim. Scrub (running with the gate config's zero grace) must now
     // collect the unreferenced bytes within the same bounded fixpoint.
-    let mut reclaim_runs = 0;
-    loop {
-        let reclaim = ctx.scrub_logged("scrub-reclaim.log").await?;
-        reclaim_runs += 1;
-        if reclaim.is_all_zero() {
-            break;
-        }
-        ensure(reclaim_runs < FIXPOINT_MAX_RUNS, || {
-            format!("no reclaim fixpoint after {reclaim_runs} runs")
-        })?;
-    }
+    ctx.scrub_to_fixpoint("scrub-reclaim.log", 0).await?;
     ensure(!ctx.store.exists(&probes.grant_only_data()).await?, || {
         format!(
             "grant-only blob bytes survived the collector after revocation ({})",

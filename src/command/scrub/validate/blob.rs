@@ -1,6 +1,8 @@
 //! Blob-data and upload-artifact validation. Runs last, once the index has
 //! been healed, so an empty index really means no references.
 
+use std::sync::PoisonError;
+
 use tracing::warn;
 
 use angos_oci::{Digest, Namespace};
@@ -18,21 +20,15 @@ use crate::registry::keys::DigestExt;
 impl Validator {
     /// Validate one blob's `data` object against its (already healed) index.
     pub async fn validate_blob(&self, digest: &Digest) -> Result<(), Error> {
-        let index = match self.metadata_store.read_blob_index(digest).await {
-            Ok(index) => index,
-            Err(RegistryError::NotFound) => {
-                // No index at all: unreferenced bytes. The executor re-verifies
-                // liveness under a gc run marker before deleting.
-                return self.reclaim_orphan_blob(digest).await;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if index.is_empty() {
-            return self.reclaim_orphan_blob(digest).await;
+        match self.metadata_store.read_blob_index(digest).await {
+            // Referenced: per-entry link probing is the reference pass's job,
+            // and config-relative grant reclamation is prune's.
+            Ok(index) if !index.is_empty() => Ok(()),
+            // Unreferenced bytes. The executor re-verifies liveness under a gc
+            // run marker before deleting.
+            Ok(_) | Err(RegistryError::NotFound) => self.reclaim_orphan_blob(digest).await,
+            Err(e) => Err(e.into()),
         }
-        // Referenced: per-entry link probing is the reference pass's job, and
-        // config-relative grant reclamation is prune's.
-        Ok(())
     }
 
     /// Delete unreferenced bytes, unless the reference walk read references
@@ -42,7 +38,12 @@ impl Validator {
         // The index read pages one directory listing while the reference walk
         // scanned the whole store; disagreement means a listing dropped a key
         // it holds, so the bytes may well be live.
-        if self.reference_walk_saw(digest) {
+        if self
+            .seen_refs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(digest)
+        {
             warn!(
                 "scrub: blob '{digest}' reads as unreferenced but the reference walk found references \
                  for it; refusing to reclaim, the backend's listing is incomplete"
@@ -55,7 +56,7 @@ impl Validator {
         let young = object_younger_than_grace(
             self.blob_store.object_store().as_ref(),
             &digest.blob_path(),
-            self.metadata_store.gc_grace_secs,
+            self.metadata_store.settings.gc_grace_secs,
         )
         .await
         .map_err(RegistryError::from)?;

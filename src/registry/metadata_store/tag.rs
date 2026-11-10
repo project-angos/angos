@@ -21,13 +21,9 @@ use crate::registry::metadata_store::{LinkMetadata, MetadataStore};
 /// truncated to the millisecond its key encodes and floored one millisecond
 /// above the entry it supersedes.
 ///
-/// Entry order is the tag's order, and two replicas sharing a backend can have
-/// skewed clocks. Without the floor a push or delete stamped below the current
-/// winner lands as the loser: the tag does not move, and the client is told it
-/// did. The truncation is part of that floor, since a stamp landing later
-/// inside the superseded millisecond encodes the very same ordinal. A
-/// replicated write keeps its author's timestamp instead, since that is what
-/// the last-writer-wins gate compares.
+/// Replicas sharing a backend can have skewed clocks; without the floor a
+/// write stamped below the current winner lands as the loser, and the client
+/// is told the tag moved when it did not.
 fn local_entry_ts(now: DateTime<Utc>, superseded: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let now = DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now);
     match superseded {
@@ -38,25 +34,33 @@ fn local_entry_ts(now: DateTime<Utc>, superseded: Option<DateTime<Utc>>) -> Date
     }
 }
 
-impl MetadataStore {
-    /// Append one entry to `tag`, the only write of an entry key. The name
-    /// carries the ordinal, the kind and the target, which is the whole
-    /// record, so the body is empty.
-    async fn write_tag_entry(
-        &self,
-        namespace: &Namespace,
-        tag: &Tag,
-        target: &Digest,
-        kind: TagEntryKind,
-        created_at: DateTime<Utc>,
-    ) -> Result<(), Error> {
-        let key = namespace.tag_entry_path(tag, created_at, kind, target);
-        self.object_store()
-            .put(&key, Bytes::new())
-            .await
-            .map_err(Error::from)
-    }
+/// Whether `entry` beats `winner` within a group: same millisecond, then the
+/// highest digest, then a `set` over the `del` of that digest.
+pub fn beats(entry: &TagEntry, winner: &TagEntry) -> bool {
+    entry.ord() == winner.ord()
+        && (entry.digest() > winner.digest()
+            || (entry.digest() == winner.digest() && matches!(winner, TagEntry::Deletion { .. })))
+}
 
+/// The metadata a winning entry resolves to; `None` for a tombstone.
+/// `media_type` is always `None` because the winner comes from key names alone.
+pub fn live_metadata(entry: TagEntry) -> Option<LinkMetadata> {
+    match entry {
+        TagEntry::Set {
+            authored_at,
+            digest,
+            ..
+        } => Some(LinkMetadata {
+            target: digest,
+            created_at: authored_at,
+            media_type: None,
+            descriptor: None,
+        }),
+        TagEntry::Deletion { .. } => None,
+    }
+}
+
+impl MetadataStore {
     /// Point `tag` at `target` with one entry put, returning whether that
     /// moved the tag: `false` for a re-push of the digest it already holds,
     /// which keeps its timestamp so the same key stays the same write.
@@ -81,8 +85,9 @@ impl MetadataStore {
             .or(authored_at)
             .unwrap_or_else(|| local_entry_ts(Utc::now(), newest));
 
-        self.write_tag_entry(namespace, tag, target, TagEntryKind::Set, created_at)
-            .await?;
+        // The key name is the whole record, so the body is empty.
+        let key = namespace.tag_entry_path(tag, created_at, TagEntryKind::Set, target);
+        self.object_store().put(&key, Bytes::new()).await?;
         if !same_target {
             self.index_namespace(namespace).await;
         }
@@ -129,14 +134,13 @@ impl MetadataStore {
             Ok(current) => {
                 let created_at =
                     authored_at.unwrap_or_else(|| local_entry_ts(Utc::now(), current.created_at));
-                self.write_tag_entry(
-                    namespace,
+                let key = namespace.tag_entry_path(
                     tag,
-                    &current.target,
-                    TagEntryKind::Deletion,
                     created_at,
-                )
-                .await?;
+                    TagEntryKind::Deletion,
+                    &current.target,
+                );
+                self.object_store().put(&key, Bytes::new()).await?;
             }
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
@@ -147,36 +151,22 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Resolve `tag` to link-shaped metadata: the complete newest entry group
-    /// decides, the highest digest winning a same-millisecond tie and a
-    /// deletion never beating an equal-timestamped push of the same digest. A
-    /// tombstone winner reads as `NotFound`, and `media_type` is always `None`
-    /// because the winner comes from key names alone.
+    /// Resolve `tag` to link-shaped metadata from its newest entry group's
+    /// winner; a tombstone winner reads as `NotFound`.
     pub async fn resolve_tag(
         &self,
         namespace: &Namespace,
         tag: &Tag,
     ) -> Result<LinkMetadata, Error> {
-        match self.resolve_tag_winner(namespace, tag).await? {
-            Some(TagEntry::Set {
-                authored_at,
-                digest,
-                ..
-            }) => Ok(LinkMetadata {
-                target: digest,
-                created_at: authored_at,
-                media_type: None,
-                descriptor: None,
-            }),
-            Some(TagEntry::Deletion { .. }) | None => Err(Error::NotFound),
-        }
+        self.resolve_tag_winner(namespace, tag)
+            .await?
+            .and_then(live_metadata)
+            .ok_or(Error::NotFound)
     }
 
-    /// The winner of the tag's complete lowest-ordinal entry group, or `None`
-    /// when the tag has no entries, a tombstone winner included, since a local
-    /// write floors its own timestamp above whatever is newest. Reads
-    /// until the ordinal changes, so a same-millisecond pair straddling a page
-    /// boundary is never split.
+    /// The winner of the tag's newest complete entry group, tombstones
+    /// included; `None` when the tag has no entries. Reads until the ordinal
+    /// changes, so a same-millisecond pair straddling a page is never split.
     async fn resolve_tag_winner(
         &self,
         namespace: &Namespace,
@@ -184,23 +174,18 @@ impl MetadataStore {
     ) -> Result<Option<TagEntry>, Error> {
         let dir = namespace.tag_entry_dir(tag);
         let mut names = self.object_store().list_in_order(&dir);
-        let mut group: Vec<TagEntry> = Vec::new();
+        let mut winner: Option<TagEntry> = None;
         while let Some(name) = names.try_next().await? {
             let Ok(entry) = name.parse::<TagEntry>() else {
                 continue;
             };
-            match group.first() {
-                Some(first) if entry.ord() != first.ord() => break,
-                _ => group.push(entry),
+            match &winner {
+                Some(current) if entry.ord() != current.ord() => break,
+                Some(current) if !beats(&entry, current) => {}
+                _ => winner = Some(entry),
             }
         }
-        // Highest digest first; a `set` beats a `del` of the same digest.
-        group.sort_by(|a, b| {
-            b.digest().cmp(a.digest()).then_with(|| {
-                matches!(a, TagEntry::Deletion { .. }).cmp(&matches!(b, TagEntry::Deletion { .. }))
-            })
-        });
-        Ok(group.into_iter().next())
+        Ok(winner)
     }
 
     /// Move one superseded tag entry under the `!hist/` prefix, re-reading the
@@ -237,32 +222,44 @@ mod tests {
     use std::cmp::max;
     use std::sync::Arc;
 
-    use bytes::Bytes;
-    use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
+    use chrono::SubsecRound;
     use tempfile::TempDir;
 
-    use angos_oci::{Digest, Namespace, Tag};
     use angos_storage::ObjectStore;
     use angos_storage::fs::Backend as StorageFsBackend;
 
     use super::*;
-    use crate::registry::keys::NamespaceExt;
     use crate::registry::metadata_store::LinkKind;
     use crate::registry::test_utils::{
         FSRegistryTestCase, RegistryTestCase, drop_links, metadata_store_over,
     };
 
-    /// The entry key carries only the millisecond, so a stamp landing later
-    /// inside the superseded millisecond must still be floored above it: it
-    /// would otherwise encode the same ordinal, leaving the group tie-break
-    /// rather than the clock to decide the tag.
     #[test]
-    fn a_stamp_inside_the_superseded_millisecond_is_floored_above_it() {
-        let entry = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
-        let later_same_ms = entry + TimeDelta::microseconds(700);
-        assert_eq!(
-            local_entry_ts(later_same_ms, Some(entry)),
-            entry + TimeDelta::milliseconds(1)
+    fn a_same_millisecond_tie_goes_to_the_highest_digest_then_the_push() {
+        let (low, high) = {
+            let a = Digest::sha256_of_bytes(b"a");
+            let b = Digest::sha256_of_bytes(b"b");
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let set = |ord, digest: &Digest| TagEntry::Set {
+            ord,
+            authored_at: None,
+            digest: digest.clone(),
+        };
+        let del = |ord, digest: &Digest| TagEntry::Deletion {
+            ord,
+            authored_at: None,
+            held: digest.clone(),
+        };
+
+        assert!(beats(&set(1, &high), &set(1, &low)));
+        assert!(!beats(&set(1, &low), &set(1, &high)));
+        assert!(beats(&del(1, &high), &set(1, &low)));
+        assert!(beats(&set(1, &low), &del(1, &low)));
+        assert!(!beats(&del(1, &low), &set(1, &low)));
+        assert!(
+            !beats(&set(2, &high), &set(1, &low)),
+            "an older millisecond never beats the newest group"
         );
     }
 
@@ -270,6 +267,13 @@ mod tests {
     fn a_local_entry_is_floored_above_the_one_it_supersedes() {
         let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let ms = TimeDelta::milliseconds(1);
+
+        // The key encodes only the millisecond, so a stamp later inside the
+        // superseded one must still land a whole millisecond above it.
+        assert_eq!(
+            local_entry_ts(now + TimeDelta::microseconds(700), Some(now)),
+            now + ms
+        );
 
         assert_eq!(local_entry_ts(now, None), now, "nothing to supersede");
         assert_eq!(
@@ -296,11 +300,7 @@ mod tests {
     async fn concurrent_same_tag_pushes_from_two_processes_lose_nothing() {
         let dir = TempDir::new().unwrap();
         let store_for = || {
-            let backend: Arc<dyn ObjectStore> = Arc::new(
-                StorageFsBackend::builder(dir.path())
-                    .sync_to_disk(false)
-                    .build(),
-            );
+            let backend: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
             metadata_store_over(backend)
         };
         let a = store_for();
@@ -321,11 +321,7 @@ mod tests {
 
         let entries = a
             .object_store()
-            .list(
-                &namespace.tag_entry_dir(&Tag::new("latest").unwrap()),
-                10,
-                None,
-            )
+            .list(&namespace.tag_entry_dir(&tag), 10, None)
             .await
             .unwrap();
         assert_eq!(entries.items.len(), 2, "neither concurrent write is lost");
@@ -422,13 +418,8 @@ mod tests {
     /// write that lands as the loser tells the client something untrue.
     #[tokio::test]
     async fn a_local_push_outranks_an_entry_from_a_faster_peer() {
-        let dir = TempDir::new().unwrap();
-        let backend: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder(dir.path())
-                .sync_to_disk(false)
-                .build(),
-        );
-        let store = metadata_store_over(backend);
+        let test_case = FSRegistryTestCase::new();
+        let store = test_case.metadata_store();
         let namespace = Namespace::new("skewed-peer").unwrap();
         let tag = Tag::new("latest").unwrap();
         let peer = Digest::sha256_of_bytes(b"what the faster peer pushed");
@@ -439,8 +430,8 @@ mod tests {
         store
             .put_tag_entry(
                 &namespace,
-                &tag.clone(),
-                &peer.clone(),
+                &tag,
+                &peer,
                 Some(Utc::now().trunc_subsecs(3) + TimeDelta::seconds(60)),
             )
             .await
@@ -448,7 +439,7 @@ mod tests {
 
         // A local push, stamped by this replica's own clock.
         store
-            .put_tag_entry(&namespace, &tag.clone(), &local.clone(), None)
+            .put_tag_entry(&namespace, &tag, &local, None)
             .await
             .unwrap();
 
@@ -487,13 +478,8 @@ mod tests {
     /// superseded entries beside a winner must not shift it.
     #[tokio::test]
     async fn tag_pages_start_after_their_cursor() {
-        let dir = TempDir::new().unwrap();
-        let backend: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder(dir.path())
-                .sync_to_disk(false)
-                .build(),
-        );
-        let store = metadata_store_over(backend);
+        let test_case = FSRegistryTestCase::new();
+        let store = test_case.metadata_store();
         let namespace = Namespace::new("paged-tags").unwrap();
 
         // Seeded out of lexical order, each tag pushed twice so a superseded entry
@@ -506,7 +492,7 @@ mod tests {
                 store
                     .put_tag_entry(
                         &namespace,
-                        &tag.clone(),
+                        &tag,
                         &digest,
                         Some(base + TimeDelta::milliseconds(revision)),
                     )

@@ -25,9 +25,8 @@ use crate::replication::{
     ReplicationDownstream,
 };
 
-/// Maps a replication error to a job error, dead-lettering a downstream
-/// authorization denial and an invalid manifest body instead of retrying an
-/// outcome that cannot change.
+/// Dead-letters a downstream denial and an invalid manifest body instead of
+/// retrying an outcome that cannot change.
 fn job_error(error: ReplicationError) -> Error {
     match error {
         ReplicationError::Client(RegistryClientError::Denied(msg))
@@ -36,8 +35,7 @@ fn job_error(error: ReplicationError) -> Error {
     }
 }
 
-/// Records a `replication_reconcile_total` outcome (`enqueued`, `failed`, or
-/// `skipped`).
+/// `outcome` is `enqueued`, `failed` or `skipped`.
 pub fn record_reconcile_outcome(outcome: &str) {
     metrics_provider()
         .replication_reconcile_total
@@ -65,9 +63,18 @@ pub struct ReplicationTarget {
     pub source_ts: Option<DateTime<Utc>>,
 }
 
-/// JSON payload for a replication job on [`Queue::Replication`]. The operation
-/// is the serde discriminant, serialized as an internal `kind` tag beside the
-/// flat target fields, which is the layout the durable queue stores.
+impl ReplicationTarget {
+    /// The tag when set, else the digest.
+    pub fn reference(&self) -> Option<Reference> {
+        match (&self.tag, &self.digest) {
+            (Some(tag), _) => Some(Reference::Tag(tag.clone())),
+            (None, Some(digest)) => Some(Reference::Digest(digest.clone())),
+            (None, None) => None,
+        }
+    }
+}
+
+/// The `kind` tag beside the flat target fields is the layout the durable queue stores.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
 pub enum ReplicationJob {
@@ -88,7 +95,6 @@ pub enum ReplicationJob {
 }
 
 impl ReplicationJob {
-    /// The envelope kind this job is queued under.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
@@ -105,66 +111,40 @@ impl ReplicationJob {
     }
 }
 
-/// Tag-or-digest segment shared by every replication `lock_key`.
-fn lock_key_reference(target: &ReplicationTarget) -> String {
-    target
-        .tag
-        .as_ref()
-        .map(ToString::to_string)
-        .or_else(|| target.digest.as_ref().map(ToString::to_string))
-        .unwrap_or_default()
-}
-
-/// Base delete `lock_key`,
-/// `{Queue::Replication}.delete.{downstream}:{namespace}:{tag_or_digest}`: the
-/// event-path delete appends `@{source_ts}` to it, the scrub prune delete keys
-/// on it bare.
-fn delete_lock_key_base(target: &ReplicationTarget) -> String {
+/// The `op` segment keeps a delete from coalescing into a pending push. The
+/// event-path delete appends `@{source_ts}` to this key, the scrub prune delete
+/// keys on it bare.
+fn lock_key_base(op: &str, target: &ReplicationTarget) -> String {
+    let reference = target
+        .reference()
+        .map(|reference| reference.to_string())
+        .unwrap_or_default();
     format!(
-        "{}.delete.{}:{}:{}",
+        "{}.{op}.{}:{}:{reference}",
         Queue::Replication,
         target.downstream,
         target.namespace,
-        lock_key_reference(target)
     )
 }
 
-/// Builds the per-job `lock_key`,
-/// `{Queue::Replication}.{op}.{downstream}:{namespace}:{tag_or_digest}` plus
-/// `@{source_ts}` for deletes, so identical pending work coalesces. The `op`
-/// segment keeps a delete from coalescing into a still-pending push, and the
-/// delete-only timestamp keeps distinct deletion events apart because a delete
-/// cannot re-derive its last-writer-wins timestamp at execute time, while a
-/// push re-resolves both digest and timestamp.
-#[must_use]
+/// Identical pending work coalesces on this key. The delete-only timestamp
+/// keeps distinct deletions apart, since a delete cannot re-derive its
+/// last-writer-wins timestamp at execute time while a push re-resolves it.
 fn replication_lock_key(job: &ReplicationJob) -> String {
     let target = job.target();
     match job {
         ReplicationJob::Delete { .. } => format!(
             "{}@{}",
-            delete_lock_key_base(target),
+            lock_key_base("delete", target),
             target
                 .source_ts
                 .map(|ts| ts.to_rfc3339())
                 .unwrap_or_default()
         ),
-        ReplicationJob::Push { .. } => format!(
-            "{}.push.{}:{}:{}",
-            Queue::Replication,
-            target.downstream,
-            target.namespace,
-            lock_key_reference(target)
-        ),
+        ReplicationJob::Push { .. } => lock_key_base("push", target),
     }
 }
 
-/// Builds a [`JobEnvelope`] from a [`ReplicationJob`], so the scrub checker and
-/// the event path enqueue the same envelope shape.
-///
-/// # Errors
-///
-/// Returns an [`Error`] when the lock key is invalid or the payload cannot be
-/// serialized.
 pub fn build_envelope(job: &ReplicationJob) -> Result<JobEnvelope, Error> {
     JobEnvelope::new(
         Queue::Replication,
@@ -174,27 +154,18 @@ pub fn build_envelope(job: &ReplicationJob) -> Result<JobEnvelope, Error> {
     )
 }
 
-/// Builds a [`JobEnvelope`] for a scrub prune delete, whose `lock_key` omits
-/// the `@{source_ts}` suffix so repeated reconcile runs coalesce on the bare
-/// reference instead of stacking one job per run. Coalescing keeps the first
-/// (older-ts) envelope, which is the conservative choice under receiver
-/// last-writer-wins, and a later scrub run re-enqueues once the pending job
-/// clears.
-///
-/// # Errors
-///
-/// Returns an [`Error`] when the lock key is invalid or the payload cannot be
-/// serialized.
+/// A scrub prune delete keys on the bare reference so repeated reconcile runs
+/// coalesce instead of stacking; keeping the first (older-ts) envelope is the
+/// conservative choice under receiver last-writer-wins.
 pub fn build_prune_delete_envelope(job: &ReplicationJob) -> Result<JobEnvelope, Error> {
     JobEnvelope::new(
         Queue::Replication,
         job.kind(),
-        &delete_lock_key_base(job.target()),
+        &lock_key_base("delete", job.target()),
         job,
     )
 }
 
-/// Mirrors a local repository's state to a configured downstream.
 pub struct ReplicationJobHandler {
     resolver: Arc<RepositoryResolver>,
     blob_store: Arc<BlobStore>,
@@ -215,8 +186,6 @@ impl ReplicationJobHandler {
         }
     }
 
-    /// Resolves the [`ReplicationDownstream`] for a payload, or errors when the
-    /// namespace or downstream is not configured.
     fn resolve_downstream<'a>(
         &'a self,
         namespace: &Namespace,
@@ -241,9 +210,8 @@ impl ReplicationJobHandler {
             })
     }
 
-    /// Records the per-outcome counter and, for a converged outcome, the
-    /// last-success gauge. `Unsupported` completed without converging, so it
-    /// counts but must not advance the staleness gauge.
+    /// `Unsupported` completed without converging, so it must not advance the
+    /// staleness gauge.
     fn record_success(downstream: &str, outcome: PushOutcome) {
         let outcome_label = match outcome {
             PushOutcome::Pushed => "pushed",
@@ -263,57 +231,40 @@ impl ReplicationJobHandler {
         }
     }
 
-    /// Re-resolves the current local target for a push: a tag is re-read at
-    /// execute time (latest-wins) for its digest and `created_at`, while a
-    /// tag-less job uses the payload digest and only confirms its revision link.
-    /// Returns `Ok(None)` when the target is gone locally, which the caller
-    /// treats as an already-converged no-op.
+    /// A tag is re-read at execute time (latest-wins); a tag-less job only
+    /// confirms its revision link. `Ok(None)` means the target is gone locally.
     async fn resolve_current_digest(
         &self,
         namespace: &Namespace,
         target: &ReplicationTarget,
     ) -> Result<Option<(Digest, Option<DateTime<Utc>>)>, Error> {
-        if let Some(tag) = &target.tag {
-            match self
-                .metadata_store
-                .read_link(namespace, &LinkKind::Tag(tag.clone()))
-                .await
-            {
-                Ok(link) => Ok(Some((link.target, link.created_at))),
-                Err(MetadataStoreError::NotFound) => Ok(None),
-                Err(e) => Err(Error::Execution(format!(
-                    "failed to read tag '{tag}' in '{namespace}': {e}"
-                ))),
-            }
-        } else {
-            let digest = target.digest.clone().ok_or_else(|| {
-                Error::Execution(format!(
-                    "tag-less push for '{namespace}' has no digest to resolve"
-                ))
-            })?;
+        let reference = target.reference().ok_or_else(|| {
+            Error::Execution(format!(
+                "tag-less push for '{namespace}' has no digest to resolve"
+            ))
+        })?;
+        match self
+            .metadata_store
+            .read_link(namespace, &LinkKind::from(&reference))
+            .await
+        {
             // A content-addressed digest carries no local version timestamp.
-            match self
-                .metadata_store
-                .read_link(namespace, &LinkKind::Digest(digest.clone()))
-                .await
-            {
-                Ok(_) => Ok(Some((digest, None))),
-                Err(MetadataStoreError::NotFound) => Ok(None),
-                Err(e) => Err(Error::Execution(format!(
-                    "failed to read revision '{digest}' in '{namespace}': {e}"
-                ))),
-            }
+            Ok(link) => Ok(Some(match reference {
+                Reference::Tag(_) => (link.target, link.created_at),
+                Reference::Digest(digest) => (digest, None),
+            })),
+            Err(MetadataStoreError::NotFound) => Ok(None),
+            Err(e) => Err(Error::Execution(format!(
+                "failed to read '{reference}' in '{namespace}': {e}"
+            ))),
         }
     }
 
-    /// Runs the push/delete attempt for a validated payload and records the
-    /// success metric. It must not record `failed` itself, since every `Err` is
-    /// counted once by the `inspect_err` in [`Self::execute`].
+    /// Must not record `failed`: [`Self::execute`] counts every `Err` once.
     async fn attempt(&self, job: &ReplicationJob) -> Result<(), Error> {
         let target = job.target();
         let namespace = &target.namespace;
         let downstream = self.resolve_downstream(namespace, &target.downstream)?;
-        // `Err` is unreachable for a routed namespace; the map stays defensive.
         let downstream_namespace = downstream.remote(namespace).map_err(|e| {
             Error::Execution(format!(
                 "invalid downstream namespace for '{namespace}': {e}"
@@ -340,16 +291,11 @@ impl ReplicationJobHandler {
         downstream_namespace: &Namespace,
     ) -> Result<(), Error> {
         let namespace = &target.namespace;
-        let reference = if let Some(tag) = &target.tag {
-            Reference::Tag(tag.clone())
-        } else {
-            let digest = target.digest.clone().ok_or_else(|| {
-                Error::Execution(format!(
-                    "tag-less delete for '{namespace}' has no digest reference"
-                ))
-            })?;
-            Reference::Digest(digest)
-        };
+        let reference = target.reference().ok_or_else(|| {
+            Error::Execution(format!(
+                "tag-less delete for '{namespace}' has no digest reference"
+            ))
+        })?;
         let outcome = pipeline::delete_manifest(
             &downstream.registry_client,
             namespace,
@@ -397,7 +343,7 @@ impl ReplicationJobHandler {
             source_ts,
             index_depth: 0,
         };
-        let outcome = pipeline::push_manifest(&ctx, &digest, target.tag.as_deref(), body)
+        let outcome = pipeline::push_manifest(&ctx, &digest, target.tag.as_ref(), body)
             .await
             .map_err(job_error)?;
         Self::record_success(&target.downstream, outcome);
@@ -413,25 +359,16 @@ impl JobHandler for ReplicationJobHandler {
             REPLICATION_DELETE_MANIFEST_KIND,
         ])?;
 
-        // Mesh cycles terminate at the mutation boundary: a mutation dispatches
-        // replication only when local state actually changed, so the handler
-        // needs no origin filter of its own.
-
-        // `failed` is counted exactly once here; success metrics land inside the
-        // attempt. The boxing is load-bearing: the concrete future chain below
-        // `attempt` overflows rustc's layout query depth in release builds.
-        Box::pin(self.attempt(&job))
-            .await
-            // A `failed` push is counted per attempt, for every `Err`,
-            // including pre-flight and local-read failures.
-            .inspect_err(|_| {
-                metrics_provider()
-                    .replication_push_total
-                    .with_label_values(&[job.target().downstream.as_str(), "failed"])
-                    .inc();
-            })?;
-
-        Ok(())
+        // No origin filter: a mutation dispatches replication only when local
+        // state changed, so mesh cycles terminate there. The boxing is
+        // load-bearing: the future chain below `attempt` overflows rustc's
+        // layout query depth in release builds.
+        Box::pin(self.attempt(&job)).await.inspect_err(|_| {
+            metrics_provider()
+                .replication_push_total
+                .with_label_values(&[job.target().downstream.as_str(), "failed"])
+                .inc();
+        })
     }
 }
 

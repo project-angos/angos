@@ -1,11 +1,7 @@
 use crate::registry;
 
-/// The auth subsystem's error vocabulary. Converted once into the HTTP
-/// server's error at the boundary (`command::server::error::conversions`),
-/// like every other subsystem; auth itself never names HTTP types.
-///
-/// The `Display` strings match the server error's variants one-to-one so the
-/// boundary conversion changes the type, never the message.
+/// Converted into the server error at `command::server::error::conversions`;
+/// the `Display` strings match its variants so the conversion keeps the message.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -16,10 +12,8 @@ pub enum Error {
     Unauthorized(String),
     #[error("Provider unavailable: {0}")]
     ProviderUnavailable(String),
-    /// A registry lookup the authorizer performs (e.g. mount-source
-    /// enumeration) failed; carried whole so the server boundary maps it to
-    /// its OCI code exactly as if the registry had been called directly.
-    /// Boxed because `registry::Error` dwarfs the string variants.
+    /// A registry lookup by the authorizer failed, carried whole so it maps to
+    /// the same OCI code as a direct registry call.
     #[error(transparent)]
     Registry(Box<registry::Error>),
 }

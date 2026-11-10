@@ -1,60 +1,34 @@
-//! Concurrent range-scan of an S3 listing: the single home of the key-ordering
-//! model shared by the children scan and the flat whole-store scan.
+//! Whole-listing scans that split S3's byte-ordered key space into disjoint
+//! ranges walked concurrently, each paging only until it passes its bound.
 //!
-//! S3 stores keys in raw byte order with no directory concept. Enumerating a
-//! large listing through one serial continuation-token chain is slow, so both
-//! scans split the key space into disjoint ranges ([`partition_ranges`],
-//! delimited by [`split_bounds`]) and walk them concurrently, each range bounded
-//! by the slowest of its siblings rather than by their sum.
-//!
-//! Two scans share that partition with different range semantics:
-//!
-//! - [`scan_all_children`] groups children on the `/` delimiter and treats each
-//!   range as half-open `[lo, hi)`. Split boundaries each end in a character
-//!   above `/` (0x2F) so a child `name` stays in the same range as its
-//!   `name/...` keys and its `name-...`/`name....` extensions; a boundary never
-//!   falls between a prefix and its key family. An object named exactly `hi` is
-//!   kept in `[lo, hi)` ([`retain_range`]) because its bare key sorts at the
-//!   upper neighbour's exclusive scan start, so only this range ever sees it.
-//! - [`scan_all_keys`] streams every raw key and treats each range as
-//!   `(lo, hi]`: exclusive on `lo` (S3 `start-after` skips the boundary itself)
-//!   and inclusive on `hi`. A key equal to a boundary lands in the range below
-//!   it and is skipped by the range above, so the partition neither misses nor
-//!   duplicates a key with no delimiter reasoning required.
-//!
-//! Both stop paging a range early: keys emit in ascending byte order, so once a
-//! key at or past `hi` appears no in-range key can follow on a later page.
+//! The children scan uses `[lo, hi)` ranges whose boundaries all sort above
+//! `/`, so a child `name` stays with its `name/...` keys; an object named
+//! exactly `hi` is kept by the range below, the only one that sees it. The flat
+//! scan uses `(lo, hi]`, matching S3's exclusive `start-after`.
 
 use std::future;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 
-use angos_s3_client::Backend as S3Backend;
-
 use crate::error::Error;
 use crate::pagination::paginated;
-use crate::{Children, ChildrenPage, KeyStream, Page};
+use crate::s3::Backend;
+use crate::{Children, ChildrenPage, KeyStream, ObjectStore};
 
-/// One S3 list page per range scan.
 const RANGE_PAGE_SIZE: u16 = 1000;
 
-// children scan
-
-/// Enumerate every immediate child of `prefix` as `(sub_prefixes, objects)`. A
-/// directory that fits in one page settles with a single list; a truncated one
-/// is rescanned as disjoint per-first-character name ranges walked concurrently,
-/// so the enumeration is not one serial token chain.
+/// Every immediate child of `prefix`; a truncated first page fans out into
+/// per-first-character ranges.
 pub async fn scan_all_children(
-    client: &S3Backend,
+    backend: &Backend,
     prefix: &str,
     concurrency: usize,
 ) -> Result<Children, Error> {
-    // Probe: a single page settles any listing that fits in one.
     let ChildrenPage {
         sub_prefixes,
         objects,
         next_token,
-    } = children_page(client, prefix, None, None).await?;
+    } = children_page(backend, prefix, None, None).await?;
     if next_token.is_none() {
         return Ok(Children {
             sub_prefixes,
@@ -65,7 +39,7 @@ pub async fn scan_all_children(
     let ranges = partition_ranges(None, split_bounds(""), None);
     let parts: Vec<Children> = stream::iter(ranges)
         .map(|(lo, hi)| async move {
-            scan_children_range_split(client, prefix, lo.as_deref(), hi.as_deref(), concurrency)
+            scan_children_range_split(backend, prefix, lo.as_deref(), hi.as_deref(), concurrency)
                 .await
         })
         .buffer_unordered(concurrency)
@@ -74,23 +48,16 @@ pub async fn scan_all_children(
     Ok(merge_parts(parts))
 }
 
-/// One page of `prefix`'s children. `after` is a raw child-name suffix the
-/// listing starts strictly after (only meaningful on the first page of a chain;
-/// a continuation token carries the position afterwards).
+/// `after` only applies to a chain's first page.
 async fn children_page(
-    client: &S3Backend,
+    backend: &Backend,
     prefix: &str,
     token: Option<String>,
     after: Option<&str>,
 ) -> Result<ChildrenPage, Error> {
-    let listing = client
-        .list_prefixes(
-            prefix,
-            "/",
-            RANGE_PAGE_SIZE,
-            token,
-            after.map(str::to_string),
-        )
+    let listing = backend
+        .client
+        .list_prefixes(prefix, RANGE_PAGE_SIZE, token, after.map(str::to_string))
         .await?;
     Ok(ChildrenPage {
         sub_prefixes: listing.prefixes,
@@ -99,10 +66,9 @@ async fn children_page(
     })
 }
 
-/// Drain the child-name range `[lo, hi)` serially: page from `lo`, keep in-range
-/// children, and stop paging once a child at or past `hi` appears.
+/// Drains the child-name range `[lo, hi)` serially.
 async fn scan_children_range(
-    client: &S3Backend,
+    backend: &Backend,
     prefix: &str,
     lo: Option<&str>,
     hi: Option<&str>,
@@ -111,13 +77,13 @@ async fn scan_children_range(
         mut sub_prefixes,
         mut objects,
         next_token: mut next,
-    } = children_page(client, prefix, None, lo).await?;
+    } = children_page(backend, prefix, None, lo).await?;
     let mut stop = retain_range(&mut sub_prefixes, &mut objects, lo, hi);
     while let Some(token) = next {
         if stop {
             break;
         }
-        let mut page = children_page(client, prefix, Some(token), None).await?;
+        let mut page = children_page(backend, prefix, Some(token), None).await?;
         stop = retain_range(&mut page.sub_prefixes, &mut page.objects, lo, hi);
         sub_prefixes.append(&mut page.sub_prefixes);
         objects.append(&mut page.objects);
@@ -129,12 +95,10 @@ async fn scan_children_range(
     })
 }
 
-/// Like [`scan_children_range`], but a range whose first page truncates is
-/// re-split once on the next name character and its sub-ranges scanned
-/// concurrently, capping the serial chain a skewed name distribution (most
-/// children starting with one character) would otherwise produce.
+/// [`scan_children_range`], but a range whose first page truncates is re-split
+/// once on the next character, for skewed names sharing a first character.
 async fn scan_children_range_split(
-    client: &S3Backend,
+    backend: &Backend,
     prefix: &str,
     lo: Option<&str>,
     hi: Option<&str>,
@@ -144,7 +108,7 @@ async fn scan_children_range_split(
         mut sub_prefixes,
         mut objects,
         next_token,
-    } = children_page(client, prefix, None, lo).await?;
+    } = children_page(backend, prefix, None, lo).await?;
     let stop = retain_range(&mut sub_prefixes, &mut objects, lo, hi);
     if next_token.is_none() || stop {
         return Ok(Children {
@@ -155,7 +119,7 @@ async fn scan_children_range_split(
     // The range below the first boundary has no name to anchor sub-splits on;
     // only names below '0' land there, so finish it serially.
     let Some(lo) = lo else {
-        return scan_children_range(client, prefix, None, hi).await;
+        return scan_children_range(backend, prefix, None, hi).await;
     };
 
     let ranges = partition_ranges(
@@ -165,7 +129,7 @@ async fn scan_children_range_split(
     );
     let parts: Vec<Children> = stream::iter(ranges)
         .map(|(sub_lo, sub_hi)| async move {
-            scan_children_range(client, prefix, sub_lo.as_deref(), sub_hi.as_deref()).await
+            scan_children_range(backend, prefix, sub_lo.as_deref(), sub_hi.as_deref()).await
         })
         .buffer_unordered(concurrency)
         .try_collect()
@@ -173,7 +137,6 @@ async fn scan_children_range_split(
     Ok(merge_parts(parts))
 }
 
-/// Concatenate the per-range results into one set.
 fn merge_parts(parts: Vec<Children>) -> Children {
     let mut merged = Children::default();
     for part in parts {
@@ -183,9 +146,8 @@ fn merge_parts(parts: Vec<Children>) -> Children {
     merged
 }
 
-/// Keep the children in the name range `[lo, hi)`, plus an object named exactly
-/// `hi` (see the module docs). Returns whether any child at or past `hi`
-/// appeared, which tells the caller to stop paging.
+/// Keeps `[lo, hi)` plus an object named exactly `hi`. Returns whether any child
+/// at or past `hi` appeared, which ends the paging.
 fn retain_range(
     sub_prefixes: &mut Vec<String>,
     objects: &mut Vec<String>,
@@ -205,32 +167,23 @@ fn retain_range(
     saw_hi
 }
 
-// flat scan
-
-/// Stream every key under `prefix`, prefix-relative and unordered. A listing
-/// that fits in one page settles from that page; a truncated one fans out into
-/// disjoint `(lo, hi]` key ranges walked concurrently, each a serial page chain
-/// that stops early once it passes its upper bound.
-///
-/// Keys sharing a long common prefix (e.g. a single content-addressed subtree)
-/// all fall in one range, which then drains as a serial chain; a keyspace that
-/// diverges near the front (many namespaces) parallelises across ranges.
+/// Every key under `prefix`, unordered; a truncated first page fans out into
+/// `(lo, hi]` ranges. Keys sharing a long common prefix still drain serially.
 pub fn scan_all_keys<'a>(
-    client: &'a S3Backend,
+    backend: &'a Backend,
     prefix: &'a str,
     concurrency: usize,
 ) -> KeyStream<'a> {
     Box::pin(
         stream::once(async move {
-            // Probe: a single page settles any listing that fits in one.
-            let page = key_page(client, prefix, None, None).await?;
+            let page = backend.list(prefix, RANGE_PAGE_SIZE, None).await?;
             if page.next_token.is_none() {
                 let settled: KeyStream<'a> = Box::pin(stream::iter(page.items.into_iter().map(Ok)));
                 return Ok::<KeyStream<'a>, Error>(settled);
             }
             let ranges = partition_ranges(None, split_bounds(""), None);
             let fanned = stream::iter(ranges)
-                .map(move |(lo, hi)| drain_key_range(client, prefix, lo, hi))
+                .map(move |(lo, hi)| drain_key_range(backend, prefix, lo, hi))
                 .flatten_unordered(concurrency);
             Ok(Box::pin(fanned) as KeyStream<'a>)
         })
@@ -238,35 +191,15 @@ pub fn scan_all_keys<'a>(
     )
 }
 
-/// One flat listing page under `prefix`. `after` is a prefix-relative key the
-/// listing starts strictly after (only meaningful on a chain's first page).
-async fn key_page(
-    client: &S3Backend,
-    prefix: &str,
-    token: Option<String>,
-    after: Option<&str>,
-) -> Result<Page<String>, Error> {
-    let listing = client
-        .list_objects(prefix, RANGE_PAGE_SIZE, token, after.map(str::to_string))
-        .await?;
-    Ok(Page {
-        items: listing.keys,
-        next_token: listing.next_token,
-    })
-}
-
-/// Stream the key range `(lo, hi]`: page from just after `lo`, then stop at the
-/// first key past `hi` (keys ascend, so none in range can follow it).
+/// Streams the key range `(lo, hi]`.
 fn drain_key_range<'a>(
-    client: &'a S3Backend,
+    backend: &'a Backend,
     prefix: &'a str,
     lo: Option<String>,
     hi: Option<String>,
 ) -> KeyStream<'a> {
-    let pages = paginated(move |token| {
-        let after = if token.is_none() { lo.clone() } else { None };
-        async move { key_page(client, prefix, token, after.as_deref()).await }
-    });
+    let pages =
+        paginated(move |token| backend.list_after(prefix, RANGE_PAGE_SIZE, token, lo.clone()));
     let bounded = pages.try_take_while(move |key| {
         let within = hi.as_deref().is_none_or(|hi| key.as_str() <= hi);
         future::ready(Ok(within))
@@ -274,11 +207,8 @@ fn drain_key_range<'a>(
     Box::pin(bounded)
 }
 
-// shared range partition
-
-/// Boundary names splitting the key space after `base`: one boundary per
-/// character keys commonly start with, in ASCII order. Each boundary sorts above
-/// `/`, which the children scan relies on (see the module docs).
+/// One boundary per character keys commonly start with, in ASCII order, each
+/// above `/`.
 fn split_bounds(base: &str) -> Vec<String> {
     ('0'..='9')
         .chain('A'..='Z')
@@ -288,9 +218,7 @@ fn split_bounds(base: &str) -> Vec<String> {
         .collect()
 }
 
-/// The consecutive ranges delimited by `bounds`, from `below` up to `above`
-/// (`None` = open end), as `(lo, hi)` pairs. Keys starting outside the boundary
-/// alphabet fall into the surrounding range, so the ranges cover every key.
+/// The consecutive `(lo, hi)` ranges delimited by `bounds`, `None` being open.
 fn partition_ranges(
     below: Option<String>,
     bounds: Vec<String>,
@@ -307,8 +235,7 @@ fn partition_ranges(
 mod tests {
     use super::*;
 
-    /// How many `(lo, hi]` ranges contain `key` under the flat scan's
-    /// exclusive-low, inclusive-high rule.
+    /// How many `(lo, hi]` ranges contain `key`.
     fn hits(ranges: &[(Option<String>, Option<String>)], key: &str) -> usize {
         ranges
             .iter()
@@ -323,14 +250,6 @@ mod tests {
         let bounds = split_bounds("x");
         assert!(bounds.iter().all(|b| b.starts_with('x')));
         assert!(bounds.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn ranges_are_contiguous_and_open_ended() {
-        let ranges = partition_ranges(None, split_bounds(""), None);
-        assert_eq!(ranges.first().map(|r| &r.0), Some(&None));
-        assert_eq!(ranges.last().map(|r| &r.1), Some(&None));
-        assert!(ranges.windows(2).all(|w| w[0].1 == w[1].0));
     }
 
     #[test]

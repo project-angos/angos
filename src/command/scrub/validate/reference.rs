@@ -2,6 +2,8 @@
 //! link backing it. Runs after the link pass, so every grant a manifest implies
 //! has been re-issued before entries are pruned against the links.
 
+use std::sync::PoisonError;
+
 use tracing::{debug, warn};
 
 use angos_oci::{Digest, Namespace};
@@ -30,7 +32,10 @@ impl Validator {
         // Witness for blob GC, an enumeration independent of the per-blob
         // listing, of every key this walk leaves in place.
         if !matches!(dangling, Ok(true)) {
-            self.record_reference_seen(digest);
+            self.seen_refs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(digest.clone());
             return dangling.map(|_| ());
         }
         self.emit(Action::RemoveBlobIndexLink {
@@ -81,13 +86,7 @@ impl Validator {
             return Ok(false);
         }
         // Re-observed: the key must still exist while its backing is still dead.
-        if !self
-            .metadata_store
-            .object_store()
-            .exists(key)
-            .await
-            .map_err(RegistryError::from)?
-        {
+        if !self.metadata_exists(key).await? {
             return Ok(false);
         }
         Ok(!self

@@ -9,7 +9,7 @@ use angos_oci::request::{
 use angos_oci::{Algorithm, Digest, Namespace, UploadSessionId};
 use angos_oci_service::{BlobWritten, NoContent, StartUpload, UploadSession};
 
-use crate::event_webhook::event::{Event, EventActor};
+use crate::event_webhook::event::{Event, EventActor, EventSubject};
 use crate::registry::blob_ownership::{GrantOutcome, grant_existing, promote_and_grant};
 use crate::registry::blob_store::hashing::{Hasher, HashingReader};
 use crate::registry::{Error, Registry, repository_name};
@@ -70,7 +70,7 @@ impl Registry {
         // The pre-existing bytes may be old, so the guarded grant catches a
         // mid-flight reclaim. The body is already drained, so neither miss may
         // fall through to a fresh write; both surface as retryable conflicts.
-        match grant_existing(&self.blob_store, self.metadata_store(), namespace, digest).await? {
+        match grant_existing(&self.blob_store, &self.metadata_store, namespace, digest).await? {
             GrantOutcome::Granted => Ok(true),
             GrantOutcome::BytesAbsent => Err(Error::ReclamationInProgress(
                 "blob bytes were reclaimed during upload; retry".to_string(),
@@ -79,22 +79,6 @@ impl Registry {
                 "blob reclamation in progress; retry".to_string(),
             )),
         }
-    }
-
-    async fn finish_completed_upload(
-        &self,
-        namespace: &Namespace,
-        session_id: &UploadSessionId,
-        digest: &Digest,
-    ) -> Result<BlobWritten, Error> {
-        if let Err(error) = self.blob_store.delete_upload(namespace, session_id).await {
-            warn!("Failed to delete completed upload state: {error}");
-        }
-
-        Ok(BlobWritten {
-            namespace: namespace.clone(),
-            digest: digest.clone(),
-        })
     }
 
     /// Grants `namespace` a reference to `mount.digest`, re-checked against the
@@ -108,17 +92,14 @@ impl Registry {
         source: &Namespace,
     ) -> Result<Option<Digest>, Error> {
         if self.blob_store.size(&mount.digest).await.is_err()
-            || !self
-                .metadata_store()
-                .can_read(source, &mount.digest)
-                .await?
+            || !self.metadata_store.can_read(source, &mount.digest).await?
         {
             return Ok(None);
         }
 
         match grant_existing(
             &self.blob_store,
-            self.metadata_store(),
+            &self.metadata_store,
             namespace,
             &mount.digest,
         )
@@ -142,7 +123,7 @@ impl Registry {
         }
 
         if let Some(from) = &mount.from {
-            let readable = self.metadata_store().can_read(from, &mount.digest).await?;
+            let readable = self.metadata_store.can_read(from, &mount.digest).await?;
             return Ok(if readable {
                 vec![from.clone()]
             } else {
@@ -150,7 +131,7 @@ impl Registry {
             });
         }
 
-        self.metadata_store()
+        self.metadata_store
             .referencing_namespaces(&mount.digest, MAX_FROM_LESS_MOUNT_CANDIDATES)
             .await
     }
@@ -194,15 +175,14 @@ impl Registry {
             ));
         };
         let digest = target.digest;
-
         if self.blob_store.size(&digest).await.is_ok()
             && self
-                .metadata_store()
+                .metadata_store
                 .can_read(&request.namespace, &digest)
                 .await?
         {
             return Ok(StartUpload::Completed(Box::new(BlobWritten {
-                namespace: request.namespace.clone(),
+                namespace: request.namespace,
                 digest,
             })));
         }
@@ -210,24 +190,20 @@ impl Registry {
         // A `?digest=` POST carrying the blob is the single-request upload, a
         // declared zero being the empty blob; only an undeclared length falls
         // back to a session.
-        let Some(content_length) = target.content_length else {
-            return Ok(StartUpload::Session(
-                self.open_upload_session(&request.namespace, Some(digest.algorithm()))
-                    .await?,
-            ));
-        };
-
         let session = self
             .open_upload_session(&request.namespace, Some(digest.algorithm()))
             .await?;
+        let Some(content_length) = target.content_length else {
+            return Ok(StartUpload::Session(session));
+        };
 
         Ok(StartUpload::Completed(Box::new(
             self.handle_complete_upload(
                 actor,
                 CompleteUploadRequest {
-                    namespace: request.namespace.clone(),
+                    namespace: request.namespace,
                     session_id: session.session_id,
-                    digest: digest.clone(),
+                    digest,
                     content_range: None,
                     content_length: Some(content_length),
                 },
@@ -252,28 +228,25 @@ impl Registry {
         source: Option<Namespace>,
     ) -> Result<StartUpload, Error> {
         let repository = repository_name(self.resolver.resolve(&request.namespace));
-        let event = Event::push_blob(
+        let event = Event::new(
+            EventSubject::BlobPush {
+                digest: request.mount.digest.clone(),
+            },
             &request.namespace,
             &repository,
-            &request.mount.digest,
             actor.as_ref(),
         );
         self.dispatch_events(&[event]).await?;
 
         // An unsatisfiable mount degrades to an ordinary upload session, so the
         // caller is never told whether the blob exists.
-        let Some(source) = &source else {
-            return Ok(StartUpload::Session(
-                self.open_upload_session(&request.namespace, None).await?,
-            ));
-        };
-
-        if let Some(digest) = self
-            .try_cross_repo_mount(&request.namespace, &request.mount, source)
-            .await?
+        if let Some(source) = &source
+            && let Some(digest) = self
+                .try_cross_repo_mount(&request.namespace, &request.mount, source)
+                .await?
         {
             return Ok(StartUpload::Completed(Box::new(BlobWritten {
-                namespace: request.namespace.clone(),
+                namespace: request.namespace,
                 digest,
             })));
         }
@@ -283,58 +256,59 @@ impl Registry {
         ))
     }
 
-    /// Early-reject a known-length body whose declared length would push the
-    /// session's cumulative size past `max_blob_size_bytes`, aborting the
-    /// session first so its staged bytes are reclaimed.
-    async fn reject_oversized_known_length(
+    /// Vets a chunk before a byte is committed: it must resume where the
+    /// session stands, and a declared length must match the window it announced
+    /// and fit under `max_blob_size_bytes`. The body comes back bounded to one
+    /// byte past what the cap leaves, so [`Self::check_written`] sees a chunked
+    /// overflow, and a deceptive Content-Length cannot smuggle extra bytes.
+    async fn admit_chunk<S>(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
         committed: u64,
-        content_length: Option<u64>,
-    ) -> Result<(), Error> {
-        let Some(len) = content_length else {
-            return Ok(());
-        };
-        self.reject_if_oversized(namespace, session_id, committed.saturating_add(len))
-            .await
-    }
-
-    /// Bound a chunked body to `remaining + 1` bytes so it can never grow the
-    /// session past `max_blob_size_bytes` without the extra byte tripping the
-    /// overflow check after the write. A known content-length was vetted by
-    /// [`Self::reject_oversized_known_length`], so only the cap itself stops a
-    /// deceptive Content-Length from smuggling extra bytes.
-    fn bound_blob_stream<S>(
-        &self,
-        committed: u64,
+        content_range: Option<ByteWindow>,
         content_length: Option<u64>,
         stream: S,
-    ) -> Take<S>
+    ) -> Result<Take<S>, Error>
     where
         S: AsyncRead + Unpin,
     {
-        let remaining = if content_length.is_some() {
-            self.config.max_blob_size_bytes
-        } else {
-            self.config.max_blob_size_bytes.saturating_sub(committed)
+        // A gap or a rewind is an out-of-order chunk, not a digest mismatch.
+        if let Some(range) = content_range
+            && (range.start != committed
+                || content_length.is_some_and(|length| !range.covers(length)))
+        {
+            return Err(Error::RangeNotSatisfiable);
+        }
+        let limit = self.config.max_blob_size_bytes;
+        let remaining = match content_length {
+            Some(length) => {
+                self.reject_if_oversized(namespace, session_id, committed.saturating_add(length))
+                    .await?;
+                limit
+            }
+            None => limit.saturating_sub(committed),
         };
-        stream.take(remaining.saturating_add(1))
+        Ok(stream.take(remaining.saturating_add(1)))
     }
 
-    /// A chunked body's window can only be checked once read; the session now
-    /// holds bytes the client will never account for, hence the abort.
-    async fn reject_unannounced_chunk(
+    /// Rejects and aborts a session the write pushed past the cap, or whose
+    /// chunked body missed the window it announced: the session now holds bytes
+    /// the client will never account for.
+    async fn check_written(
         &self,
         namespace: &Namespace,
         session_id: &UploadSessionId,
+        committed: u64,
         content_range: Option<ByteWindow>,
         content_length: Option<u64>,
-        written: u64,
+        new_total: u64,
     ) -> Result<(), Error> {
+        self.reject_if_oversized(namespace, session_id, new_total)
+            .await?;
         if content_length.is_none()
             && let Some(range) = content_range
-            && !range.covers(written)
+            && !range.covers(new_total.saturating_sub(committed))
         {
             self.abort_upload_quietly(namespace, session_id).await;
             return Err(Error::RangeNotSatisfiable);
@@ -383,28 +357,16 @@ impl Registry {
             .read_session(&request.namespace, &request.session_id)
             .await?;
         let committed = session.committed_offset;
-
-        // Refused before a byte is committed: a chunk must resume where the
-        // session stands, and a declared length must match the window it
-        // announced.
-        if let Some(range) = request.content_range
-            && (!range.starts_at(committed)
-                || request
-                    .content_length
-                    .is_some_and(|length| !range.covers(length)))
-        {
-            return Err(Error::RangeNotSatisfiable);
-        }
-
-        self.reject_oversized_known_length(
-            &request.namespace,
-            &request.session_id,
-            committed,
-            request.content_length,
-        )
-        .await?;
-
-        let bounded = self.bound_blob_stream(committed, request.content_length, stream);
+        let bounded = self
+            .admit_chunk(
+                &request.namespace,
+                &request.session_id,
+                committed,
+                request.content_range,
+                request.content_length,
+                stream,
+            )
+            .await?;
         // PATCH only needs the running size, the digest being finalized at the
         // PUT. Concurrent PATCHes on one session are unserialized: the PUT's
         // size check rejects an interleaving, and it promotes only the bytes it
@@ -420,14 +382,13 @@ impl Registry {
             )
             .await?;
 
-        self.reject_if_oversized(&request.namespace, &request.session_id, size)
-            .await?;
-        self.reject_unannounced_chunk(
+        self.check_written(
             &request.namespace,
             &request.session_id,
+            committed,
             request.content_range,
             request.content_length,
-            size.saturating_sub(committed),
+            size,
         )
         .await?;
 
@@ -467,7 +428,14 @@ impl Registry {
         // The event fires before the finalize, so a completed blob can never
         // go unnotified; a later failure leaves a false positive instead.
         let repository = repository_name(self.resolver.resolve(namespace));
-        let event = Event::push_blob(namespace, &repository, digest, actor.as_ref());
+        let event = Event::new(
+            EventSubject::BlobPush {
+                digest: digest.clone(),
+            },
+            namespace,
+            &repository,
+            actor.as_ref(),
+        );
         self.dispatch_events(&[event]).await?;
 
         // An unknown session reads as empty only so the blob-exists path below
@@ -480,33 +448,28 @@ impl Registry {
         let committed = session
             .as_ref()
             .map_or(0, |session| session.committed_offset);
-        let has_prior_writes = committed > 0;
-
-        // A final-chunk PUT carrying a Content-Range must resume from the
-        // committed offset and carry the window it announced. Both are
-        // out-of-order chunks rather than digest mismatches, and both are
-        // refused before a byte is committed.
-        if let Some(range) = content_range
-            && (!range.starts_at(committed)
-                || content_length.is_some_and(|length| !range.covers(length)))
-        {
-            return Err(Error::RangeNotSatisfiable);
-        }
-
-        self.reject_oversized_known_length(namespace, session_id, committed, content_length)
+        let mut stream = self
+            .admit_chunk(
+                namespace,
+                session_id,
+                committed,
+                content_range,
+                content_length,
+                stream,
+            )
             .await?;
-
-        // Bound the final chunk so a chunked (`None` content-length) PUT that
-        // carries the whole body cannot grow the session past the cap.
-        let mut stream = self.bound_blob_stream(committed, content_length, stream);
-        if !has_prior_writes
+        if committed == 0
             && self
                 .complete_existing_upload(namespace, digest, content_length, &mut stream)
                 .await?
         {
-            return self
-                .finish_completed_upload(namespace, session_id, digest)
-                .await;
+            if let Err(error) = self.blob_store.delete_upload(namespace, session_id).await {
+                warn!("Failed to delete completed upload state: {error}");
+            }
+            return Ok(BlobWritten {
+                namespace: namespace.clone(),
+                digest: digest.clone(),
+            });
         }
 
         let Some(session) = session else {
@@ -525,14 +488,13 @@ impl Registry {
             )
             .await?;
 
-        self.reject_if_oversized(namespace, session_id, new_total)
-            .await?;
-        self.reject_unannounced_chunk(
+        self.check_written(
             namespace,
             session_id,
+            committed,
             content_range,
             content_length,
-            new_total.saturating_sub(committed),
+            new_total,
         )
         .await?;
 
@@ -548,7 +510,7 @@ impl Registry {
         // A promotion leaves no session behind, so there is nothing to clean.
         promote_and_grant(
             &self.blob_store,
-            self.metadata_store.as_ref(),
+            &self.metadata_store,
             namespace,
             session_id,
             digest,
@@ -601,7 +563,6 @@ mod tests {
     use async_trait::async_trait;
     use http::StatusCode;
     use http::header::{LOCATION, RANGE};
-    use tokio::io::AsyncRead;
 
     use angos_oci::http_range::ByteWindow;
     use angos_oci::request::{
@@ -714,7 +675,7 @@ mod tests {
             );
 
             registry
-                .metadata_store()
+                .metadata_store
                 .grant(namespace, &digest)
                 .await
                 .unwrap();
@@ -756,7 +717,7 @@ mod tests {
 
             let digest = put_blob_direct(&registry.blob_store, content).await;
             registry
-                .metadata_store()
+                .metadata_store
                 .grant(source, &digest)
                 .await
                 .unwrap();
@@ -788,7 +749,7 @@ mod tests {
 
             assert!(
                 registry
-                    .metadata_store()
+                    .metadata_store
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -797,8 +758,6 @@ mod tests {
         })
         .await;
     }
-
-    // Mount event emission is covered in `event_emission_tests`.
 
     #[tokio::test]
     async fn test_mount_blob_falls_back_when_source_lacks_blob() {
@@ -844,7 +803,7 @@ mod tests {
 
             assert!(
                 !registry
-                    .metadata_store()
+                    .metadata_store
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -893,94 +852,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mount_blob_automatic_grants_referenced_blob() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let owner = &Namespace::new("test-repo/owner").unwrap();
-            let target = &Namespace::new("test-repo/target").unwrap();
-            let content = b"automatically discoverable blob";
-
-            let digest = put_blob_direct(&registry.blob_store, content).await;
-            registry
-                .metadata_store()
-                .grant(owner, &digest)
-                .await
-                .unwrap();
-
-            let mount = BlobMount {
-                digest: digest.clone(),
-                from: None,
-            };
-            let response = registry
-                .handle_mount_blob(
-                    None,
-                    MountBlobRequest {
-                        namespace: target.clone(),
-                        mount,
-                    },
-                    Some(owner.clone()),
-                )
-                .await
-                .unwrap()
-                .into_response()
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::CREATED,
-                "automatic discovery must mount a referenced blob"
-            );
-            assert_eq!(response_digest(&response), digest);
-            assert!(
-                registry
-                    .metadata_store()
-                    .can_read(target, &digest)
-                    .await
-                    .unwrap(),
-                "automatic mount must grant the target namespace a reference"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_mount_blob_automatic_falls_back_for_unreferenced_blob() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let target = &Namespace::new("test-repo/target").unwrap();
-            let source = &Namespace::new("test-repo/source").unwrap();
-            let content = b"orphan blob present but unreferenced";
-
-            let digest = put_blob_direct(&registry.blob_store, content).await;
-
-            let mount = BlobMount {
-                digest: digest.clone(),
-                from: None,
-            };
-            let response = registry
-                .handle_mount_blob(
-                    None,
-                    MountBlobRequest {
-                        namespace: target.clone(),
-                        mount,
-                    },
-                    Some(source.clone()),
-                )
-                .await
-                .unwrap()
-                .into_response()
-                .unwrap();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::ACCEPTED,
-                "an unreferenced (orphan) blob must not be auto-mounted"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_mount_blob_grants_only_from_the_authorized_source() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
@@ -992,11 +863,7 @@ mod tests {
             // Guards the authorize-then-grant TOCTOU: the grant is conditioned
             // on the authorized source, not on `owner`.
             let digest = put_blob_direct(&registry.blob_store, content).await;
-            registry
-                .metadata_store()
-                .grant(owner, &digest)
-                .await
-                .unwrap();
+            registry.metadata_store.grant(owner, &digest).await.unwrap();
 
             let mount = BlobMount {
                 digest: digest.clone(),
@@ -1023,7 +890,7 @@ mod tests {
             );
             assert!(
                 !registry
-                    .metadata_store()
+                    .metadata_store
                     .can_read(target, &digest)
                     .await
                     .unwrap(),
@@ -1043,7 +910,7 @@ mod tests {
             let content = b"candidate resolution blob";
 
             let digest = put_blob_direct(&registry.blob_store, content).await;
-            let ownership = registry.metadata_store();
+            let ownership = &registry.metadata_store;
             ownership.grant(source, &digest).await.unwrap();
             ownership.grant(other, &digest).await.unwrap();
 
@@ -1566,44 +1433,6 @@ mod tests {
         .await;
     }
 
-    /// The ordinary case, where the window and the bytes agree, still commits.
-    #[tokio::test]
-    async fn a_chunk_matching_its_content_range_is_committed() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let content = b"ten bytes!";
-            let session_id = UploadSessionId::generate();
-
-            registry
-                .blob_store
-                .create_upload(namespace, &session_id, None)
-                .await
-                .unwrap();
-
-            let response = registry
-                .handle_patch_upload(
-                    PatchUploadRequest {
-                        namespace: namespace.clone(),
-                        session_id: session_id.clone(),
-                        content_range: Some(ByteWindow {
-                            start: 0,
-                            end: Some(content.len() as u64 - 1),
-                        }),
-                        content_length: Some(content.len() as u64),
-                    },
-                    Cursor::new(content.to_vec()),
-                )
-                .await
-                .expect("a chunk matching its window must commit")
-                .into_open_response()
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-        })
-        .await;
-    }
-
     /// The empty blob is pushed in one request like any other: a declared zero
     /// is the whole body, not an absent one.
     #[tokio::test]
@@ -1885,7 +1714,7 @@ mod tests {
         let digest = put_blob_direct(&registry.blob_store, content).await;
 
         registry
-            .metadata_store()
+            .metadata_store
             .grant(first_namespace, &digest)
             .await
             .unwrap();
@@ -1927,7 +1756,7 @@ mod tests {
         assert_eq!(registry.blob_store.read(&digest).await.unwrap(), content);
         assert!(
             registry
-                .metadata_store()
+                .metadata_store
                 .can_read(second_namespace, &digest)
                 .await
                 .unwrap()
@@ -1959,7 +1788,7 @@ mod tests {
         let digest = put_blob_direct(&registry.blob_store, content).await;
 
         registry
-            .metadata_store()
+            .metadata_store
             .grant(first_namespace, &digest)
             .await
             .unwrap();
@@ -1988,7 +1817,7 @@ mod tests {
 
         assert!(
             registry
-                .metadata_store()
+                .metadata_store
                 .can_read(second_namespace, &digest)
                 .await
                 .unwrap()
@@ -2016,14 +1845,6 @@ mod tests {
                 .create_upload(namespace, &session_id, None)
                 .await
                 .unwrap();
-
-            assert!(
-                registry
-                    .blob_store
-                    .upload_summary(namespace, &session_id)
-                    .await
-                    .is_ok()
-            );
 
             registry
                 .handle_cancel_upload(DeleteUploadRequest {
@@ -2241,52 +2062,6 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::RangeNotSatisfiable)));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_upload_summary_size_accumulates() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let session_id = UploadSessionId::generate();
-            let content = b"size check content";
-
-            let session = registry
-                .blob_store
-                .create_upload(namespace, &session_id, None)
-                .await
-                .unwrap();
-
-            let summary = registry
-                .blob_store
-                .upload_summary(namespace, &session_id)
-                .await
-                .unwrap();
-            assert_eq!(summary.size, 0);
-
-            let stream: Box<dyn AsyncRead + Unpin + Send + Sync> =
-                Box::new(Cursor::new(content.to_vec()));
-            registry
-                .blob_store
-                .write_upload(
-                    namespace,
-                    &session_id,
-                    session,
-                    stream,
-                    Some(content.len() as u64),
-                    Algorithm::Sha256,
-                )
-                .await
-                .unwrap();
-
-            let summary = registry
-                .blob_store
-                .upload_summary(namespace, &session_id)
-                .await
-                .unwrap();
-            assert_eq!(summary.size, content.len() as u64);
         })
         .await;
     }

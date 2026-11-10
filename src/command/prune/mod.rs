@@ -12,12 +12,12 @@ use tracing::warn;
 
 pub use checker::RetentionChecker;
 
-use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::maintenance::executor::{Executor, run_sink};
 use crate::command::maintenance::{Error, check};
 use crate::command::scrub::default_concurrency;
 use crate::configuration::Configuration;
-use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock, rules_use_pull_time};
+use crate::policy::{RetentionPolicy, RetentionPolicyConfig, rules_use_pull_time};
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(
@@ -79,10 +79,7 @@ pub fn global_retention_policy(config: &RetentionPolicyConfig) -> Option<Arc<Ret
         return None;
     }
 
-    Some(Arc::new(RetentionPolicy::new(
-        config,
-        Arc::new(SystemClock),
-    )))
+    Some(Arc::new(RetentionPolicy::new(config.rules.clone())))
 }
 
 /// Applies the retention policies to every namespace, then reclaims aged
@@ -91,7 +88,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
     ensure_pull_time_rules_are_recorded(config)?;
     let window = Duration::from_std(options.uploads.into())
         .map_err(|e| Error::Initialization(format!("Upload window is invalid: {e}")))?;
-    let MaintenanceContext {
+    let StoreContext {
         blob_store: blob_backend,
         metadata_store,
         repositories,

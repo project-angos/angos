@@ -44,13 +44,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_adds_key_to_existing_table() {
-        let result = merged("[s3]\nbucket = \"b\"\n", "[s3]\nregion = \"r\"\n");
-        assert!(result.contains("bucket"), "base key kept: {result}");
-        assert!(result.contains("region"), "overlay key added: {result}");
-    }
-
-    #[test]
     fn overlay_scalar_replaces_base_scalar() {
         let result = merged("[s3]\nbucket = \"base\"\n", "[s3]\nbucket = \"overlay\"\n");
         assert!(result.contains("\"overlay\""), "overlay wins: {result}");

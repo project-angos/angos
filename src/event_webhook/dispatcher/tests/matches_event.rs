@@ -1,45 +1,30 @@
-use super::common::{build_endpoint, create_test_config};
+use super::common::{build_endpoint, create_test_webhook_config};
 use crate::configuration::RegexPattern;
-use crate::event_webhook::event::EventKind;
+use crate::event_webhook::config::DeliveryPolicy;
+use crate::event_webhook::event::EventKind::{BlobPush, ManifestPush};
 
 #[test]
-fn matches_event_no_filter_matches_all_repositories() {
-    let endpoint = build_endpoint(create_test_config(vec![EventKind::ManifestPush], None));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "other/thing"));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "anything"));
-}
+fn matches_event_requires_the_kind_and_any_repository_filter() {
+    let config = || {
+        create_test_webhook_config(
+            "https://example.com/webhook",
+            DeliveryPolicy::Optional,
+            None,
+            0,
+        )
+    };
+    let unfiltered = build_endpoint(config());
+    assert!(unfiltered.matches_event(&ManifestPush, "anything"));
+    assert!(!unfiltered.matches_event(&BlobPush, "anything"));
 
-#[test]
-fn matches_event_multiple_filters_matches_if_any_pattern_matches() {
-    let endpoint = build_endpoint(create_test_config(
-        vec![EventKind::ManifestPush],
-        Some(vec![
-            RegexPattern::compile("^myapp/.*").unwrap(),
-            RegexPattern::compile("^library/.*").unwrap(),
-        ]),
-    ));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "library/nginx"));
-    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/repo"));
-}
-
-#[test]
-fn matches_event_filters_by_event_kind() {
-    let endpoint = build_endpoint(create_test_config(vec![EventKind::ManifestPush], None));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
-    assert!(!endpoint.matches_event(&EventKind::BlobPush, "myapp/backend"));
-    assert!(!endpoint.matches_event(&EventKind::TagCreate, "myapp/backend"));
-}
-
-#[test]
-fn matches_event_both_event_kind_and_repository_must_match() {
-    let endpoint = build_endpoint(create_test_config(
-        vec![EventKind::ManifestPush],
-        Some(vec![RegexPattern::compile("^myapp/.*").unwrap()]),
-    ));
-    assert!(endpoint.matches_event(&EventKind::ManifestPush, "myapp/backend"));
-    assert!(!endpoint.matches_event(&EventKind::BlobPush, "myapp/backend"));
-    assert!(!endpoint.matches_event(&EventKind::ManifestPush, "other/repo"));
-    assert!(!endpoint.matches_event(&EventKind::BlobPush, "other/repo"));
+    let mut filtered = config();
+    filtered.repository_filter = Some(vec![
+        RegexPattern::compile("^myapp/.*").unwrap(),
+        RegexPattern::compile("^library/.*").unwrap(),
+    ]);
+    let filtered = build_endpoint(filtered);
+    assert!(filtered.matches_event(&ManifestPush, "myapp/backend"));
+    assert!(filtered.matches_event(&ManifestPush, "library/nginx"));
+    assert!(!filtered.matches_event(&ManifestPush, "other/repo"));
+    assert!(!filtered.matches_event(&BlobPush, "myapp/backend"));
 }
