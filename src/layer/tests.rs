@@ -36,7 +36,7 @@ use crate::registry::keys::DigestExt;
 use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
 use crate::registry::repository::Config;
 use crate::registry::test_utils::{
-    fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
+    FsTestStack, fs_test_stack, repository_with_replication, seed_manifest, single_repo_resolver,
 };
 use crate::registry::{Error as RegistryError, Registry, RegistryConfig, Repository};
 use crate::test_fixtures::client::test_client_config;
@@ -96,6 +96,50 @@ fn layer_tar(padding: usize) -> Vec<u8> {
     );
     add(&long, EntryType::Regular, b"deep", None);
     builder.into_inner().expect("tar bytes")
+}
+
+async fn put_layer(stack: &FsTestStack, compressed: Vec<u8>) -> Digest {
+    let digest = Digest::sha256_of_bytes(&compressed);
+    stack
+        .blob_store
+        .put_blob(&digest, compressed.into())
+        .await
+        .unwrap();
+    digest
+}
+
+async fn owned_layer(stack: &FsTestStack, namespace: &Namespace, compressed: Vec<u8>) -> Digest {
+    let digest = put_layer(stack, compressed).await;
+    stack
+        .metadata_store
+        .grant(namespace, &digest)
+        .await
+        .unwrap();
+    digest
+}
+
+fn indexer(stack: &FsTestStack) -> IndexLayerJobHandler {
+    IndexLayerJobHandler::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        LIMITS,
+    )
+}
+
+/// A registry over the `apps` repository and the job store it enqueues into.
+fn apps_registry(stack: &FsTestStack) -> (Arc<Registry>, Arc<JobStore>) {
+    let job_store = Arc::new(JobStore::new(
+        &stack.metadata_store,
+        "index-test",
+        ClaimMode::Atomic,
+    ));
+    let registry = Registry::new(
+        stack.blob_store.clone(),
+        stack.metadata_store.clone(),
+        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
+        RegistryConfig::new(job_store.clone()),
+    );
+    (registry, job_store)
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -501,18 +545,8 @@ fn indexing_refuses_a_layer_past_its_limits() {
 #[tokio::test]
 async fn the_job_indexes_a_stored_layer_once() {
     let stack = fs_test_stack();
-    let compressed = gzip(&layer_tar(16));
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    let handler = IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    );
+    let digest = put_layer(&stack, gzip(&layer_tar(16))).await;
+    let handler = indexer(&stack);
     handler.index(&digest, false).await.unwrap();
     let listing = stack
         .metadata_store
@@ -544,24 +578,8 @@ async fn the_job_indexes_a_stored_layer_once() {
 async fn the_endpoints_index_on_demand_and_serve_a_file() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let compressed = gzip(&layer_tar(16));
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    let job_store = Arc::new(JobStore::new(
-        &stack.metadata_store,
-        "index-test",
-        ClaimMode::Atomic,
-    ));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
-        RegistryConfig::new(job_store.clone()),
-    );
+    let digest = put_layer(&stack, gzip(&layer_tar(16))).await;
+    let (registry, job_store) = apps_registry(&stack);
     let entries = |namespace: &Namespace| {
         registry.handle_list_layer_entries(LayerEntriesRequest {
             namespace: namespace.clone(),
@@ -581,14 +599,7 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
     let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(job_store.count_pending(Queue::Index, 0).await.unwrap(), 1);
-    IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    )
-    .index(&digest, false)
-    .await
-    .unwrap();
+    indexer(&stack).index(&digest, false).await.unwrap();
     let response = entries(&namespace).await.unwrap().into_response().unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -646,23 +657,8 @@ async fn the_endpoints_index_on_demand_and_serve_a_file() {
 async fn an_older_listing_is_served_and_walked_again() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let compressed = gzip(&layer_tar(16));
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    stack
-        .metadata_store
-        .grant(&namespace, &digest)
-        .await
-        .unwrap();
-    let handler = IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    );
+    let digest = owned_layer(&stack, &namespace, gzip(&layer_tar(16))).await;
+    let handler = indexer(&stack);
     handler.index(&digest, false).await.unwrap();
     let mut listing = stack
         .metadata_store
@@ -686,17 +682,7 @@ async fn an_older_listing_is_served_and_walked_again() {
         .await
         .unwrap();
 
-    let job_store = Arc::new(JobStore::new(
-        &stack.metadata_store,
-        "index-test",
-        ClaimMode::Atomic,
-    ));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
-        RegistryConfig::new(job_store.clone()),
-    );
+    let (registry, job_store) = apps_registry(&stack);
     let response = registry
         .handle_list_layer_entries(LayerEntriesRequest {
             namespace,
@@ -747,26 +733,8 @@ async fn an_older_listing_is_served_and_walked_again() {
 async fn the_file_endpoint_serves_a_range() {
     let stack = fs_test_stack();
     let namespace = Namespace::new("apps/web").unwrap();
-    let compressed = gzip(&layer_tar(6 * 1024 * 1024));
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    stack
-        .metadata_store
-        .grant(&namespace, &digest)
-        .await
-        .unwrap();
-    IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    )
-    .index(&digest, false)
-    .await
-    .unwrap();
+    let digest = owned_layer(&stack, &namespace, gzip(&layer_tar(6 * 1024 * 1024))).await;
+    indexer(&stack).index(&digest, false).await.unwrap();
     // Without its chunk the read would still succeed, decoding from the start.
     assert!(
         stack
@@ -776,17 +744,7 @@ async fn the_file_endpoint_serves_a_range() {
             .await
             .unwrap()
     );
-    let job_store = Arc::new(JobStore::new(
-        &stack.metadata_store,
-        "index-test",
-        ClaimMode::Atomic,
-    ));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
-        RegistryConfig::new(job_store),
-    );
+    let (registry, _) = apps_registry(&stack);
     let file = |range: &str| {
         registry.handle_get_layer_file(LayerFileRequest {
             namespace: namespace.clone(),
@@ -855,26 +813,8 @@ async fn a_file_is_found_across_entry_chunks() {
     builder
         .append_link(&mut link, "a-link", "data/04999")
         .unwrap();
-    let compressed = gzip(&builder.into_inner().unwrap());
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    stack
-        .metadata_store
-        .grant(&namespace, &digest)
-        .await
-        .unwrap();
-    IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    )
-    .index(&digest, false)
-    .await
-    .unwrap();
+    let digest = owned_layer(&stack, &namespace, gzip(&builder.into_inner().unwrap())).await;
+    indexer(&stack).index(&digest, false).await.unwrap();
     let listing = stack
         .metadata_store
         .read_listing(&digest)
@@ -882,17 +822,7 @@ async fn a_file_is_found_across_entry_chunks() {
         .unwrap()
         .expect("a listing");
     assert_eq!(listing.chunks.len(), 3);
-    let job_store = Arc::new(JobStore::new(
-        &stack.metadata_store,
-        "index-test",
-        ClaimMode::Atomic,
-    ));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
-        RegistryConfig::new(job_store),
-    );
+    let (registry, _) = apps_registry(&stack);
 
     for (path, expected) in [
         ("data/00000", "file 0\n"),
@@ -1080,37 +1010,9 @@ async fn details_describe_binaries_and_certificates() {
         header.set_gid(0);
         builder.append_data(&mut header, path, data).unwrap();
     }
-    let compressed = gzip(&builder.into_inner().unwrap());
-    let digest = Digest::sha256_of_bytes(&compressed);
-    stack
-        .blob_store
-        .put_blob(&digest, compressed.into())
-        .await
-        .unwrap();
-    stack
-        .metadata_store
-        .grant(&namespace, &digest)
-        .await
-        .unwrap();
-    IndexLayerJobHandler::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        LIMITS,
-    )
-    .index(&digest, false)
-    .await
-    .unwrap();
-    let job_store = Arc::new(JobStore::new(
-        &stack.metadata_store,
-        "index-test",
-        ClaimMode::Atomic,
-    ));
-    let registry = Registry::new(
-        stack.blob_store.clone(),
-        stack.metadata_store.clone(),
-        single_repo_resolver("apps", repository_with_replication("apps", Vec::new())),
-        RegistryConfig::new(job_store),
-    );
+    let digest = owned_layer(&stack, &namespace, gzip(&builder.into_inner().unwrap())).await;
+    indexer(&stack).index(&digest, false).await.unwrap();
+    let (registry, _) = apps_registry(&stack);
     let details = |path: &str| {
         registry.handle_get_layer_file_details(LayerFileDetailsRequest {
             namespace: namespace.clone(),

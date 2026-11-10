@@ -21,8 +21,8 @@ use crate::identity::{Action, ClientIdentity, RequestScheme};
 use crate::registry::{Error as RegistryError, Registry};
 
 pub struct ServerContext {
-    authenticator: Arc<Authenticator>,
-    authorizer: Arc<Authorizer>,
+    authenticator: Authenticator,
+    authorizer: Authorizer,
     token_issuer: Option<TokenIssuer>,
     trusted_proxies: Vec<TrustedProxy>,
     pub registry: Arc<Registry>,
@@ -38,19 +38,15 @@ impl ServerContext {
         cache: &Arc<Cache>,
         registry: Arc<Registry>,
     ) -> Result<Self, Error> {
-        let authenticator = Arc::new(Authenticator::new(config, cache)?);
-        let authorizer = Arc::new(Authorizer::new(config)?);
-        let token_issuer = config
-            .auth
-            .token_service
-            .as_ref()
-            .map(|token_service| TokenIssuer::new(token_service, &config.auth))
-            .transpose()?;
-
         Ok(Self {
-            authenticator,
-            authorizer,
-            token_issuer,
+            authenticator: Authenticator::new(config, cache)?,
+            authorizer: Authorizer::new(config)?,
+            token_issuer: config
+                .auth
+                .token_service
+                .as_ref()
+                .map(|token_service| TokenIssuer::new(token_service, &config.auth))
+                .transpose()?,
             trusted_proxies: config.global.trusted_proxies.clone(),
             registry,
             enable_ui: config.ui.enabled,

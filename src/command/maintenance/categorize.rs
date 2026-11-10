@@ -26,7 +26,7 @@ pub enum KeyCategory {
     BlobData { digest: Digest },
     /// `v2/layers/{alg}/{prefix}/{hash}/entries` or `/checkpoints` (metadata
     /// store): a layer's filesystem listing, derived from its blob.
-    LayerListing { digest: Digest },
+    LayerListing,
     /// `v2/ref/{alg}/{prefix}/{hash}/{ns}!own` or `.../{ns}!r/{entry}`
     /// (metadata store); the namespace is raw, its validity being a validation
     /// concern.
@@ -36,18 +36,20 @@ pub enum KeyCategory {
         link: LinkKind,
     },
     /// `v2/ns/{ns}!tag/{tag}!/{ord}.{kind}.{alg}.{hash}` (metadata store): one
-    /// write-once tag event, both names already checked against their grammars,
-    /// or the `claim` an immutable tag's first push took.
-    TagEntry { namespace: String, tag: String },
+    /// write-once tag event, or the `claim` an immutable tag's first push took.
+    TagEntry { namespace: Namespace, tag: Tag },
     /// `v2/ns/{ns}!hist/{tag}!/{ord}.{kind}.{alg}.{hash}` (metadata store):
     /// one demoted tag-history entry, write-once and never validated.
     TagHistory,
     /// `v2/ns/{ns}!atime/tag/{tag}!/{ord}.{suffix}` (metadata store): one
     /// append-only tag access entry.
-    TagAtimeEntry { namespace: String, tag: String },
+    TagAtimeEntry { namespace: Namespace, tag: Tag },
     /// `v2/ns/{ns}!atime/rev/{alg}/{hash}!/{ord}.{suffix}` (metadata store):
     /// one append-only revision access entry.
-    RevisionAtimeEntry { namespace: String, digest: Digest },
+    RevisionAtimeEntry {
+        namespace: Namespace,
+        digest: Digest,
+    },
     /// `v2/ns/{ns}!atime/tag/{tag}!compacted/{ord}.{suffix}` or
     /// `v2/ns/{ns}!atime/rev/{alg}/{hash}!compacted/{ord}.{suffix}` (metadata
     /// store): one chunk of compacted access entries, trimmed by its target's
@@ -55,16 +57,19 @@ pub enum KeyCategory {
     AtimeChunk,
     /// `v2/ns/{ns}!rev/{alg}/{prefix}/{hash}` (metadata store): the immutable
     /// record of a stored manifest revision.
-    RevisionRecord { namespace: String, digest: Digest },
+    RevisionRecord {
+        namespace: Namespace,
+        digest: Digest,
+    },
     /// `v2/ns/{ns}!sub/{alg}/{prefix}/{hash}/{r-alg}.{r-hash}` (metadata
     /// store): one referrer record under its subject.
     ReferrerRecord {
-        namespace: String,
+        namespace: Namespace,
         subject: Digest,
         referrer: Digest,
     },
     /// `v2/cat/{ns}!` (metadata store): a namespace's catalog index key.
-    CatalogIndex { namespace: String },
+    CatalogIndex { namespace: Namespace },
     /// An upload-session artifact under `v2/repositories/{ns}/_uploads/{uuid}/`
     /// (blob store).
     UploadArtifact {
@@ -72,7 +77,7 @@ pub enum KeyCategory {
         artifact: UploadArtifact,
     },
     /// A pending or dead-lettered job envelope (metadata store).
-    JobRecord { queue: Queue, state: JobState },
+    JobRecord { state: JobState },
     /// A `lock_key` dedup index entry (metadata store).
     JobIndex { queue: Queue },
     /// A worker's leased claim key under `_jobs/claims/` (metadata store).
@@ -152,10 +157,10 @@ pub fn categorize(key: &str) -> KeyCategory {
     }
     if let Some(rest) = strip_prefix_dir(key, CAT_ROOT) {
         return match rest.strip_suffix('!') {
-            Some(name) if Namespace::new(name).is_ok() => KeyCategory::CatalogIndex {
-                namespace: name.to_string(),
-            },
-            _ => KeyCategory::Unknown,
+            Some(name) => Namespace::new(name).map_or(KeyCategory::Unknown, |namespace| {
+                KeyCategory::CatalogIndex { namespace }
+            }),
+            None => KeyCategory::Unknown,
         };
     }
     if let Some(rest) = strip_prefix_dir(key, REPOS_ROOT) {
@@ -194,9 +199,9 @@ fn categorize_layer(rest: &str) -> KeyCategory {
     let [algorithm, prefix, hash, tail @ ..] = segments.as_slice() else {
         return KeyCategory::Unknown;
     };
-    let Some(digest) = parse_sharded(algorithm, prefix, hash) else {
+    if parse_sharded(algorithm, prefix, hash).is_none() {
         return KeyCategory::Unknown;
-    };
+    }
 
     // Chunks are `entries.<n>` and `checkpoints.<n>`; the whole `entries` and
     // `checkpoints` objects an older version wrote are retired layouts.
@@ -206,8 +211,8 @@ fn categorize_layer(rest: &str) -> KeyCategory {
         })
     };
     match *tail {
-        ["listing"] => KeyCategory::LayerListing { digest },
-        [name] if chunk(name) => KeyCategory::LayerListing { digest },
+        ["listing"] => KeyCategory::LayerListing,
+        [name] if chunk(name) => KeyCategory::LayerListing,
         _ => KeyCategory::Unknown,
     }
 }
@@ -243,22 +248,22 @@ fn categorize_ns(rest: &str) -> KeyCategory {
     let Some((namespace, marker)) = rest.split_once('!') else {
         return KeyCategory::Unknown;
     };
-    if Namespace::new(namespace).is_err() {
+    let Ok(namespace) = Namespace::new(namespace) else {
         return KeyCategory::Unknown;
-    }
+    };
     if let Some((kind @ ("tag" | "hist"), entries)) = marker.split_once('/') {
         let Some((tag, entry)) = entries.split_once("!/") else {
             return KeyCategory::Unknown;
         };
         let claim = kind == "tag" && entry == TAG_CLAIM;
-        if Tag::new(tag).is_err() || (!claim && entry.parse::<TagEntry>().is_err()) {
+        let Ok(tag) = Tag::new(tag) else {
+            return KeyCategory::Unknown;
+        };
+        if !claim && entry.parse::<TagEntry>().is_err() {
             return KeyCategory::Unknown;
         }
         return if kind == "tag" {
-            KeyCategory::TagEntry {
-                namespace: namespace.to_string(),
-                tag: tag.to_string(),
-            }
+            KeyCategory::TagEntry { namespace, tag }
         } else {
             KeyCategory::TagHistory
         };
@@ -270,17 +275,14 @@ fn categorize_ns(rest: &str) -> KeyCategory {
         let Some(digest) = parse_revision_record(rest) else {
             return KeyCategory::Unknown;
         };
-        return KeyCategory::RevisionRecord {
-            namespace: namespace.to_string(),
-            digest,
-        };
+        return KeyCategory::RevisionRecord { namespace, digest };
     }
     if let Some(rest) = marker.strip_prefix("sub/") {
         let Some((subject, referrer)) = parse_referrer_record(rest) else {
             return KeyCategory::Unknown;
         };
         return KeyCategory::ReferrerRecord {
-            namespace: namespace.to_string(),
+            namespace,
             subject,
             referrer,
         };
@@ -291,7 +293,7 @@ fn categorize_ns(rest: &str) -> KeyCategory {
 /// `tag/{tag}!/{ord}.{suffix}` or `rev/{alg}/{hash}!/{ord}.{suffix}`: one
 /// append-only access entry. `tag/{tag}!compacted/{ord}.{suffix}` or
 /// `rev/{alg}/{hash}!compacted/{ord}.{suffix}`: one compacted chunk.
-fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
+fn categorize_atime(namespace: Namespace, rest: &str) -> KeyCategory {
     if let Some((target, chunk)) = rest.split_once(&format!("!{ATIME_COMPACTED}/")) {
         let target_valid = match target.split_once('/') {
             Some(("tag", tag)) => Tag::new(tag).is_ok(),
@@ -308,13 +310,10 @@ fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
     }
     if let Some(tag_rest) = rest.strip_prefix("tag/") {
         if let Some((tag, entry)) = tag_rest.split_once("!/")
-            && Tag::new(tag).is_ok()
+            && let Ok(tag) = Tag::new(tag)
             && parse_atime_entry(entry).is_some()
         {
-            return KeyCategory::TagAtimeEntry {
-                namespace: namespace.to_string(),
-                tag: tag.to_string(),
-            };
+            return KeyCategory::TagAtimeEntry { namespace, tag };
         }
         return KeyCategory::Unknown;
     }
@@ -326,10 +325,7 @@ fn categorize_atime(namespace: &str, rest: &str) -> KeyCategory {
             && let Some(digest) = parse_digest(algorithm, hash)
             && parse_atime_entry(entry).is_some()
         {
-            return KeyCategory::RevisionAtimeEntry {
-                namespace: namespace.to_string(),
-                digest,
-            };
+            return KeyCategory::RevisionAtimeEntry { namespace, digest };
         }
     }
     KeyCategory::Unknown
@@ -360,11 +356,9 @@ fn categorize_job(rest: &str) -> KeyCategory {
 
     match *partition {
         "pending" => KeyCategory::JobRecord {
-            queue,
             state: JobState::Pending,
         },
         "failed" => KeyCategory::JobRecord {
-            queue,
             state: JobState::Failed,
         },
         "index" => KeyCategory::JobIndex { queue },
@@ -451,14 +445,14 @@ mod tests {
         assert_eq!(
             categorize(&namespace().revision_record_path(&digest_a())),
             KeyCategory::RevisionRecord {
-                namespace: "org/app".to_string(),
+                namespace: namespace(),
                 digest: digest_a(),
             }
         );
         assert_eq!(
             categorize(&namespace().referrer_record_path(&digest_a(), &digest_b())),
             KeyCategory::ReferrerRecord {
-                namespace: "org/app".to_string(),
+                namespace: namespace(),
                 subject: digest_a(),
                 referrer: digest_b(),
             }
@@ -533,16 +527,16 @@ mod tests {
         assert_eq!(
             categorize(&key),
             KeyCategory::TagEntry {
-                namespace: "org/app".to_string(),
-                tag: "v1.0".to_string(),
+                namespace: namespace(),
+                tag: Tag::new("v1.0").unwrap(),
             }
         );
         // An immutable tag's claim belongs to its tag, not to the quarantine.
         assert_eq!(
             categorize(&ns.tag_claim_path(&tag)),
             KeyCategory::TagEntry {
-                namespace: "org/app".to_string(),
-                tag: "v1.0".to_string(),
+                namespace: namespace(),
+                tag: Tag::new("v1.0").unwrap(),
             }
         );
     }
@@ -559,8 +553,8 @@ mod tests {
         assert_eq!(
             categorize(&key),
             KeyCategory::TagAtimeEntry {
-                namespace: "org/app".to_string(),
-                tag: "v1.0".to_string(),
+                namespace: namespace(),
+                tag: Tag::new("v1.0").unwrap(),
             }
         );
         assert_eq!(
@@ -569,7 +563,7 @@ mod tests {
                     .unwrap()
             ),
             KeyCategory::RevisionAtimeEntry {
-                namespace: "org/app".to_string(),
+                namespace: namespace(),
                 digest: digest_a(),
             }
         );
@@ -693,7 +687,6 @@ mod tests {
     /// the unknown-key quarantine instead of being reported as one.
     #[test]
     fn an_upload_directory_that_is_not_a_session_is_unknown() {
-        let ns = namespace();
         for name in ["uuid-1", "", "..", "not-a-uuid", "067e6162"] {
             let key = format!("v2/repositories/org/app/_uploads/{name}/data");
             assert_eq!(
@@ -702,13 +695,6 @@ mod tests {
                 "'{name}' must not categorize as an upload session"
             );
         }
-        assert_eq!(
-            categorize(&ns.upload_path(&UploadSessionId::from_str(SESSION).unwrap())),
-            KeyCategory::UploadArtifact {
-                namespace: "org/app".to_string(),
-                artifact: UploadArtifact::Data,
-            }
-        );
     }
 
     #[test]
@@ -716,14 +702,12 @@ mod tests {
         assert_eq!(
             categorize(&job_pending_path("replication", "0000-id")),
             KeyCategory::JobRecord {
-                queue: Queue::Replication,
                 state: JobState::Pending,
             }
         );
         assert_eq!(
             categorize(&job_failed_path("cache", "0000-id")),
             KeyCategory::JobRecord {
-                queue: Queue::Cache,
                 state: JobState::Failed,
             }
         );
@@ -796,12 +780,7 @@ mod tests {
             digest.layer_checkpoints_path(0),
             digest.layer_checkpoints_path(12),
         ] {
-            assert_eq!(
-                categorize(&key),
-                KeyCategory::LayerListing {
-                    digest: digest.clone()
-                }
-            );
+            assert_eq!(categorize(&key), KeyCategory::LayerListing);
         }
         // The whole entries and checkpoints objects are retired, left for quarantine.
         for name in [

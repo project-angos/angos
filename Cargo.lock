@@ -169,7 +169,6 @@ dependencies = [
 name = "angos-oci"
 version = "0.1.0"
 dependencies = [
- "angos-oci",
  "chrono",
  "hex",
  "http",
@@ -258,14 +257,11 @@ name = "angos-storage"
 version = "0.1.0"
 dependencies = [
  "angos-s3-client",
- "angos-storage",
  "async-trait",
  "bytes",
  "bytesize",
  "chrono",
  "futures-util",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

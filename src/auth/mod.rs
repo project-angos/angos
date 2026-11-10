@@ -8,46 +8,18 @@ pub mod oidc;
 pub mod token_service;
 pub mod webhook;
 
-use async_trait::async_trait;
 pub use authenticator::Authenticator;
 pub use authorizer::Authorizer;
 pub use basic_auth::BasicAuthValidator;
 pub use error::Error;
-use http::request::Parts;
-pub use mtls::{MtlsValidator, PeerCertificate};
+pub use mtls::PeerCertificate;
 pub use oidc::OidcValidator;
-use sha2::{Digest as Sha2Digest, Sha256};
 pub use token_service::{TokenIssuer, TokenValidator};
 
-use crate::identity::ClientIdentity;
-
-/// Lowercase-hex sha256 of `data`, for deriving stable, bounded-length cache
-/// keys from arbitrary key material.
-pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
-    hex::encode(Sha256::digest(data.as_ref()))
-}
-
-/// Result of authentication attempt
+/// What one authentication method found; credentials present but invalid are
+/// an `Err` instead.
 #[derive(Debug)]
 pub enum AuthResult {
-    /// Authentication succeeded, identity was updated
     Authenticated,
-    /// No credentials found for this auth method
     NoCredentials,
-}
-
-/// Authentication middleware trait that processes requests and builds client identity
-#[async_trait]
-pub trait AuthMiddleware: Send + Sync {
-    /// Process the request and update the client identity if credentials are found
-    ///
-    /// Returns:
-    /// - `Ok(AuthResult::Authenticated)` if valid credentials were found and identity updated
-    /// - `Ok(AuthResult::NoCredentials)` if no credentials for this auth method were found
-    /// - `Err(Error)` if credentials were found but invalid (should fail the request)
-    async fn authenticate(
-        &self,
-        parts: &Parts,
-        identity: &mut ClientIdentity,
-    ) -> Result<AuthResult, Error>;
 }

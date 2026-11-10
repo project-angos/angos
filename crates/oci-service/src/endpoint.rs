@@ -1,10 +1,5 @@
-//! Parse an HTTP method and URL path into an [`Endpoint`] of the OCI
-//! Distribution surface.
-//!
-//! This is the routing half of the spec: given `(method, path, query)`, name
-//! the operation and pull the validated path/query values it addresses. Headers
-//! and body are layered on by the transport afterwards. A path this surface
-//! does not serve returns `None`, so a caller can try the next surface.
+//! Routing for the OCI Distribution surface: `(method, path, query)` to the
+//! operation and the validated values it addresses.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -14,14 +9,12 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use angos_oci::path::{API_PREFIX, TAGS_LIST, UPLOADS};
+use angos_oci::request::ManifestPutTarget;
 use angos_oci::server;
 use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, Tag, UploadSessionId};
 
-use angos_oci::request::ManifestPutTarget;
-
-/// An operation of the OCI Distribution HTTP API, with the values its path and
-/// query carry. HEAD and GET are distinct variants so a caller can route them
-/// to a body-less handler.
+/// HEAD and GET are distinct variants so a caller can route HEAD to a
+/// body-less handler.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     /// `GET`/`HEAD /v2/`, end-1.
@@ -58,7 +51,6 @@ pub enum Endpoint {
     },
 }
 
-/// An operation on `/v2/<name>/manifests/<reference>`.
 #[derive(Clone, Debug)]
 pub enum ManifestEndpoint {
     /// `GET /v2/<name>/manifests/<reference>`, end-3.
@@ -83,7 +75,6 @@ pub enum ManifestEndpoint {
     },
 }
 
-/// An operation on `/v2/<name>/blobs/uploads/`.
 #[derive(Clone, Debug)]
 pub enum UploadEndpoint {
     /// `POST /v2/<name>/blobs/uploads/`, end-4a/4b.
@@ -166,19 +157,13 @@ impl UploadEndpoint {
     }
 }
 
-/// Parse `(method, path, query)` into an OCI [`Endpoint`], or `None` when the
-/// path is not part of the OCI surface (so a caller may try another surface).
-/// `path` is the raw URL path; `query` is the raw query string without `?`.
+/// `None` when the path is not part of this surface, so a caller can try the
+/// next one. `query` is the raw query string without `?`.
 #[must_use]
 pub fn parse(method: &Method, path: &str, query: Option<&str>) -> Option<Endpoint> {
     // HEAD as well as GET: the version check is the OCI conformance probe.
     if path == "/v2/" && (method == Method::GET || method == Method::HEAD) {
         return Some(Endpoint::CheckVersion);
-    }
-    // end-1 is `/v2/`; the same path without its slash is not the version
-    // endpoint and addresses nothing.
-    if path == "/v2" {
-        return None;
     }
 
     let api_path = path.strip_prefix(API_PREFIX)?;
@@ -207,18 +192,18 @@ fn parse_query<T: DeserializeOwned>(params: Option<&str>) -> Option<T> {
     serde_html_form::from_str(params.unwrap_or_default()).ok()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct DigestQuery {
     digest: Option<Digest>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct TagQuery {
     #[serde(default)]
     tag: BTreeSet<Tag>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct MountQuery {
     mount: Option<Digest>,
     from: Option<Namespace>,
@@ -227,20 +212,16 @@ struct MountQuery {
     digest_algorithm: Option<Algorithm>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ArtifactTypeQuery {
+struct ReferrersQuery {
     artifact_type: Option<MediaType>,
-}
-
-#[derive(Deserialize, Default)]
-struct PaginationQuery {
-    n: Option<u16>,
     last: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CursorQuery {
+struct PaginationQuery {
+    n: Option<u16>,
     last: Option<String>,
 }
 
@@ -350,11 +331,15 @@ fn try_referrers(method: &Method, path: &str, params: Option<&str>) -> Option<En
     let digest = Digest::from_str(digest).ok()?;
     // Strict parse: a malformed `?artifactType=` is a bad filter, not an absent
     // one, so it must not degrade into an unfiltered listing.
+    let ReferrersQuery {
+        artifact_type,
+        last,
+    } = parse_query(params)?;
     Some(Endpoint::GetReferrers {
         namespace,
         digest,
-        artifact_type: parse_query::<ArtifactTypeQuery>(params)?.artifact_type,
-        last: parse_query::<CursorQuery>(params)?.last,
+        artifact_type,
+        last,
     })
 }
 
@@ -374,6 +359,9 @@ mod tests {
 
     use angos_oci::client::referrers_path;
     use angos_oci::request::GetReferrersRequest;
+
+    const D: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const UPLOADS_START: &str = "/v2/myrepo/app/blobs/uploads/";
 
     fn ns(s: &str) -> Namespace {
         Namespace::new(s).unwrap()
@@ -395,11 +383,10 @@ mod tests {
 
     #[test]
     fn blob_get_head_delete() {
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let path = format!("/v2/library/nginx/blobs/{d}");
+        let path = format!("/v2/library/nginx/blobs/{D}");
         assert!(matches!(
             parse(&Method::GET, &path, None),
-            Some(Endpoint::GetBlob { namespace, digest }) if namespace == ns("library/nginx") && digest.to_string() == d
+            Some(Endpoint::GetBlob { namespace, digest }) if namespace == ns("library/nginx") && digest.to_string() == D
         ));
         assert!(matches!(
             parse(&Method::HEAD, &path, None),
@@ -408,6 +395,27 @@ mod tests {
         assert!(matches!(
             parse(&Method::DELETE, &path, None),
             Some(Endpoint::DeleteBlob { .. })
+        ));
+        assert!(parse(&Method::OPTIONS, &path, None).is_none());
+    }
+
+    #[test]
+    fn manifest_get_head_delete() {
+        // A by-tag GET ignores `?tag=`, which only a by-digest PUT reads.
+        assert!(matches!(
+            parse(&Method::GET, "/v2/myrepo/app/manifests/latest", Some("tag=a")),
+            Some(Endpoint::Manifest(ManifestEndpoint::Get { namespace, reference }))
+                if namespace == ns("myrepo/app") && reference.to_string() == "latest"
+        ));
+        assert!(matches!(
+            parse(&Method::HEAD, "/v2/myrepo/app/manifests/v1.0.0", None),
+            Some(Endpoint::Manifest(ManifestEndpoint::Head { reference, .. }))
+                if reference.to_string() == "v1.0.0"
+        ));
+        assert!(matches!(
+            parse(&Method::DELETE, &format!("/v2/myrepo/app/manifests/{D}"), None),
+            Some(Endpoint::Manifest(ManifestEndpoint::Delete { reference, .. }))
+                if reference.to_string() == D
         ));
     }
 
@@ -423,59 +431,139 @@ mod tests {
     }
 
     #[test]
-    fn start_upload_and_mount() {
-        assert!(matches!(
-            parse(&Method::POST, "/v2/app/blobs/uploads/", None),
-            Some(Endpoint::Upload(UploadEndpoint::Start { .. }))
-        ));
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(matches!(
+    fn put_manifest_by_digest_dedups_repeated_tag_params() {
+        let Some(Endpoint::Manifest(ManifestEndpoint::Put {
+            target: ManifestPutTarget::Digest { tags, .. },
+            ..
+        })) = parse(
+            &Method::PUT,
+            &format!("/v2/foo/manifests/{D}"),
+            Some("tag=a&tag=a&tag=b"),
+        )
+        else {
+            panic!("a by-digest PUT must produce a Digest target");
+        };
+        assert_eq!(tags, vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()]);
+    }
+
+    /// A single invalid `?tag=` rejects the route (the generic 400) rather than
+    /// dropping every tag.
+    #[test]
+    fn put_manifest_by_digest_invalid_tag_param_rejected() {
+        assert!(
             parse(
-                &Method::POST,
-                "/v2/app/blobs/uploads/",
-                Some(&format!("mount={d}&from=other"))
-            ),
-            Some(Endpoint::Upload(UploadEndpoint::Mount {
-                from: Some(_),
-                ..
-            }))
-        ));
+                &Method::PUT,
+                &format!("/v2/foo/manifests/{D}"),
+                Some("tag=a&tag=bad!tag"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
-    fn tags_and_referrers() {
+    fn list_tags() {
         assert!(matches!(
             parse(&Method::GET, "/v2/app/tags/list", Some("n=2")),
             Some(Endpoint::ListTags { n: Some(2), .. })
         ));
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(matches!(
-            parse(&Method::GET, &format!("/v2/app/referrers/{d}"), None),
-            Some(Endpoint::GetReferrers { .. })
-        ));
     }
 
     #[test]
-    fn upload_start_method_slash_and_namespace() {
-        // POST with the spec's trailing slash opens a session under the namespace.
+    fn upload_start() {
         assert!(matches!(
-            parse(&Method::POST, "/v2/myrepo/app/blobs/uploads/", None),
-            Some(Endpoint::Upload(UploadEndpoint::Start { namespace, digest: None, .. })) if namespace == ns("myrepo/app")
+            parse(&Method::POST, UPLOADS_START, None),
+            Some(Endpoint::Upload(UploadEndpoint::Start { namespace, digest: None, digest_algorithm: None }))
+                if namespace == ns("myrepo/app")
         ));
-        // Nested namespace parses correctly.
+        let Some(Endpoint::Upload(UploadEndpoint::Start { digest, .. })) =
+            parse(&Method::POST, UPLOADS_START, Some(&format!("digest={D}")))
+        else {
+            panic!("expected a one-shot upload start");
+        };
+        assert_eq!(digest.map(|digest| digest.to_string()).as_deref(), Some(D));
+        // The hint makes the session hash under one algorithm.
         assert!(matches!(
-            parse(&Method::POST, "/v2/org/team/blobs/uploads/", None),
-            Some(Endpoint::Upload(UploadEndpoint::Start { namespace, .. })) if namespace == ns("org/team")
+            parse(
+                &Method::POST,
+                UPLOADS_START,
+                Some("digest-algorithm=sha512")
+            ),
+            Some(Endpoint::Upload(UploadEndpoint::Start {
+                digest_algorithm: Some(Algorithm::Sha512),
+                ..
+            }))
         ));
-        // A GET on the start path is not the endpoint.
-        assert!(parse(&Method::GET, "/v2/myrepo/app/blobs/uploads/", None).is_none());
-        // Missing trailing slash is not the uploads endpoint.
+
+        assert!(parse(&Method::GET, UPLOADS_START, None).is_none());
         assert!(parse(&Method::POST, "/v2/foo/blobs/uploads", None).is_none());
-        // Empty or invalid namespaces do not route.
         assert!(parse(&Method::POST, "/v2/blobs/uploads/", None).is_none());
         assert!(parse(&Method::POST, "/v2/MyRepo/blobs/uploads/", None).is_none());
-        assert!(parse(&Method::POST, "/v2/bad ns/blobs/uploads/", None).is_none());
-        // A session id that is not a valid uuid does not route.
+    }
+
+    /// An unset `from` makes the server attempt automatic content discovery.
+    #[test]
+    fn mount_blob_with_and_without_from() {
+        assert!(matches!(
+            parse(&Method::POST, UPLOADS_START, Some(&format!("mount={D}&from=other"))),
+            Some(Endpoint::Upload(UploadEndpoint::Mount { from: Some(from), .. })) if from == ns("other")
+        ));
+        assert!(matches!(
+            parse(&Method::POST, UPLOADS_START, Some(&format!("mount={D}"))),
+            Some(Endpoint::Upload(UploadEndpoint::Mount { digest, from: None, .. })) if digest.to_string() == D
+        ));
+    }
+
+    /// The OCI fall-back-to-session rule covers unsatisfiable mounts, not
+    /// syntactically invalid ones, so any malformed parameter is a 400, even
+    /// one the chosen operation would not read.
+    #[test]
+    fn upload_start_rejects_malformed_queries() {
+        for query in [
+            format!("mount={D}&from=Invalid"),
+            "from=Invalid".to_string(),
+            "digest=not-a-digest".to_string(),
+            "mount=not-a-digest".to_string(),
+            format!("mount={D}&digest=garbage"),
+            "digest-algorithm=md5".to_string(),
+        ] {
+            assert!(
+                parse(&Method::POST, UPLOADS_START, Some(&query)).is_none(),
+                "?{query} must not route"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_session_get_patch_delete() {
+        let session_id = UploadSessionId::generate();
+        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
+        for (method, name) in [
+            (Method::GET, "get-upload"),
+            (Method::PATCH, "patch-upload"),
+            (Method::DELETE, "delete-upload"),
+        ] {
+            let endpoint = parse(&method, &path, None).expect("a session route");
+            assert_eq!(endpoint.endpoint_name(), name);
+            let Endpoint::Upload(
+                UploadEndpoint::Get {
+                    namespace,
+                    session_id: parsed,
+                }
+                | UploadEndpoint::Patch {
+                    namespace,
+                    session_id: parsed,
+                }
+                | UploadEndpoint::Delete {
+                    namespace,
+                    session_id: parsed,
+                },
+            ) = endpoint
+            else {
+                panic!("{name} must address the session");
+            };
+            assert_eq!(namespace, "myrepo/app");
+            assert_eq!(parsed, session_id);
+        }
         assert!(
             parse(
                 &Method::GET,
@@ -487,20 +575,33 @@ mod tests {
     }
 
     #[test]
-    fn malformed_addresses_and_methods_decline() {
-        // A blob digest that does not parse is a miss.
-        assert!(parse(&Method::GET, "/v2/myrepo/app/blobs/not-a-digest", None).is_none());
-        // A referrers digest that does not parse is a miss (the 400 vs 404 call
-        // is the transport's, via `is_invalid_referrers_request`).
-        assert!(parse(&Method::GET, "/v2/myrepo/app/referrers/not-a-digest", None).is_none());
-        // Tags list is read-only.
-        assert!(parse(&Method::POST, "/v2/myrepo/app/tags/list", None).is_none());
-        // A by-tag manifest read parses the tag reference.
+    fn put_upload_requires_a_digest() {
+        let session_id = UploadSessionId::generate();
+        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
         assert!(matches!(
-            parse(&Method::GET, "/v2/myrepo/app/manifests/latest", None),
-            Some(Endpoint::Manifest(ManifestEndpoint::Get { namespace, reference }))
-                if namespace == ns("myrepo/app") && reference.to_string() == "latest"
+            parse(&Method::PUT, &path, Some(&format!("digest={D}"))),
+            Some(Endpoint::Upload(UploadEndpoint::Put { session_id: parsed, digest, .. }))
+                if parsed == session_id && digest.to_string() == D
         ));
+        assert!(parse(&Method::PUT, &path, None).is_none());
+    }
+
+    #[test]
+    fn malformed_addresses_and_methods_decline() {
+        assert!(parse(&Method::GET, "/v2/myrepo/app/blobs/not-a-digest", None).is_none());
+        // The 400 vs 404 call is the transport's, via `is_invalid_referrers_request`.
+        assert!(parse(&Method::GET, "/v2/myrepo/app/referrers/not-a-digest", None).is_none());
+        assert!(parse(&Method::POST, "/v2/myrepo/app/tags/list", None).is_none());
+        // Must not route, so the dispatcher answers the PUT `400` as OCI
+        // conformance requires.
+        assert!(
+            parse(
+                &Method::PUT,
+                "/v2/myrepo/app/manifests/sha256:not-a-digest",
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -522,348 +623,18 @@ mod tests {
         ));
     }
 
-    /// A reference that parses as neither a tag nor a digest must not route, so
-    /// the dispatcher answers a `PUT` carrying one with `400`, as OCI
-    /// conformance requires.
-    #[test]
-    fn put_manifest_with_unparseable_reference_is_rejected() {
-        assert!(
-            parse(
-                &Method::PUT,
-                "/v2/myrepo/app/manifests/sha256:not-a-digest",
-                None,
-            )
-            .is_none(),
-        );
-    }
-
-    #[test]
-    fn start_upload_with_digest() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::Upload(UploadEndpoint::Start {
-            namespace, digest, ..
-        })) = parse(
-            &Method::POST,
-            "/v2/myrepo/app/blobs/uploads/",
-            Some(&format!("digest={d}")),
-        )
-        else {
-            panic!("Expected StartUpload route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(digest.map(|digest| digest.to_string()).as_deref(), Some(d));
-    }
-
-    /// An unset `from` makes the server attempt automatic content discovery.
-    #[test]
-    fn mount_blob_without_from() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::Upload(UploadEndpoint::Mount { digest, from, .. })) = parse(
-            &Method::POST,
-            "/v2/myrepo/target/blobs/uploads/",
-            Some(&format!("mount={d}")),
-        ) else {
-            panic!("Expected MountBlob route");
-        };
-        assert_eq!(digest.to_string(), d);
-        assert!(from.is_none());
-    }
-
-    #[test]
-    fn mount_blob_with_malformed_from_is_rejected() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/target/blobs/uploads/",
-                Some(&format!("mount={d}&from=Invalid")),
-            )
-            .is_none(),
-            "a malformed ?from= must not route (POST -> 400)"
-        );
-    }
-
-    #[test]
-    fn malformed_from_without_mount_is_rejected() {
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/target/blobs/uploads/",
-                Some("from=Invalid"),
-            )
-            .is_none(),
-            "a malformed ?from= must not route even unused (POST -> 400)"
-        );
-    }
-
-    #[test]
-    fn start_upload_with_malformed_digest_is_rejected() {
-        for query in ["digest=not-a-digest", "digest=garbage"] {
-            assert!(
-                parse(&Method::POST, "/v2/myrepo/app/blobs/uploads/", Some(query)).is_none(),
-                "a malformed ?digest= must not start a session (POST -> 400)"
-            );
-        }
-    }
-
-    /// The OCI fall-back-to-session rule covers unsatisfiable mounts, not
-    /// syntactically invalid ones.
-    #[test]
-    fn malformed_mount_is_rejected() {
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/target/blobs/uploads/",
-                Some("mount=not-a-digest"),
-            )
-            .is_none(),
-            "a malformed ?mount= must reject the route (POST -> 400)"
-        );
-    }
-
-    /// Real clients never combine `?mount=` with a monolithic `?digest=`;
-    /// rejecting the combination is by design.
-    #[test]
-    fn mount_with_malformed_digest_is_rejected() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/target/blobs/uploads/",
-                Some(&format!("mount={d}&digest=garbage")),
-            )
-            .is_none(),
-            "a malformed ?digest= must poison the mount path too (POST -> 400)"
-        );
-    }
-
-    #[test]
-    fn get_upload() {
-        let session_id = UploadSessionId::generate();
-        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::Upload(UploadEndpoint::Get {
-            namespace,
-            session_id: parsed,
-        })) = parse(&Method::GET, &path, None)
-        else {
-            panic!("Expected GetUpload route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(parsed, session_id);
-    }
-
-    #[test]
-    fn patch_upload() {
-        let session_id = UploadSessionId::generate();
-        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::Upload(UploadEndpoint::Patch {
-            namespace,
-            session_id: parsed,
-        })) = parse(&Method::PATCH, &path, None)
-        else {
-            panic!("Expected PatchUpload route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(parsed, session_id);
-    }
-
-    #[test]
-    fn put_upload() {
-        let session_id = UploadSessionId::generate();
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::Upload(UploadEndpoint::Put {
-            namespace,
-            session_id: parsed,
-            digest,
-        })) = parse(&Method::PUT, &path, Some(&format!("digest={d}")))
-        else {
-            panic!("Expected PutUpload route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(parsed, session_id);
-        assert_eq!(digest.to_string(), d);
-    }
-
-    #[test]
-    fn put_upload_without_digest() {
-        let session_id = UploadSessionId::generate();
-        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        assert!(parse(&Method::PUT, &path, None).is_none());
-    }
-
-    #[test]
-    fn delete_upload() {
-        let session_id = UploadSessionId::generate();
-        let path = format!("/v2/myrepo/app/blobs/uploads/{session_id}");
-        let Some(Endpoint::Upload(UploadEndpoint::Delete {
-            namespace,
-            session_id: parsed,
-        })) = parse(&Method::DELETE, &path, None)
-        else {
-            panic!("Expected DeleteUpload route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(parsed, session_id);
-    }
-
-    #[test]
-    fn head_manifest() {
-        let Some(Endpoint::Manifest(ManifestEndpoint::Head {
-            namespace,
-            reference,
-        })) = parse(&Method::HEAD, "/v2/myrepo/app/manifests/v1.0.0", None)
-        else {
-            panic!("Expected HeadManifest route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(reference.to_string(), "v1.0.0");
-    }
-
-    #[test]
-    fn put_manifest_by_digest_dedups_repeated_tag_params() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::Manifest(ManifestEndpoint::Put {
-            target: ManifestPutTarget::Digest { tags, .. },
-            ..
-        })) = parse(
-            &Method::PUT,
-            &format!("/v2/foo/manifests/{d}"),
-            Some("tag=a&tag=a&tag=b"),
-        )
-        else {
-            panic!("a by-digest PUT must produce a Digest target");
-        };
-        assert_eq!(
-            tags,
-            vec![Tag::new("a").unwrap(), Tag::new("b").unwrap()],
-            "a repeated `?tag=` value is de-duplicated"
-        );
-    }
-
-    /// A single invalid `?tag=` value fails deserialization, so the route is
-    /// rejected (the generic 400) rather than dropping every tag.
-    #[test]
-    fn put_manifest_by_digest_invalid_tag_param_rejected() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        assert!(
-            parse(
-                &Method::PUT,
-                &format!("/v2/foo/manifests/{d}"),
-                Some("tag=a&tag=bad!tag"),
-            )
-            .is_none(),
-            "an invalid `?tag=` value must reject the by-digest PUT route"
-        );
-    }
-
-    #[test]
-    fn get_manifest_by_tag_ignores_tag_params() {
-        assert!(
-            matches!(
-                parse(&Method::GET, "/v2/foo/manifests/latest", Some("tag=a")),
-                Some(Endpoint::Manifest(ManifestEndpoint::Get { .. }))
-            ),
-            "GET by tag must not carry tag params"
-        );
-    }
-
-    #[test]
-    fn delete_manifest() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::Manifest(ManifestEndpoint::Delete {
-            namespace,
-            reference,
-        })) = parse(
-            &Method::DELETE,
-            &format!("/v2/myrepo/app/manifests/{d}"),
-            None,
-        )
-        else {
-            panic!("Expected DeleteManifest route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(reference.to_string(), d);
-    }
-
-    #[test]
-    fn get_referrer_with_artifact_type() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let Some(Endpoint::GetReferrers {
-            namespace,
-            digest,
-            artifact_type,
-            ..
-        }) = parse(
-            &Method::GET,
-            &format!("/v2/myrepo/app/referrers/{d}"),
-            Some("artifactType=application/vnd.oci.image.manifest.v1%2Bjson"),
-        )
-        else {
-            panic!("Expected GetReferrer route");
-        };
-        assert_eq!(namespace, "myrepo/app");
-        assert_eq!(digest.to_string(), d);
-        assert_eq!(
-            artifact_type,
-            Some(MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap())
-        );
-    }
-
-    #[test]
-    fn unknown_method_declines() {
-        let d = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        assert!(parse(&Method::OPTIONS, &format!("/v2/myrepo/app/blobs/{d}"), None).is_none());
-    }
-
-    /// The `?digest-algorithm=` hint reaches the session so it hashes under one
-    /// algorithm; an unsupported value is a malformed request, not an absent
-    /// hint.
-    #[test]
-    fn upload_digest_algorithm_hint_is_parsed() {
-        match parse(
-            &Method::POST,
-            "/v2/myrepo/app/blobs/uploads/",
-            Some("digest-algorithm=sha512"),
-        ) {
-            Some(Endpoint::Upload(UploadEndpoint::Start {
-                digest_algorithm, ..
-            })) => assert_eq!(digest_algorithm, Some(Algorithm::Sha512)),
-            other => panic!("a hinted upload must start a session, got {other:?}"),
-        }
-
-        match parse(&Method::POST, "/v2/myrepo/app/blobs/uploads/", None) {
-            Some(Endpoint::Upload(UploadEndpoint::Start {
-                digest_algorithm, ..
-            })) => assert!(digest_algorithm.is_none()),
-            other => panic!("an unhinted upload must start a session, got {other:?}"),
-        }
-
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/app/blobs/uploads/",
-                Some("digest-algorithm=md5"),
-            )
-            .is_none(),
-            "an unsupported algorithm must not start a session (POST -> 400)"
-        );
-    }
-
-    /// The filter is a media type, so its `+json` style suffix must survive the
-    /// query decoding, in either spelling a client percent-encodes it as.
+    /// The `+json` suffix must survive query decoding in either spelling a
+    /// client percent-encodes it as.
     #[test]
     fn artifact_type_filter_keeps_an_encoded_media_type_suffix() {
-        let d = format!("sha256:{}", "a".repeat(64));
         let expected = MediaType::new("application/vnd.in-toto+json").unwrap();
-
         for query in [
             "artifactType=application%2Fvnd.in-toto%2Bjson",
             "artifactType=application/vnd.in-toto%2Bjson",
         ] {
             match parse(
                 &Method::GET,
-                &format!("/v2/lib/nginx/referrers/{d}"),
+                &format!("/v2/lib/nginx/referrers/{D}"),
                 Some(query),
             ) {
                 Some(Endpoint::GetReferrers { artifact_type, .. }) => assert_eq!(
@@ -876,19 +647,16 @@ mod tests {
         }
     }
 
-    /// A value that is not a media type is a bad filter, not an absent one: it
-    /// must never degrade into an unfiltered listing of every referrer. A
-    /// parameter section is not a media type either: only a header may carry
-    /// one, so a filter naming parameters is refused rather than quietly
-    /// reduced to the type ahead of them.
+    /// A malformed filter must never degrade into an unfiltered listing. Only a
+    /// header may carry media type parameters, so a filter naming them is
+    /// refused rather than reduced to the type ahead of them.
     #[test]
     fn artifact_type_filter_rejects_a_malformed_value() {
-        let d = format!("sha256:{}", "a".repeat(64));
         for filter in ["not-a-media-type", "application/json;charset=utf-8"] {
             assert!(
                 parse(
                     &Method::GET,
-                    &format!("/v2/lib/nginx/referrers/{d}"),
+                    &format!("/v2/lib/nginx/referrers/{D}"),
                     Some(&format!("artifactType={filter}")),
                 )
                 .is_none(),
@@ -897,17 +665,16 @@ mod tests {
         }
     }
 
-    /// The spec defines no page size for this endpoint, so `?n=` is not part of
-    /// it and is ignored like any other unknown parameter rather than rejected.
+    /// The spec defines no page size here, so `?n=` is ignored like any other
+    /// unknown parameter rather than rejected.
     #[test]
     fn a_referrers_page_size_is_not_a_parameter() {
-        let d = format!("sha256:{}", "a".repeat(64));
         for query in ["n=abc", "n=65536", "n=10"] {
             assert!(
                 matches!(
                     parse(
                         &Method::GET,
-                        &format!("/v2/lib/nginx/referrers/{d}"),
+                        &format!("/v2/lib/nginx/referrers/{D}"),
                         Some(query)
                     ),
                     Some(Endpoint::GetReferrers { .. })
@@ -917,13 +684,11 @@ mod tests {
         }
     }
 
-    /// The `Link` a filtered listing advertises is composed by the serving side
-    /// and parsed back by this one, so the filter has to survive the round
-    /// trip. A raw `+` would come back as a space and fail the media-type
-    /// grammar.
+    /// The serving side composes the `Link` a filtered listing advertises; a
+    /// raw `+` would come back as a space and fail the media-type grammar.
     #[test]
     fn a_rendered_referrers_link_parses_back_into_the_same_filter() {
-        let digest: Digest = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        let digest: Digest = D.parse().unwrap();
         let filter = MediaType::new("application/vnd.example.sbom.v1+json").unwrap();
         let link = referrers_path(
             "",
@@ -945,7 +710,7 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(artifact_type.as_ref(), Some(&filter));
-                assert_eq!(last.as_deref(), Some(digest.to_string().as_str()));
+                assert_eq!(last.as_deref(), Some(D));
             }
             other => panic!("the advertised next page must route, got {other:?}"),
         }

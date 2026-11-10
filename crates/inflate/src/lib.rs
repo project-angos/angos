@@ -1,19 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! A pure-Rust inflater (RFC 1951) for gzip streams, with checkpoints. gzip
-//! has no random access: reaching a byte means decoding everything before it.
-//! At a block boundary the inflater can record where the input stands and the
-//! last 32 KiB of output, which is all a later decode needs to resume there.
-//! No C binding and no unsafe code.
+//! A pure-Rust gzip inflater (RFC 1951) with checkpoints. gzip has no random
+//! access, so at a block boundary the inflater can record the input position
+//! and the last 32 KiB of output: all [`Inflater::resume`] needs to restart
+//! there.
 //!
-//! [`Inflater::new`] decodes a stream from its start, taking a [`Checkpoint`]
-//! at the first block boundary after every so many bytes of output;
-//! [`Inflater::resume`] picks up at one, given the input positioned at its
-//! `in_offset`. Both read as a [`std::io::Read`] of the uncompressed bytes.
-//!
-//! The hot loop is built the way miniz's is: preconditions checked once per
-//! symbol, the bit buffer and input cursor in locals, an 11-bit lookup with
-//! a bit-by-bit fallback. It decodes a real layer at `miniz_oxide`'s speed.
+//! The hot loop follows miniz: preconditions checked once per symbol, the bit
+//! buffer and input cursor in locals, an 11-bit lookup with a bit-by-bit
+//! fallback. It matches `miniz_oxide`'s speed on a real layer.
 
 use std::io::{self, Read};
 use std::mem;
@@ -79,6 +73,43 @@ fn unexpected_end() -> io::Error {
 /// The ring slot an output offset lands in.
 fn slot(offset: u64) -> usize {
     usize::try_from(offset & RING_MASK).unwrap_or(0)
+}
+
+/// Copies a `length`-byte match from `distance` back and returns the new
+/// position. Chunks of at most `distance` bytes repeat a run (a reference into
+/// what it writes) correctly; short ones move sixteen bytes at once, since
+/// over-copying inside the ring is cheaper than a length-dependent loop, and a
+/// copy that would wrap the ring goes by byte.
+#[inline]
+fn copy_match(
+    ring: &mut [u8; RING],
+    mut pos: u64,
+    distance: u64,
+    mut length: u64,
+) -> io::Result<u64> {
+    if distance > pos || distance > WINDOW as u64 {
+        return Err(invalid("distance too far back"));
+    }
+    while length > 0 {
+        let chunk = length.min(distance);
+        let (src, dst) = (slot(pos - distance), slot(pos));
+        let len = usize::try_from(chunk).unwrap_or(0);
+        if chunk <= 16 && src + 16 <= RING && dst + 16 <= RING {
+            let word: [u8; 16] = ring[src..src + 16].try_into().unwrap_or([0; 16]);
+            ring[dst..dst + 16].copy_from_slice(&word);
+            pos += chunk;
+            length -= chunk;
+        } else if src + len <= RING && dst + len <= RING {
+            ring.copy_within(src..src + len, dst);
+            pos += chunk;
+            length -= chunk;
+        } else {
+            ring[dst] = ring[src];
+            pos += 1;
+            length -= 1;
+        }
+    }
+    Ok(pos)
 }
 
 /// A canonical Huffman code: a fast table for codes up to [`FAST_BITS`] long
@@ -198,16 +229,6 @@ impl<R: Read> BitReader<R> {
         Ok(())
     }
 
-    /// The fast loop's chunk top-up: the cursor `p` it holds is written back,
-    /// the chunk slid and refilled, and the new cursor returned. The loop
-    /// checks what is ahead of it afterwards.
-    fn top_up_from(&mut self, p: usize) -> io::Result<usize> {
-        self.consumed += (p - self.pos) as u64;
-        self.pos = p;
-        self.top_up()?;
-        Ok(self.pos)
-    }
-
     fn next_input_byte(&mut self) -> io::Result<Option<u8>> {
         if self.pos == self.len {
             self.len = loop {
@@ -290,23 +311,6 @@ impl<R: Read> BitReader<R> {
 
     fn next_byte(&mut self) -> io::Result<u8> {
         self.next_byte_or_end()?.ok_or_else(unexpected_end)
-    }
-
-    /// The bits consumed so far, as the byte and bit a checkpoint records.
-    fn position(&self) -> (u64, u8) {
-        let consumed_bits = self.consumed * 8 - u64::from(self.nbits);
-        (
-            consumed_bits / 8,
-            u8::try_from(consumed_bits % 8).unwrap_or(0),
-        )
-    }
-
-    /// Starts reading at `bit` of the next byte, for a resume.
-    fn skip_bits_of_next_byte(&mut self, bit: u8) -> io::Result<()> {
-        let byte = self.next_byte()?;
-        self.bits = u64::from(byte) >> bit;
-        self.nbits = 8 - u32::from(bit);
-        Ok(())
     }
 
     /// One symbol: a table lookup nearly always, the canonical walk for a
@@ -530,14 +534,9 @@ impl<R: Read> Inflater<R> {
         Ok(())
     }
 
-    fn read_member_header(&mut self) -> io::Result<()> {
-        let id1 = self.bits.next_byte()?;
-        let id2 = self.bits.next_byte()?;
-        self.read_member_header_after_magic(id1, id2)
-    }
-
-    fn read_member_header_after_magic(&mut self, id1: u8, id2: u8) -> io::Result<()> {
-        if (id1, id2) != (0x1f, 0x8b) {
+    /// The rest of a gzip member header, `id1` already read.
+    fn read_member_header(&mut self, id1: u8) -> io::Result<()> {
+        if (id1, self.bits.next_byte()?) != (0x1f, 0x8b) {
             return Err(invalid("not a gzip stream"));
         }
         if self.bits.next_byte()? != 8 {
@@ -571,14 +570,14 @@ impl<R: Read> Inflater<R> {
         if self.pos == 0 || self.pos - self.last_checkpoint < self.checkpoint_every {
             return;
         }
-        let (in_offset, bit) = self.bits.position();
+        let consumed_bits = self.bits.consumed * 8 - u64::from(self.bits.nbits);
         let len = usize::try_from(self.pos.min(WINDOW as u64)).unwrap_or(WINDOW);
         let window: Vec<u8> = (0..len)
             .map(|i| self.ring[slot(self.pos - len as u64 + i as u64)])
             .collect();
         self.checkpoints.push(Checkpoint {
-            in_offset,
-            bit,
+            in_offset: consumed_bits / 8,
+            bit: u8::try_from(consumed_bits % 8).unwrap_or(0),
             out_offset: self.pos,
             window,
         });
@@ -587,7 +586,9 @@ impl<R: Read> Inflater<R> {
 
     fn start_block(&mut self) -> io::Result<()> {
         if let Some(bit) = self.resume_bit.take() {
-            self.bits.skip_bits_of_next_byte(bit)?;
+            let byte = self.bits.next_byte()?;
+            self.bits.bits = u64::from(byte) >> bit;
+            self.bits.nbits = 8 - u32::from(bit);
         } else {
             self.take_checkpoint();
         }
@@ -671,22 +672,6 @@ impl<R: Read> Inflater<R> {
         Ok(())
     }
 
-    fn emit(&mut self, byte: u8) {
-        self.ring[slot(self.pos)] = byte;
-        self.pos += 1;
-    }
-
-    /// Decodes the block's symbols until it ends or [`WINDOW`] bytes wait to
-    /// be read. The hot loop: the position and the codes live in locals, and
-    /// nothing goes back through the state machine per symbol.
-    fn run_block(&mut self, block: &Block) -> io::Result<()> {
-        self.run_fast(block)?;
-        if self.state == State::Huffman {
-            self.run_checked(block)?;
-        }
-        Ok(())
-    }
-
     /// The fast loop: with room for the longest match and a chunk of input
     /// ahead, one symbol decodes with no end-of-input or room check at all.
     /// The reader's cursor and bit buffer live in locals meanwhile, written
@@ -707,7 +692,10 @@ impl<R: Read> Inflater<R> {
             // The chunk runs low long before the input does: slide it and
             // read on, leaving only a true end of input to the checked loop.
             if bits.len - p < FAST_INPUT {
-                p = bits.top_up_from(p)?;
+                bits.consumed += (p - bits.pos) as u64;
+                bits.pos = p;
+                bits.top_up()?;
+                p = bits.pos;
                 if bits.len - p < FAST_INPUT {
                     break;
                 }
@@ -736,7 +724,7 @@ impl<R: Read> Inflater<R> {
                 .ok_or_else(|| invalid("bad length"))?;
             fill32!(bits, p, b, n);
             let extra = u32::from(LENGTH_EXTRA[index]);
-            let mut length = u64::from(base) + (b & ((1u64 << extra) - 1));
+            let length = u64::from(base) + (b & ((1u64 << extra) - 1));
             b >>= extra;
             n -= extra;
             fill32!(bits, p, b, n);
@@ -755,32 +743,7 @@ impl<R: Read> Inflater<R> {
             let distance = u64::from(dbase) + (b & ((1u64 << extra) - 1));
             b >>= extra;
             n -= extra;
-            if distance > pos || distance > WINDOW as u64 {
-                return Err(invalid("distance too far back"));
-            }
-            // Sixteen bytes at a time for short copies, over-copying inside
-            // the ring, since a call per match costs more than the bytes; a
-            // run (a reference into what it writes) repeats in chunks of its
-            // distance.
-            while length > 0 {
-                let chunk = length.min(distance);
-                let (src, dst) = (slot(pos - distance), slot(pos));
-                let len = usize::try_from(chunk).unwrap_or(0);
-                if chunk <= 16 && src + 16 <= RING && dst + 16 <= RING {
-                    let word: [u8; 16] = ring[src..src + 16].try_into().unwrap_or([0; 16]);
-                    ring[dst..dst + 16].copy_from_slice(&word);
-                    pos += chunk;
-                    length -= chunk;
-                } else if src + len <= RING && dst + len <= RING {
-                    ring.copy_within(src..src + len, dst);
-                    pos += chunk;
-                    length -= chunk;
-                } else {
-                    ring[dst] = ring[src];
-                    pos += 1;
-                    length -= 1;
-                }
-            }
+            pos = copy_match(ring, pos, distance, length)?;
         }
         bits.consumed += (p - bits.pos) as u64;
         bits.pos = p;
@@ -812,38 +775,11 @@ impl<R: Read> Inflater<R> {
             let base = *LENGTH_BASE
                 .get(index)
                 .ok_or_else(|| invalid("bad length"))?;
-            let mut length =
-                u64::from(base) + u64::from(bits.take(u32::from(LENGTH_EXTRA[index]))?);
+            let length = u64::from(base) + u64::from(bits.take(u32::from(LENGTH_EXTRA[index]))?);
             let dsym = usize::from(bits.decode(&block.distances)?);
             let dbase = *DIST_BASE.get(dsym).ok_or_else(|| invalid("bad distance"))?;
             let distance = u64::from(dbase) + u64::from(bits.take(u32::from(DIST_EXTRA[dsym]))?);
-            if distance > pos || distance > WINDOW as u64 {
-                return Err(invalid("distance too far back"));
-            }
-            // Slice copies of at most `distance` bytes, so a run (a reference
-            // into what it writes) repeats correctly; a copy that would wrap
-            // the ring goes by byte.
-            while length > 0 {
-                let chunk = length.min(distance);
-                let (src, dst) = (slot(pos - distance), slot(pos));
-                let len = usize::try_from(chunk).unwrap_or(0);
-                if chunk <= 16 && src + 16 <= RING && dst + 16 <= RING {
-                    // Sixteen bytes always: over-copying inside the ring is
-                    // harmless and cheaper than a length-dependent loop.
-                    let word: [u8; 16] = ring[src..src + 16].try_into().unwrap_or([0; 16]);
-                    ring[dst..dst + 16].copy_from_slice(&word);
-                    pos += chunk;
-                    length -= chunk;
-                } else if src + len <= RING && dst + len <= RING {
-                    ring.copy_within(src..src + len, dst);
-                    pos += chunk;
-                    length -= chunk;
-                } else {
-                    ring[dst] = ring[src];
-                    pos += 1;
-                    length -= 1;
-                }
-            }
+            pos = copy_match(ring, pos, distance, length)?;
         }
         self.pos = pos;
         Ok(())
@@ -855,7 +791,8 @@ impl<R: Read> Inflater<R> {
         while self.pos - self.served < WINDOW as u64 {
             match self.state {
                 State::MemberStart => {
-                    self.read_member_header()?;
+                    let id1 = self.bits.next_byte()?;
+                    self.read_member_header(id1)?;
                     self.state = State::BlockStart;
                 }
                 State::BlockStart => self.start_block()?,
@@ -863,8 +800,8 @@ impl<R: Read> Inflater<R> {
                     if remaining == 0 {
                         self.state = State::BlockEnd;
                     } else {
-                        let byte = self.bits.next_byte()?;
-                        self.emit(byte);
+                        self.ring[slot(self.pos)] = self.bits.next_byte()?;
+                        self.pos += 1;
                         self.state = State::Stored {
                             remaining: remaining - 1,
                         };
@@ -875,7 +812,10 @@ impl<R: Read> Inflater<R> {
                         .block
                         .clone()
                         .ok_or_else(|| invalid("no code table for this block"))?;
-                    self.run_block(&block)?;
+                    self.run_fast(&block)?;
+                    if self.state == State::Huffman {
+                        self.run_checked(&block)?;
+                    }
                 }
                 State::BlockEnd => {
                     self.state = if self.final_block {
@@ -893,8 +833,7 @@ impl<R: Read> Inflater<R> {
                     match self.bits.next_byte_or_end()? {
                         None => self.state = State::Done,
                         Some(id1) => {
-                            let id2 = self.bits.next_byte()?;
-                            self.read_member_header_after_magic(id1, id2)?;
+                            self.read_member_header(id1)?;
                             self.state = State::BlockStart;
                         }
                     }

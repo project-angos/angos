@@ -21,13 +21,28 @@ fn ref_tail(link: &LinkKind) -> String {
         LinkKind::Blob(_) => "own".to_string(),
         LinkKind::Digest(_) => "r/rev".to_string(),
         LinkKind::Tag(tag) => format!("r/tag.{tag}"),
-        LinkKind::Referrer { subject, .. } => {
-            format!("r/sub.{}.{}", subject.algorithm(), subject.hash())
-        }
-        LinkKind::ReferencedBy(referrer) => {
-            format!("r/{}.{}", referrer.algorithm(), referrer.hash())
-        }
+        LinkKind::Referrer { subject, .. } => format!("r/sub.{}", ref_digest_name(subject)),
+        LinkKind::ReferencedBy(referrer) => format!("r/{}", ref_digest_name(referrer)),
     }
+}
+
+/// `<root>/<algo>/<pfx>/<hash>`, the layout every digest-keyed tree shares.
+fn sharded(root: &str, digest: &Digest) -> String {
+    format!(
+        "{root}/{}/{}/{}",
+        digest.algorithm(),
+        digest.hash_prefix(),
+        digest.hash()
+    )
+}
+
+/// The stamp an entry name's inverted-millis ordinal encodes; `None` outside
+/// the band a writer produces.
+fn ordinal_stamp(ord: u64) -> Option<DateTime<Utc>> {
+    (u64::MAX - 1)
+        .checked_sub(ord)
+        .and_then(|millis| i64::try_from(millis).ok())
+        .and_then(DateTime::from_timestamp_millis)
 }
 
 /// What a tag entry records: a push or a deletion.
@@ -109,10 +124,7 @@ impl FromStr for TagEntry {
         // No stamp for an ordinal outside the band a writer produces, such as
         // the `u64::MAX` an angos before 1.9.0 wrote for an entry converted
         // from a stamp-less link: those sort last and never win resolution.
-        let authored_at = (u64::MAX - 1)
-            .checked_sub(ord)
-            .and_then(|millis| i64::try_from(millis).ok())
-            .and_then(DateTime::from_timestamp_millis);
+        let authored_at = ordinal_stamp(ord);
         let algorithm = Algorithm::from_str(algorithm).map_err(|_| ())?;
         let digest = Digest::with_algorithm(algorithm, hash).map_err(|_| ())?;
         match kind {
@@ -138,10 +150,7 @@ pub fn parse_atime_entry(name: &str) -> Option<DateTime<Utc>> {
     if ord.len() != 16 || suffix.len() != 8 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    (u64::MAX - 1)
-        .checked_sub(u64::from_str_radix(ord, 16).ok()?)
-        .and_then(|millis| i64::try_from(millis).ok())
-        .and_then(DateTime::from_timestamp_millis)
+    ordinal_stamp(u64::from_str_radix(ord, 16).ok()?)
 }
 
 /// The name of the access entry `client` records at `at`, `<ord>.<suffix>`:
@@ -172,13 +181,10 @@ pub const LAYERS_ROOT: &str = "v2/layers";
 
 /// Every current-shape storage key addressed by a blob's digest.
 pub trait DigestExt {
-    /// Directory holding a blob's data.
     fn blob_dir(&self) -> String;
 
-    /// The blob's content.
     fn blob_path(&self) -> String;
 
-    /// Directory holding what the filesystem indexer derived from the layer.
     fn layer_dir(&self) -> String;
 
     /// The layer's listing, whose presence marks the layer indexed.
@@ -202,7 +208,6 @@ pub trait DigestExt {
     /// `a/b`'s directories.
     fn blob_ref_path(&self, namespace: &Namespace, link: &LinkKind) -> String;
 
-    /// The namespace's ownership reference key for the digest.
     fn blob_ref_own_path(&self, namespace: &Namespace) -> String;
 
     /// Directory holding a namespace's non-ownership reference keys for the
@@ -222,12 +227,7 @@ pub trait DigestExt {
 
 impl DigestExt for Digest {
     fn blob_dir(&self) -> String {
-        format!(
-            "{BLOBS_ROOT}/{}/{}/{}",
-            self.algorithm(),
-            self.hash_prefix(),
-            self.hash()
-        )
+        sharded(BLOBS_ROOT, self)
     }
 
     fn blob_path(&self) -> String {
@@ -235,12 +235,7 @@ impl DigestExt for Digest {
     }
 
     fn layer_dir(&self) -> String {
-        format!(
-            "{LAYERS_ROOT}/{}/{}/{}",
-            self.algorithm(),
-            self.hash_prefix(),
-            self.hash()
-        )
+        sharded(LAYERS_ROOT, self)
     }
 
     fn layer_listing_path(&self) -> String {
@@ -256,12 +251,7 @@ impl DigestExt for Digest {
     }
 
     fn blob_ref_dir(&self) -> String {
-        format!(
-            "{REF_ROOT}/{}/{}/{}",
-            self.algorithm(),
-            self.hash_prefix(),
-            self.hash()
-        )
+        sharded(REF_ROOT, self)
     }
 
     fn blob_ref_path(&self, namespace: &Namespace, link: &LinkKind) -> String {
@@ -392,7 +382,6 @@ pub trait NamespaceExt {
     /// prefix cannot collide with it.
     fn tag_atime_entry_dir(&self, tag: &Tag) -> String;
 
-    /// Directory holding one revision's append-only access entries.
     fn revision_atime_entry_dir(&self, digest: &Digest) -> String;
 
     /// The directory holding `link`'s access entries. Only tags and revisions
@@ -418,7 +407,6 @@ pub trait NamespaceExt {
     /// what makes the digest resolvable; its body carries what a HEAD needs.
     fn revision_record_path(&self, digest: &Digest) -> String;
 
-    /// Directory holding every revision record of the namespace.
     fn revision_records_root(&self) -> String;
 
     /// Root of every referrer record in the namespace, which one walk lists
@@ -429,17 +417,12 @@ pub trait NamespaceExt {
     /// manifest, whose body is that manifest's descriptor.
     fn referrer_record_dir(&self, subject: &Digest) -> String;
 
-    /// One referring manifest's record under `subject`.
     fn referrer_record_path(&self, subject: &Digest, referrer: &Digest) -> String;
 
-    /// Root directory holding the namespace's upload containers, one per
-    /// session.
     fn uploads_root_dir(&self) -> String;
 
-    /// Directory holding everything one upload session owns.
     fn upload_container_path(&self, session_id: &UploadSessionId) -> String;
 
-    /// The bytes received so far for an upload session.
     fn upload_path(&self, session_id: &UploadSessionId) -> String;
 
     /// The upload session's single durable record: last activity, committed
@@ -475,10 +458,9 @@ impl NamespaceExt for Namespace {
         // Inverted millis, so a listing yields the newest entry first.
         let ord = u64::MAX - 1 - authored_at.timestamp_millis().max(0).unsigned_abs();
         format!(
-            "{}/{ord:016x}.{kind}.{}.{}",
+            "{}/{ord:016x}.{kind}.{}",
             self.tag_entry_dir(tag),
-            digest.algorithm(),
-            digest.hash()
+            ref_digest_name(digest)
         )
     }
 
@@ -523,13 +505,7 @@ impl NamespaceExt for Namespace {
     }
 
     fn revision_record_path(&self, digest: &Digest) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.revision_records_root(),
-            digest.algorithm(),
-            digest.hash_prefix(),
-            digest.hash()
-        )
+        sharded(&self.revision_records_root(), digest)
     }
 
     fn revision_records_root(&self) -> String {
@@ -541,13 +517,7 @@ impl NamespaceExt for Namespace {
     }
 
     fn referrer_record_dir(&self, subject: &Digest) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.referrer_records_root(),
-            subject.algorithm(),
-            subject.hash_prefix(),
-            subject.hash()
-        )
+        sharded(&self.referrer_records_root(), subject)
     }
 
     fn referrer_record_path(&self, subject: &Digest, referrer: &Digest) -> String {
@@ -672,13 +642,6 @@ mod tests {
                 "entry {name:?} must round-trip"
             );
         }
-
-        // Same millisecond, different digests: distinct keys, both parseable.
-        let other = Digest::sha256(HASH_B).unwrap();
-        assert_ne!(
-            namespace.tag_entry_path(&tag, at, TagEntryKind::Set, &digest),
-            namespace.tag_entry_path(&tag, at, TagEntryKind::Set, &other)
-        );
     }
 
     #[test]

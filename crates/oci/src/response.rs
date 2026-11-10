@@ -1,10 +1,4 @@
-//! The answers of the distribution API: the JSON documents an endpoint serves
-//! and a client reads back, and what a write reports. Shared by both ends, like
-//! [`crate::request`].
-//!
-//! What a *transport* hands back is not here: a streamed blob body and an open
-//! upload session carry a reader and a credential, which belong to the client
-//! that owns them rather than to the protocol.
+//! The answers of the distribution API, shared by both ends.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -13,15 +7,11 @@ use serde_json::Value;
 
 use crate::types::{Digest, MediaType, Namespace};
 
-/// Body of `GET /v2/<ns>/tags/list`.
-///
-/// `tags` stays in its wire form: a reader that rejected the whole page over one
-/// name it cannot parse would lose every other tag with it, so callers validate
-/// entry by entry and decide what a bad one costs them.
+/// Body of `GET /v2/<ns>/tags/list`. `tags` stays raw, so one bad name does not
+/// lose the whole page.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TagsListResponse {
-    /// Absent only on a remote that omits it; the spec requires it and a
-    /// registry always serves it.
+    /// Absent only on a remote that breaks the spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<Namespace>,
     #[serde(default)]
@@ -51,25 +41,6 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// The whole set, for a caller checking that a body names a code the spec
-    /// defines.
-    pub const ALL: &'static [Self] = &[
-        Self::BlobUnknown,
-        Self::BlobUploadInvalid,
-        Self::BlobUploadUnknown,
-        Self::DigestInvalid,
-        Self::ManifestBlobUnknown,
-        Self::ManifestInvalid,
-        Self::ManifestUnknown,
-        Self::NameInvalid,
-        Self::NameUnknown,
-        Self::SizeInvalid,
-        Self::Unauthorized,
-        Self::Denied,
-        Self::Unsupported,
-        Self::TooManyRequests,
-    ];
-
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -106,15 +77,12 @@ pub const RECLAMATION_IN_PROGRESS_CODE: &str = "RECLAMATION_IN_PROGRESS";
 pub const UPSTREAM_UNAVAILABLE_CODE: &str = "UPSTREAM_UNAVAILABLE";
 pub const REPLICATION_SUPERSEDED_CODE: &str = "REPLICATION_SUPERSEDED";
 
-/// Body of any 4xx/5xx answer: the codes the spec defines, each with what the
-/// registry chose to say about it.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ErrorResponse {
     pub errors: Vec<ErrorInfo>,
 }
 
 impl ErrorResponse {
-    /// The code of the first error, which is the one a caller acts on.
     #[must_use]
     pub fn first_code(&self) -> Option<&str> {
         self.errors.first().map(|error| error.code.as_str())
@@ -153,7 +121,6 @@ pub struct ManifestResponse {
     pub body: Vec<u8>,
 }
 
-/// Outcome of a manifest push.
 #[derive(Debug)]
 pub enum PutManifestOutcome {
     /// Stored, echoing what the receiver saw.
@@ -169,7 +136,6 @@ pub enum PutManifestOutcome {
     Superseded,
 }
 
-/// Outcome of a manifest delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteManifestOutcome {
     Deleted,
@@ -188,8 +154,7 @@ mod tests {
     use super::*;
 
     // The spelling is the wire contract, so each variant is pinned rather than
-    // derived from its name. The table doubles as the completeness check of
-    // `ErrorCode::ALL`, which no `match` forces to stay exhaustive.
+    // derived from its name.
     #[test]
     fn every_error_code_spells_its_wire_form() {
         let pinned = [
@@ -208,10 +173,7 @@ mod tests {
             (ErrorCode::Unsupported, "UNSUPPORTED"),
             (ErrorCode::TooManyRequests, "TOOMANYREQUESTS"),
         ];
-        assert_eq!(ErrorCode::ALL.len(), pinned.len());
-
         for (code, wire) in pinned {
-            assert!(ErrorCode::ALL.contains(&code));
             assert_eq!(code.as_str(), wire);
             assert_eq!(code.to_string(), wire);
         }

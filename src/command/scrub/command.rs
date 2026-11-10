@@ -12,14 +12,13 @@ use tracing::info;
 
 use super::orphan_jobs;
 
-use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::maintenance::Error;
-use crate::command::maintenance::executor::{ActionSink, Executor, run_sink};
-use crate::command::maintenance::walk::{self, WalkStats};
+use crate::command::maintenance::executor::{ActionSink, Executor, run_job_store, run_sink};
+use crate::command::maintenance::walk;
 use crate::command::reconcile;
 use crate::command::scrub::validate::{Pass, Validator};
 use crate::configuration::Configuration;
-use crate::jobs::store::{ClaimMode, JobStore};
 use crate::registry::Registry;
 use crate::registry::blob_store::BlobStore;
 use crate::registry::keys::REF_ROOT;
@@ -55,7 +54,6 @@ pub struct Command {
     blob_store: Arc<BlobStore>,
     metadata_store: Arc<MetadataStore>,
     validator: Arc<Validator>,
-    stats: Arc<WalkStats>,
     concurrency: usize,
     delete_unknown: bool,
     /// Held so the end of the run can drain in-flight async webhook
@@ -67,7 +65,7 @@ pub struct Command {
 
 impl Command {
     pub async fn new(options: &Options, config: &Configuration) -> Result<Self, Error> {
-        let MaintenanceContext {
+        let StoreContext {
             blob_store,
             metadata_store,
             repositories,
@@ -87,12 +85,10 @@ impl Command {
         })?
         .into();
 
-        let stats = Arc::new(WalkStats::default());
         let validator = Arc::new(Validator::new(
             blob_store.clone(),
             metadata_store.clone(),
             sink.clone(),
-            stats.clone(),
             options.delete_unknown,
         ));
 
@@ -100,7 +96,6 @@ impl Command {
             blob_store,
             metadata_store,
             validator,
-            stats,
             concurrency: options.concurrency,
             delete_unknown: options.delete_unknown,
             registry,
@@ -127,11 +122,7 @@ impl Command {
         )
         .await?;
         orphan_jobs::sweep_orphan_jobs(
-            &Arc::new(JobStore::new(
-                &self.metadata_store,
-                "scrub-orphans",
-                ClaimMode::Atomic,
-            )),
+            &run_job_store(&self.metadata_store, "scrub-orphans"),
             &self.repositories,
             self.sink.as_ref(),
             self.concurrency,
@@ -147,7 +138,7 @@ impl Command {
         }
         info!(
             "scrub complete: {}",
-            self.stats.summary(self.delete_unknown)
+            self.validator.stats.summary(self.delete_unknown)
         );
         Ok(())
     }
@@ -270,7 +261,7 @@ mod tests {
         loop {
             let mut again = Command::new(&options(false, 4), &config).await.unwrap();
             again.run().await.unwrap();
-            let stats = &again.stats;
+            let stats = &again.validator.stats;
             let emitted = stats.repairs.load(Ordering::Relaxed)
                 + stats.quarantined.load(Ordering::Relaxed)
                 + stats.corrupt.load(Ordering::Relaxed);

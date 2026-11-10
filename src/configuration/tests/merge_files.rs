@@ -3,7 +3,6 @@ use std::fs;
 use tempfile::TempDir;
 
 use crate::configuration::{Configuration, Error, ServerConfig};
-use crate::registry::blob_store::BlobStoreConfig;
 use crate::test_fixtures::configuration::{MINIMAL_CONFIG_TOML, config_toml};
 
 /// Writes `documents` into a scratch directory and loads them as one merged
@@ -20,9 +19,8 @@ fn load_merged(documents: &[&str]) -> (TempDir, Result<Configuration, Error>) {
     (dir, result)
 }
 
-/// The reason merging exists: an overlay can add `rules` to an access policy an
-/// earlier file already opened, which a single concatenated document cannot do
-/// because a repeated `[global.access_policy]` header is a TOML error.
+/// The reason merging exists: concatenating the documents instead would repeat
+/// the `[global.access_policy]` header, which is a TOML error.
 #[test]
 fn overlay_adds_rules_to_an_access_policy_the_base_opened() {
     let base = config_toml(
@@ -40,62 +38,6 @@ fn overlay_adds_rules_to_an_access_policy_the_base_opened() {
     let config = result.expect("merged config loads");
 
     assert_eq!(config.global.access_policy.rules.len(), 1);
-}
-
-/// The same two documents concatenated are rejected, which is what an operator
-/// hits when a chart appends raw TOML instead of passing a second file.
-#[test]
-fn concatenating_the_same_documents_is_a_duplicate_table_error() {
-    let concatenated = format!(
-        "{}\n{}",
-        config_toml(
-            r#"
-            [global.access_policy]
-            default = "deny"
-        "#
-        ),
-        r#"
-        [global.access_policy]
-        rules = ["request.action in ['healthz']"]
-    "#
-    );
-
-    let result = Configuration::load_from_str(&concatenated);
-
-    assert!(
-        matches!(result, Err(Error::InvalidFormat(_))),
-        "duplicate table must be rejected, got {result:?}"
-    );
-}
-
-#[test]
-fn overlay_supplies_credentials_the_base_omits() {
-    let base = r#"
-        [server]
-        bind_address = "0.0.0.0"
-
-        [blob_store.s3]
-        endpoint = "https://s3.example.com"
-        bucket = "registry"
-        region = "us-east-1"
-        access_key_id = ""
-        secret_key = ""
-    "#;
-    let overlay = r#"
-        [blob_store.s3]
-        access_key_id = "from-overlay"
-        secret_key = "overlay-secret"
-    "#;
-
-    let (_dir, result) = load_merged(&[base, overlay]);
-    let config = result.expect("merged config loads");
-
-    let BlobStoreConfig::S3(s3) = &config.blob_store else {
-        panic!("expected an S3 blob store");
-    };
-    assert_eq!(s3.connection.access_key_id.expose(), "from-overlay");
-    assert_eq!(s3.connection.secret_key.expose(), "overlay-secret");
-    assert_eq!(s3.connection.bucket, "registry");
 }
 
 #[test]

@@ -158,12 +158,6 @@ impl Registry {
             .any(|pattern| pattern.is_match(tag.as_ref()))
     }
 
-    /// The metadata store, for the ownership and link reads outside the
-    /// registry's own operations.
-    pub fn metadata_store(&self) -> &MetadataStore {
-        &self.metadata_store
-    }
-
     /// The read-buffer size each frame of a streamed blob body is filled from,
     /// which the transport passes when rendering a [`BlobGet`](angos_oci_service::BlobGet).
     #[must_use]
@@ -191,11 +185,6 @@ impl Registry {
     /// emit through the same instance [`Registry::shutdown`] drains.
     pub fn event_dispatcher(&self) -> Option<Arc<EventDispatcher>> {
         self.config.event_dispatcher.clone()
-    }
-
-    #[cfg(test)]
-    pub fn has_event_dispatcher(&self) -> bool {
-        self.config.event_dispatcher.is_some()
     }
 
     /// Delivers every event even when an earlier delivery fails, returning the
@@ -236,8 +225,8 @@ impl Registry {
     }
 
     #[instrument]
-    pub fn repository_for_namespace(&self, namespace: &Namespace) -> Result<&Repository, Error> {
-        self.resolver.resolve(namespace).ok_or(Error::NameUnknown)
+    pub fn repository_for_namespace(&self, namespace: &Namespace) -> Option<&Repository> {
+        self.resolver.resolve(namespace)
     }
 
     /// Fire-and-forget enqueue of the follow-up work a write dispatches: a
@@ -331,7 +320,7 @@ mod immutable_tag_tests {
         repositories.insert("myrepo".to_string(), repository);
 
         let dir = TempDir::new().expect("temp dir");
-        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let object: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         let metadata_store = metadata_store_over(object.clone());
         let registry = Registry::new(
             Arc::new(BlobStore::new(object, None)),
@@ -354,9 +343,7 @@ mod immutable_tag_tests {
     }
 
     fn repository_of(registry: &Registry) -> Option<&Repository> {
-        registry
-            .repository_for_namespace(&Namespace::new("myrepo/app").unwrap())
-            .ok()
+        registry.repository_for_namespace(&Namespace::new("myrepo/app").unwrap())
     }
 
     fn tag(name: &str) -> Tag {

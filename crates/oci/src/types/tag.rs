@@ -11,8 +11,6 @@ fn is_tag(s: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-/// A validated OCI tag: a single reference name (not a digest). The private
-/// field forces construction through the validating constructors below.
 #[derive(Clone, Debug, Ord, Eq, Hash, PartialEq, PartialOrd)]
 pub struct Tag(String);
 
@@ -29,15 +27,11 @@ impl Tag {
     }
 }
 
-// Here rather than in `digest.rs` because the schema is valid by construction,
-// so it builds a `Tag` straight from the private field.
+// Here so it can build the `Tag` from the private field.
 impl Digest {
-    /// The tag this subject's referrers are recorded under on a registry that
-    /// does not implement the Referrers API: the algorithm and the encoded hash
-    /// truncated to 64 characters, joined by a hyphen. Infallible by
-    /// construction, since a registered algorithm plus lowercase hex only
-    /// produces characters the tag grammar admits and the truncation keeps it
-    /// inside the length cap, so the spec's substitution rule never applies.
+    /// The tag this subject's referrers are recorded under on a registry
+    /// without the Referrers API: `<algorithm>-<hash truncated to 64>`, which
+    /// always satisfies the tag grammar.
     /// REF: <https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md#referrers-tag-schema>
     #[must_use]
     pub fn referrers_fallback_tag(&self) -> Tag {
@@ -59,45 +53,23 @@ mod tests {
     use crate::types::Algorithm;
 
     #[test]
-    fn test_valid_tag() {
-        let tag = Tag::new("latest").unwrap();
-        assert_eq!(tag.as_ref(), "latest");
-    }
-
-    #[test]
-    fn test_invalid_char_exclamation_rejected() {
-        assert!(Tag::new("foo!bar").is_err());
-    }
-
-    // Edge case: tag starting with '@' is rejected (@ is not a leading word char).
-    #[test]
-    fn test_leading_at_rejected() {
-        assert!(Tag::new("@invalid").is_err());
-    }
-
-    // The tag grammar is ASCII only, so Unicode word characters must be rejected.
-    #[test]
-    fn test_non_ascii_rejected() {
-        for tag in ["café", "日本", "Ａ"] {
-            assert!(
-                Tag::new(tag).is_err(),
-                "non-ASCII tag '{tag}' must be rejected"
-            );
+    fn test_tag_grammar() {
+        for tag in ["latest", "_v2.1-rc", "a".repeat(128).as_str()] {
+            assert!(Tag::new(tag).is_ok(), "'{tag}' must be accepted");
         }
-    }
-
-    // Edge case: tag of exactly 128 chars is valid (1 leading + 127 trailing).
-    #[test]
-    fn test_128_chars_accepted() {
-        let tag = "a".repeat(128);
-        assert!(Tag::new(&tag).is_ok());
-    }
-
-    // Edge case: tag of 129 chars exceeds the 128-char OCI limit and is rejected.
-    #[test]
-    fn test_129_chars_rejected() {
-        let tag = "a".repeat(129);
-        assert!(Tag::new(&tag).is_err());
+        // The grammar is ASCII only.
+        for tag in [
+            "",
+            "foo!bar",
+            "@invalid",
+            ".v1",
+            "café",
+            "日本",
+            "Ａ",
+            "a".repeat(129).as_str(),
+        ] {
+            assert!(Tag::new(tag).is_err(), "'{tag}' must be rejected");
+        }
     }
 
     // sha256 fits the 64-character cap exactly; sha512 is 128 and must be cut,
@@ -117,26 +89,11 @@ mod tests {
         );
     }
 
+    /// Covers the serde half of `str_newtype!` for every newtype.
     #[test]
-    fn test_empty_rejected() {
-        assert!(Tag::new("").is_err());
-    }
-
-    #[test]
-    fn test_serialize() {
-        let tag = Tag::new("latest").unwrap();
-        assert_eq!(serde_json::to_string(&tag).unwrap(), "\"latest\"");
-    }
-
-    #[test]
-    fn test_deserialize_round_trip() {
+    fn test_serde_round_trips_and_validates() {
         let tag: Tag = serde_json::from_str("\"v2.1\"").unwrap();
-        assert_eq!(tag.as_ref(), "v2.1");
-    }
-
-    #[test]
-    fn test_deserialize_invalid_rejected() {
-        let result: Result<Tag, _> = serde_json::from_str("\"@invalid\"");
-        assert!(result.is_err());
+        assert_eq!(serde_json::to_string(&tag).unwrap(), "\"v2.1\"");
+        assert!(serde_json::from_str::<Tag>("\"@invalid\"").is_err());
     }
 }

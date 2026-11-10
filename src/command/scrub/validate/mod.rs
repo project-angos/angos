@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tracing::warn;
 
 use angos_oci::Digest;
+use angos_storage::Error as StorageError;
 
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::{Action, WalkedStore};
@@ -26,7 +27,7 @@ use crate::command::maintenance::executor::{ActionSink, object_younger_than_grac
 use crate::command::maintenance::walk::WalkStats;
 use crate::registry::Error as RegistryError;
 use crate::registry::blob_store::BlobStore;
-use crate::registry::metadata_store::MetadataStore;
+use crate::registry::metadata_store::{LinkKind, MetadataStore};
 
 /// One of the three walk passes. Later passes rely on earlier repairs: links
 /// are healed and grants reconciled before entries are pruned against them,
@@ -48,15 +49,15 @@ pub struct Validator {
     pub blob_store: Arc<BlobStore>,
     pub metadata_store: Arc<MetadataStore>,
     pub sink: Arc<dyn ActionSink>,
-    pub stats: Arc<WalkStats>,
+    pub stats: WalkStats,
     /// Delete unrecognized keys outright instead of quarantining them
     /// (`--delete-unknown`).
     delete_unknown: bool,
     /// Names a once-per-container emission already handled, so the per-key
     /// walk does not repeat their prefix-level actions.
     handled: Mutex<HashSet<String>>,
-    /// Digests the reference walk read live references for (see
-    /// [`Self::record_reference_seen`]).
+    /// Digests the reference walk read live references for: a witness,
+    /// independent of the per-blob listing, against which blob GC decides.
     seen_refs: Mutex<HashSet<Digest>>,
 }
 
@@ -65,14 +66,13 @@ impl Validator {
         blob_store: Arc<BlobStore>,
         metadata_store: Arc<MetadataStore>,
         sink: Arc<dyn ActionSink>,
-        stats: Arc<WalkStats>,
         delete_unknown: bool,
     ) -> Self {
         Self {
             blob_store,
             metadata_store,
             sink,
-            stats,
+            stats: WalkStats::default(),
             delete_unknown,
             handled: Mutex::new(HashSet::new()),
             seen_refs: Mutex::new(HashSet::new()),
@@ -103,10 +103,11 @@ impl Validator {
                 self.validate_tag_entries(&namespace, &tag).await
             }
             (Pass::MetadataLinks, KeyCategory::TagAtimeEntry { namespace, tag }) => {
-                self.collect_tag_atime_entries(&namespace, &tag).await
+                self.collect_atime_entries(&namespace, &LinkKind::Tag(tag))
+                    .await
             }
             (Pass::MetadataLinks, KeyCategory::RevisionAtimeEntry { namespace, digest }) => {
-                self.collect_revision_atime_entries(&namespace, &digest)
+                self.collect_atime_entries(&namespace, &LinkKind::Digest(digest))
                     .await
             }
             (Pass::MetadataLinks, KeyCategory::RevisionRecord { namespace, digest }) => {
@@ -120,10 +121,10 @@ impl Validator {
                     referrer,
                 },
             ) => {
-                self.validate_referrer_record(&namespace, &subject, &referrer)
+                self.validate_referrer_record(namespace, subject, referrer)
                     .await
             }
-            (Pass::MetadataLinks, KeyCategory::JobRecord { state, .. }) => {
+            (Pass::MetadataLinks, KeyCategory::JobRecord { state }) => {
                 self.validate_job_record(key, state).await
             }
             (Pass::MetadataLinks, KeyCategory::JobIndex { queue }) => {
@@ -149,9 +150,16 @@ impl Validator {
                     .await
             }
             (Pass::MetadataLinks, KeyCategory::CatalogIndex { namespace }) => {
-                self.validate_catalog_index(&namespace).await
+                self.validate_catalog_index(namespace).await
             }
-            (pass, KeyCategory::Unknown) => self.quarantine(walked_store(pass), key).await,
+            (pass, KeyCategory::Unknown) => {
+                let store = if pass == Pass::Blob {
+                    WalkedStore::Blob
+                } else {
+                    WalkedStore::Metadata
+                };
+                self.quarantine(store, key).await
+            }
             // A known category needing nothing here: owned by another pass or
             // the other store, write-once tag history, or a live run marker.
             _ => Ok(()),
@@ -173,7 +181,7 @@ impl Validator {
         let young = object_younger_than_grace(
             self.metadata_store.object_store().as_ref(),
             key,
-            self.metadata_store.gc_grace_secs,
+            self.metadata_store.settings.gc_grace_secs,
         )
         .await
         .map_err(RegistryError::from)?;
@@ -183,20 +191,33 @@ impl Validator {
     /// Handle a key matching no known layout: quarantined by default, deleted
     /// under `--delete-unknown`, counted either way.
     async fn quarantine(&self, store: WalkedStore, key: &str) -> Result<(), Error> {
+        let key = key.to_string();
         let action = if self.delete_unknown {
-            Action::DeleteUnknownKey {
-                store,
-                key: key.to_string(),
-            }
+            Action::DeleteUnknownKey { store, key }
         } else {
-            Action::QuarantineKey {
-                store,
-                key: key.to_string(),
-            }
+            Action::QuarantineKey { store, key }
         };
         self.sink.apply(action).await?;
         self.stats.quarantined.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Raw metadata-store read tolerating a concurrent deletion.
+    pub async fn read_metadata_object(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
+        match self.metadata_store.object_store().get(key).await {
+            Ok(raw) => Ok(Some(raw)),
+            Err(StorageError::NotFound) => Ok(None),
+            Err(e) => Err(RegistryError::from(e).into()),
+        }
+    }
+
+    pub async fn metadata_exists(&self, key: &str) -> Result<bool, Error> {
+        Ok(self
+            .metadata_store
+            .object_store()
+            .exists(key)
+            .await
+            .map_err(RegistryError::from)?)
     }
 
     /// Delete an expected-shape object whose content is unreadable.
@@ -218,31 +239,5 @@ impl Validator {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(token)
-    }
-
-    /// Record that the reference walk read a live reference to `digest`. The
-    /// walk enumerates the whole store, so this is an independent witness
-    /// against the per-blob listing blob GC decides from.
-    pub fn record_reference_seen(&self, digest: &Digest) {
-        self.seen_refs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(digest.clone());
-    }
-
-    /// Whether the reference walk read a live reference to `digest`.
-    pub fn reference_walk_saw(&self, digest: &Digest) -> bool {
-        self.seen_refs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(digest)
-    }
-}
-
-/// The store a pass walks, for raw-key actions.
-fn walked_store(pass: Pass) -> WalkedStore {
-    match pass {
-        Pass::MetadataLinks | Pass::MetadataReferences => WalkedStore::Metadata,
-        Pass::Blob => WalkedStore::Blob,
     }
 }

@@ -32,10 +32,8 @@ pub struct RevisionRecord {
 
 impl MetadataStore {
     /// Write the revision record with one create-if-absent, returning whether
-    /// it was created: the record is never mutated, so a re-push of a stored
-    /// digest keeps the record it already has, `created_at` included. A
-    /// replicated write stamps its author's time, anything else this
-    /// replica's clock.
+    /// it was created. A replicated write stamps its author's time, anything
+    /// else this replica's clock.
     pub async fn put_revision(
         &self,
         namespace: &Namespace,

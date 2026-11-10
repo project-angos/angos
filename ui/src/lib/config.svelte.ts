@@ -1,4 +1,4 @@
-export interface OidcConfig {
+interface OidcConfig {
 	issuer: string;
 	client_id: string;
 	/** The OAuth `scope` parameter, verbatim. */
@@ -11,7 +11,7 @@ interface UiConfig {
 }
 
 let config: UiConfig = $state({ name: 'angos' });
-let loaded = $state(false);
+let loaded = false;
 
 export async function loadConfig(): Promise<void> {
 	if (loaded) return;
@@ -19,8 +19,7 @@ export async function loadConfig(): Promise<void> {
 	try {
 		const response = await fetch('/v2/_angos/ui/config');
 		if (response.ok) {
-			const data: UiConfig = await response.json();
-			config = data;
+			config = await response.json();
 		}
 	} catch {
 		// Use defaults on error

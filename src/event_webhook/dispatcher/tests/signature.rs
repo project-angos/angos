@@ -6,7 +6,7 @@ use crate::event_webhook::dispatcher::compute_signature;
 use crate::event_webhook::dispatcher::tests::common::{create_test_event, single_hook_dispatcher};
 
 #[tokio::test]
-async fn dispatch_sends_hmac_signature_header() {
+async fn dispatch_sends_bearer_token_and_hmac_signature_headers() {
     let server = MockServer::start().await;
     let event = create_test_event();
     let body = serde_json::to_vec(&event).unwrap();
@@ -17,6 +17,7 @@ async fn dispatch_sends_hmac_signature_header() {
 
     Mock::given(method("POST"))
         .and(header("X-Registry-Signature-256", expected_sig.as_str()))
+        .and(header("Authorization", "Bearer hmac-secret"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)

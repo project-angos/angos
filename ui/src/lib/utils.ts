@@ -3,18 +3,7 @@ import type { ManifestEntry, Platform, Manifest, Descriptor, ReferrerInfo, Layer
 
 export type AttestationType = 'slsa' | 'sbom' | 'signature' | 'vuln' | 'artifact';
 
-export interface TreeNode {
-	manifest: ManifestEntry;
-	children: { manifest: ManifestEntry; platform?: Platform }[];
-	attestations: {
-		digest: string;
-		type: AttestationType;
-		artifactType?: string;
-		annotations?: Record<string, string>;
-	}[];
-}
-
-export type TreeRowKind = 'root' | 'child' | 'attestation' | 'referrer';
+type TreeRowKind = 'root' | 'child' | 'attestation' | 'referrer';
 
 export interface TreeRowNode {
 	digest: string;
@@ -33,75 +22,81 @@ export interface TreeRowNode {
 	last_pulled_at?: string;
 	/** Whether pushed/pulled columns show timestamps (true for root/child rows). */
 	showDates: boolean;
-	/** Whether this node can be expanded to reveal its children. */
 	canExpand: boolean;
 	children: TreeRowNode[];
 }
 
 /**
- * Flattens the {@link TreeNode} structure into a uniform recursive shape that a
- * single recursive `TreeRow` component can render at arbitrary depth.
+ * The listing as rows a recursive `TreeRow` renders: each manifest that is no
+ * other's child or referrer, with its platform children and then its referrers.
  */
-export function buildTreeRows(tree: TreeNode[]): TreeRowNode[] {
-	return tree.map((node) => {
-		const children: TreeRowNode[] = [];
-		node.children.forEach((child) => {
-			const referrers = child.manifest.referrers ?? [];
-			children.push({
-				digest: child.manifest.digest,
-				kind: 'child',
-				hasNext: false,
-				tags: [],
-				platform: child.platform,
-				pushed_at: child.manifest.pushed_at,
-				last_pulled_at: child.manifest.last_pulled_at,
-				showDates: true,
-				canExpand: referrers.length > 0,
-				children: referrers.map((referrer) => ({
-					digest: referrer.digest,
-					kind: 'referrer' as const,
+export function buildTreeRows(manifests: ManifestEntry[]): TreeRowNode[] {
+	const referrerRows = (kind: 'attestation' | 'referrer', referrers: ReferrerInfo[]): TreeRowNode[] =>
+		referrers.map((referrer, i) => ({
+			digest: referrer.digest,
+			kind,
+			hasNext: i < referrers.length - 1,
+			tags: [],
+			attestationType: getAttestationType(referrer),
+			annotations: referrer.annotations,
+			showDates: false,
+			canExpand: false,
+			children: []
+		}));
+	const nested = new Set<string>();
+	const childrenOf = new Map<string, TreeRowNode[]>();
+	const referrersOf = new Map<string, ReferrerInfo[]>();
+	for (const m of manifests) {
+		// Skip a self-reference: a manifest that lists itself as a parent or
+		// referrer must not exclude itself from the roots, or it renders nowhere.
+		for (const parent of m.parents ?? []) {
+			if (parent.digest === m.digest) continue;
+			nested.add(m.digest);
+			const referrers = m.referrers ?? [];
+			childrenOf.set(parent.digest, [
+				...(childrenOf.get(parent.digest) ?? []),
+				{
+					digest: m.digest,
+					kind: 'child',
 					hasNext: false,
 					tags: [],
-					attestationType: getAttestationType(referrer),
-					annotations: referrer.annotations,
-					showDates: false,
-					canExpand: false,
-					children: []
-				}))
+					platform: parent.platform,
+					pushed_at: m.pushed_at,
+					last_pulled_at: m.last_pulled_at,
+					showDates: true,
+					canExpand: referrers.length > 0,
+					children: referrerRows('referrer', referrers)
+				}
+			]);
+		}
+		const referrers = (m.referrers ?? []).filter((referrer) => referrer.digest !== m.digest);
+		for (const referrer of referrers) nested.add(referrer.digest);
+		referrersOf.set(m.digest, referrers);
+	}
+	return manifests
+		.filter((m) => !nested.has(m.digest))
+		.map((m) => {
+			const children = [
+				...(childrenOf.get(m.digest) ?? []).sort((a, b) =>
+					formatPlatform(a.platform).localeCompare(formatPlatform(b.platform))
+				),
+				...referrerRows('attestation', referrersOf.get(m.digest) ?? [])
+			];
+			children.forEach((child, idx) => {
+				child.hasNext = idx !== children.length - 1;
 			});
-		});
-		node.attestations.forEach((att) => {
-			children.push({
-				digest: att.digest,
-				kind: 'attestation',
+			return {
+				digest: m.digest,
+				kind: 'root',
 				hasNext: false,
-				tags: [],
-				attestationType: att.type,
-				annotations: att.annotations,
-				showDates: false,
-				canExpand: false,
-				children: []
-			});
+				tags: m.tags,
+				pushed_at: m.pushed_at,
+				last_pulled_at: m.last_pulled_at,
+				showDates: true,
+				canExpand: children.length > 0,
+				children
+			};
 		});
-		// Mark connector lines for every sibling except the last.
-		children.forEach((child, idx) => {
-			child.hasNext = idx !== children.length - 1;
-			child.children.forEach((grandchild, gidx) => {
-				grandchild.hasNext = gidx !== child.children.length - 1;
-			});
-		});
-		return {
-			digest: node.manifest.digest,
-			kind: 'root' as const,
-			hasNext: false,
-			tags: node.manifest.tags,
-			pushed_at: node.manifest.pushed_at,
-			last_pulled_at: node.manifest.last_pulled_at,
-			showDates: true,
-			canExpand: children.length > 0,
-			children
-		};
-	});
 }
 
 const SLSA_ARTIFACT_TYPES = new Set([
@@ -165,15 +160,6 @@ export function getAttestationType(referrer: ReferrerInfo): AttestationType {
 	return 'artifact';
 }
 
-/**
- * A browse URL is the full registry path, with no marker separating the
- * repository from the namespace under it: a repository name may contain
- * slashes, so only the configured names can tell them apart.
- */
-export function pathUrl(path: string): string {
-	return resolve(path);
-}
-
 /** A tag cannot contain a colon and a digest always does (`algorithm:hex`). */
 export function isDigest(reference: string): boolean {
 	return reference.includes(':');
@@ -186,19 +172,6 @@ export function imageReference(path: string, reference: string): string {
 
 export function manifestUrl(path: string, reference: string): string {
 	return resolve(imageReference(path, reference));
-}
-
-/** The page rendering the vulnerability report stored at `digest`. */
-export function digestConfirmKey(digest: string): string {
-	return `digest:${digest}`;
-}
-
-export function tagConfirmKey(tag: string): string {
-	return `tag:${tag}`;
-}
-
-export function uploadConfirmKey(uuid: string): string {
-	return `upload:${uuid}`;
 }
 
 export const selectedUploadsConfirmKey = 'uploads:selected';
@@ -270,67 +243,7 @@ export function formatRetention(seconds: number): string {
 	return `${seconds} seconds`;
 }
 
-export function displayNamespace(namespace: string, repository: string): string {
-	const prefix = repository + '/';
-	if (namespace.startsWith(prefix)) {
-		return namespace.slice(prefix.length);
-	}
-	return namespace;
-}
-
-export function buildTree(manifests: ManifestEntry[]): TreeNode[] {
-	const childDigests = new Set<string>();
-	const referrerDigests = new Set<string>();
-	const parentToChildren = new Map<string, { manifest: ManifestEntry; platform?: Platform }[]>();
-	const manifestToAttestations = new Map<string, TreeNode['attestations']>();
-
-	for (const m of manifests) {
-		// Skip a self-reference: a manifest that lists itself as a parent or
-		// referrer must not exclude itself from the roots, or it renders nowhere.
-		const parents = (m.parents ?? []).filter((parent) => parent.digest !== m.digest);
-		if (parents.length > 0) {
-			childDigests.add(m.digest);
-			for (const parent of parents) {
-				const children = parentToChildren.get(parent.digest) ?? [];
-				children.push({ manifest: m, platform: parent.platform });
-				parentToChildren.set(parent.digest, children);
-			}
-		}
-
-		const referrers = (m.referrers ?? []).filter((referrer) => referrer.digest !== m.digest);
-		if (referrers.length > 0) {
-			const attestations: TreeNode['attestations'] = [];
-			for (const referrer of referrers) {
-				referrerDigests.add(referrer.digest);
-				attestations.push({
-					digest: referrer.digest,
-					type: getAttestationType(referrer),
-					artifactType: referrer.artifactType,
-					annotations: referrer.annotations,
-				});
-			}
-			manifestToAttestations.set(m.digest, attestations);
-		}
-	}
-
-	const roots: TreeNode[] = [];
-	for (const m of manifests) {
-		if (!childDigests.has(m.digest) && !referrerDigests.has(m.digest)) {
-			const children = parentToChildren.get(m.digest) ?? [];
-			children.sort((a, b) => {
-				const pa = formatPlatform(a.platform);
-				const pb = formatPlatform(b.platform);
-				return pa.localeCompare(pb);
-			});
-			const attestations = manifestToAttestations.get(m.digest) ?? [];
-			roots.push({ manifest: m, children, attestations });
-		}
-	}
-
-	return roots;
-}
-
-export interface DeleteCascade {
+interface DeleteCascade {
 	/** Children whose every parent is being deleted and that carry no tag. */
 	platforms: string[];
 	/** Referrers of everything removed, which have no subject left. */
@@ -407,21 +320,7 @@ export function cascadeSummary(cascade: DeleteCascade): string {
 
 export function isInteractiveTarget(event: MouseEvent): boolean {
 	const target = event.target as HTMLElement;
-	return (
-		target.tagName === 'BUTTON' ||
-		!!target.closest('button') ||
-		target.tagName === 'A' ||
-		!!target.closest('a') ||
-		target.tagName === 'INPUT' ||
-		!!target.closest('label')
-	);
-}
-
-export function getTagConfirm(deleteConfirm: string | null): string | null {
-	if (deleteConfirm?.startsWith('tag:')) {
-		return deleteConfirm.slice(4);
-	}
-	return null;
+	return !!target.closest('button, a, label') || target.tagName === 'INPUT';
 }
 
 export function getAnnotationLabel(key: string): string {
@@ -442,13 +341,6 @@ export function getFileName(layer: Descriptor): string | null {
 	return layer.annotations?.['org.opencontainers.image.title'] ?? null;
 }
 
-/**
- * The namespaces sitting under `namespace`, named relative to it.
- *
- * A registry name such as `repo/team/app` creates no object at `repo/team`, so
- * an intermediate level holds no manifests of its own and would otherwise be a
- * dead end with nothing to click through to.
- */
 export interface NamespaceDescendant {
 	path: string;
 	label: string;
@@ -457,6 +349,13 @@ export interface NamespaceDescendant {
 	upload_count?: number;
 }
 
+/**
+ * The namespaces sitting under `namespace`, named relative to it.
+ *
+ * A registry name such as `repo/team/app` creates no object at `repo/team`, so
+ * an intermediate level holds no manifests of its own and would otherwise be a
+ * dead end with nothing to click through to.
+ */
 export function descendantNamespaces(
 	entries: { name: string; tag_count?: number; manifest_count?: number; upload_count?: number }[],
 	namespace: string
@@ -473,13 +372,6 @@ export function descendantNamespaces(
 		}));
 }
 
-/**
- * The repository owning `path`, which is the longest configured name that is
- * `path` itself or a prefix of it. A repository name may contain slashes, so a
- * browse path cannot be split into repository and namespace without this.
- * `null` when the path lies outside every repository, as an intermediate
- * segment does.
- */
 let started = false;
 
 /**
@@ -493,6 +385,13 @@ export function isFirstLoad(): boolean {
 	return first;
 }
 
+/**
+ * The repository owning `path`, which is the longest configured name that is
+ * `path` itself or a prefix of it. A repository name may contain slashes, so a
+ * browse path cannot be split into repository and namespace without this.
+ * `null` when the path lies outside every repository, as an intermediate
+ * segment does.
+ */
 export function resolveRepository(names: string[], path: string): string | null {
 	let owner: string | null = null;
 	for (const name of names) {
@@ -524,14 +423,14 @@ export interface FsNode {
 	children: Map<string, FsNode>;
 }
 
-export interface FsDeletion {
+interface FsDeletion {
 	path: string;
 	/** Index of the layer whose whiteout removed it. */
 	layer: number;
 }
 
 /** A file's bytes, still stored in its layer, that a later layer overwrote or removed. */
-export interface FsWaste {
+interface FsWaste {
 	/** The file as its layer holds it, gone from the tree. */
 	node: FsNode;
 	size: number;
@@ -540,7 +439,7 @@ export interface FsWaste {
 	change: 'replaced' | 'unchanged' | 'removed';
 }
 
-export interface FsTree {
+interface FsTree {
 	root: FsNode;
 	deletions: FsDeletion[];
 	/** Largest first. */
@@ -624,7 +523,7 @@ export function mergeLayers(listings: LayerListing[]): FsTree {
 }
 
 /** Files of the merged tree holding the same bytes. */
-export interface FsDuplicate {
+interface FsDuplicate {
 	size: number;
 	nodes: FsNode[];
 }
@@ -645,9 +544,9 @@ export function fsDuplicates(root: FsNode): FsDuplicate[] {
 	return [...sets.values()].filter((set) => set.nodes.length > 1).sort((a, b) => fsCopies(b) - fsCopies(a));
 }
 
-export type FsRisk = 'setuid' | 'setgid' | 'capabilities' | 'world-writable';
+type FsRisk = 'setuid' | 'setgid' | 'capabilities' | 'world-writable';
 
-export interface FsRisky {
+interface FsRisky {
 	node: FsNode;
 	risks: FsRisk[];
 }
@@ -719,7 +618,7 @@ export function fsVisible(matcher: FsMatcher, node: FsNode): boolean {
 }
 
 /** One row of the tree view, with what its guide lines need. */
-export interface FsTreeRow {
+interface FsTreeRow {
 	node: FsNode;
 	depth: number;
 	/** Whether each ancestor column carries a continuing guide line. */
@@ -849,7 +748,7 @@ export function parseScanSummary(annotations?: Record<string, string>): ScanSumm
 	return { scanner: annotations['io.angos.scan.scanner'], counts, total };
 }
 
-export interface Finding {
+interface Finding {
 	id: string;
 	severity: Severity;
 	pkg?: string;
@@ -886,22 +785,18 @@ const SEVERITY_WORDS: Record<string, Severity> = {
 	negligible: 'low'
 };
 
-function severityWord(word: string): Severity | null {
-	return SEVERITY_WORDS[word.toLowerCase()] ?? null;
-}
-
 // The scanner's own severity word when it states one (Trivy tags its rule,
 // Grype writes it into the message), else the CVSS score bucketed the way
 // GitHub code scanning does. Mirrors the registry's summary.
 function severityOf(rule: SarifRule | undefined, message: string): Severity {
 	for (const tag of rule?.properties?.tags ?? []) {
-		const word = severityWord(tag);
+		const word = SEVERITY_WORDS[tag.toLowerCase()];
 		if (word) return word;
 	}
 	// Every marked word pair, as the registry reads them, not only the first.
 	const words = message.split(/\s+/);
 	for (let i = 0; i + 1 < words.length; i++) {
-		const word = ['Severity:', 'A', 'An'].includes(words[i]) && severityWord(words[i + 1]);
+		const word = ['Severity:', 'A', 'An'].includes(words[i]) && SEVERITY_WORDS[words[i + 1].toLowerCase()];
 		if (word) return word;
 	}
 	const score = Number(rule?.properties?.['security-severity']);
@@ -949,8 +844,7 @@ export function parseSarif(document: unknown): ParsedReport {
 	}
 	const rank = (severity: Severity) => SEVERITIES.indexOf(severity);
 	findings.sort((a, b) => rank(a.severity) - rank(b.severity) || a.id.localeCompare(b.id));
-	const total = findings.length;
-	return { findings, summary: { scanner, counts, total } };
+	return { findings, summary: { scanner, counts, total: findings.length } };
 }
 
 /** The newest vulnerability report among `referrers` that carries a summary. */

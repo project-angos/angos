@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, ClientBuilder, Identity};
 use rustls::RootCertStore;
 use rustls_native_certs::CertificateResult;
@@ -20,8 +18,7 @@ pub struct ClientTls {
     pub identity: Option<MtlsIdentity>,
 }
 
-/// A client certificate with its private key; holding both together is what
-/// makes one without the other unrepresentable.
+/// A client certificate with its private key, never one without the other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MtlsIdentity {
     pub certificate: PathBuf,
@@ -62,8 +59,6 @@ impl TryFrom<ClientTlsFields> for ClientTls {
     }
 }
 
-/// A username with its password, which a config section sets together or not
-/// at all.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasicAuth {
     pub username: String,
@@ -71,8 +66,7 @@ pub struct BasicAuth {
 }
 
 impl BasicAuth {
-    /// The credentials a config section set, refusing one half without the
-    /// other rather than running anonymous.
+    /// Refuses one half without the other rather than running anonymous.
     ///
     /// # Errors
     ///
@@ -89,85 +83,23 @@ impl BasicAuth {
     }
 }
 
-/// Decorates a [`reqwest::ClientBuilder`] with an optional server CA bundle and
-/// client certificate loaded from files, then builds the [`Client`].
+/// Builds `builder` as a rustls client trusting [`trusted_roots`] and presenting
+/// the configured identity.
 ///
-/// Starts from a rustls builder; redirect and timeout policy are set through
-/// the `with_*` methods, and the mTLS material is layered on at [`Self::build`].
-pub struct MtlsClientBuilder {
-    builder: ClientBuilder,
-    tls: ClientTls,
-}
-
-impl Default for MtlsClientBuilder {
-    fn default() -> Self {
-        Self::new()
+/// # Errors
+///
+/// Returns an error when a configured certificate or key file cannot be read
+/// or parsed, or when the HTTP client cannot be built.
+pub fn build_client(builder: ClientBuilder, tls: &ClientTls) -> Result<Client, String> {
+    let mut builder = builder
+        .use_rustls_tls()
+        .tls_certs_only(trusted_roots(tls.server_ca_bundle.as_deref())?);
+    if let Some(identity) = &tls.identity {
+        builder = builder.identity(load_identity(identity)?);
     }
-}
-
-impl MtlsClientBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            builder: Client::builder().use_rustls_tls(),
-            tls: ClientTls::default(),
-        }
-    }
-
-    /// Sets the redirect policy the built client follows.
-    #[must_use]
-    pub fn with_redirect_policy(mut self, policy: Policy) -> Self {
-        self.builder = self.builder.redirect(policy);
-        self
-    }
-
-    /// Sets the whole-request timeout the built client applies to each request.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.timeout(timeout);
-        self
-    }
-
-    /// Bounds establishing the connection (TCP plus TLS handshake).
-    #[must_use]
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.connect_timeout(timeout);
-        self
-    }
-
-    /// Bounds inactivity between reads during a transfer, without capping a
-    /// long but progressing transfer by a total deadline.
-    #[must_use]
-    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.read_timeout(timeout);
-        self
-    }
-
-    /// Trusts `tls`'s PEM CA bundle for server verification, beside the
-    /// system roots, and presents its client identity.
-    #[must_use]
-    pub fn with_tls(mut self, tls: &ClientTls) -> Self {
-        self.tls = tls.clone();
-        self
-    }
-
-    /// Loads the configured files and builds the client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a configured certificate or key file cannot be read
-    /// or parsed, or when the HTTP client cannot be built.
-    pub fn build(self) -> Result<Client, String> {
-        let mut builder = self
-            .builder
-            .tls_certs_only(trusted_roots(self.tls.server_ca_bundle.as_deref())?);
-        if let Some(identity) = &self.tls.identity {
-            builder = builder.identity(load_identity(identity)?);
-        }
-        builder
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))
-    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))
 }
 
 /// The roots every outbound client trusts: the system CA bundle
@@ -248,14 +180,14 @@ mod tests {
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     };
-    use reqwest::Certificate;
+    use reqwest::{Certificate, Client};
     use rustls::pki_types::CertificateDer;
     use rustls_native_certs::CertificateResult;
 
     use angos_secret::Secret;
 
     use super::{
-        BasicAuth, ClientTls, ClientTlsFields, MtlsClientBuilder, MtlsIdentity, collect_roots,
+        BasicAuth, ClientTls, ClientTlsFields, MtlsIdentity, build_client, collect_roots,
         load_certificate_bundle, load_identity,
     };
 
@@ -306,16 +238,6 @@ mod tests {
     });
 
     #[test]
-    fn load_certificate_bundle_parses_pem_bundle() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let file_path = tmp_dir.path().join("bundle.pem");
-        fs::write(&file_path, &FIXTURES.ca_bundle).unwrap();
-
-        let loaded_certificates = load_certificate_bundle(&file_path).unwrap();
-        assert_eq!(loaded_certificates.len(), 2);
-    }
-
-    #[test]
     fn load_certificate_bundle_rejects_invalid_pem() {
         let content = "-----BEGIN INVALID CERTIFICATE-----LOLNOP-----END CERTIFICATE-----";
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -328,18 +250,19 @@ mod tests {
 
     #[test]
     fn rustls_tls_builds_with_and_without_ca_bundle() {
-        assert!(MtlsClientBuilder::new().build().is_ok());
+        assert!(build_client(Client::builder(), &ClientTls::default()).is_ok());
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_path = tmp_dir.path().join("bundle.pem");
         fs::write(&file_path, &FIXTURES.ca_bundle).unwrap();
 
-        let client = MtlsClientBuilder::new()
-            .with_tls(&ClientTls {
+        let client = build_client(
+            Client::builder(),
+            &ClientTls {
                 server_ca_bundle: Some(file_path),
                 identity: None,
-            })
-            .build();
+            },
+        );
         assert!(client.is_ok());
     }
 
@@ -392,25 +315,6 @@ mod tests {
         assert!(collect_roots(CertificateResult::default(), Vec::new()).is_err());
     }
 
-    #[test]
-    fn load_identity_parses_certificate_and_key() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let cert_file_path = tmp_dir.path().join("certificate.pem");
-        fs::write(&cert_file_path, &FIXTURES.client_cert).unwrap();
-
-        let key_file_path = tmp_dir.path().join("private-key.pem");
-        fs::write(&key_file_path, &FIXTURES.client_key).unwrap();
-
-        let identity = MtlsIdentity {
-            certificate: cert_file_path,
-            private_key: key_file_path.clone(),
-        };
-        assert!(load_identity(&identity).is_ok());
-
-        fs::write(&key_file_path, &FIXTURES.ca_bundle).unwrap();
-        assert!(load_identity(&identity).is_err());
-    }
-
     /// A certificate file with no trailing newline still yields an identity:
     /// its `END` marker would otherwise run into the key's `BEGIN` marker and
     /// the key would be skipped.
@@ -423,14 +327,18 @@ mod tests {
         let key_file_path = tmp_dir.path().join("private-key.pem");
         fs::write(&key_file_path, &FIXTURES.client_key).unwrap();
 
-        let identity = load_identity(&MtlsIdentity {
+        let identity = MtlsIdentity {
             certificate: cert_file_path,
-            private_key: key_file_path,
-        });
+            private_key: key_file_path.clone(),
+        };
+        let loaded = load_identity(&identity);
         assert!(
-            identity.is_ok(),
-            "an unterminated certificate must not lose the key: {identity:?}"
+            loaded.is_ok(),
+            "an unterminated certificate must not lose the key: {loaded:?}"
         );
+
+        fs::write(&key_file_path, &FIXTURES.ca_bundle).unwrap();
+        assert!(load_identity(&identity).is_err());
     }
 
     /// A certificate without its key, or a key without its certificate, would

@@ -2,16 +2,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
-use hyper::header::CONTENT_RANGE;
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use tracing::instrument;
 
-use angos_docker_extension_service::{CatalogRequest, Endpoint as DockerEndpoint};
-use angos_extension_service::{
-    DeleteJobRequest, Endpoint as AngosEndpoint, LayerEntriesRequest, LayerFileDetailsRequest,
-    LayerFileRequest, ListJobsRequest, ListPullsRequest, RetryJobRequest,
-};
+use angos_docker_extension_service::Endpoint as DockerEndpoint;
+use angos_extension_service::{Endpoint as AngosEndpoint, LayerEntriesRequest, LayerFileRequest};
 use angos_oci::Namespace;
 use angos_oci::request::{
     BlobMount, CompleteUploadRequest, DeleteBlobRequest, DeleteManifestRequest,
@@ -45,8 +41,6 @@ pub async fn dispatch_request(
         return handle_unknown_route(&parts);
     };
 
-    // The endpoint is the dispatch key; authorization reads the `Action`
-    // projection of it, so the policy input is unchanged by this routing.
     let action = Action::from(&route);
     let identity = authenticate_and_authorize(&context, &action, &parts).await?;
     dispatch_route(&context, route, &parts, incoming, &identity).await
@@ -65,10 +59,10 @@ pub async fn authenticate_and_authorize(
 }
 
 #[instrument(skip(context, parts, incoming, identity))]
-async fn dispatch_route<'a>(
-    context: &'a ServerContext,
+async fn dispatch_route(
+    context: &ServerContext,
     route: Route,
-    parts: &'a Parts,
+    parts: &Parts,
     incoming: Incoming,
     identity: &ClientIdentity,
 ) -> Result<Response<ResponseBody>, Error> {
@@ -88,8 +82,8 @@ async fn dispatch_route<'a>(
             handlers::handle_get_token(token_issuer, identity)
         }
         Route::Oci(endpoint) => dispatch_oci(context, endpoint, parts, incoming, identity).await,
-        Route::Docker(DockerEndpoint::ListCatalog { n, last }) => Ok(registry
-            .handle_list_catalog(CatalogRequest { n, last }, &|namespace: &Namespace| {
+        Route::Docker(DockerEndpoint::ListCatalog(request)) => Ok(registry
+            .handle_list_catalog(request, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
             })
             .await?
@@ -110,8 +104,6 @@ async fn dispatch_oci(
 ) -> Result<Response<ResponseBody>, Error> {
     let headers = RequestHeaders::new(&parts.headers);
     let registry = &context.registry;
-    // The authenticated caller, borrowed by whichever arm runs.
-    let actor = EventActor::from(identity.clone());
 
     match endpoint {
         OciEndpoint::CheckVersion => Ok(registry::api_version().into_response()?),
@@ -120,7 +112,7 @@ async fn dispatch_oci(
         }
         OciEndpoint::GetBlob { namespace, digest } => Ok(registry
             .handle_get_blob(
-                Some(actor),
+                Some(EventActor::from(identity.clone())),
                 GetBlobRequest {
                     namespace,
                     digest,
@@ -167,7 +159,6 @@ async fn dispatch_oci(
     }
 }
 
-/// The manifest endpoints, routed here by [`dispatch_oci`].
 async fn dispatch_manifest(
     context: &ServerContext,
     endpoint: ManifestEndpoint,
@@ -247,7 +238,6 @@ async fn dispatch_manifest(
     }
 }
 
-/// The blob-upload session endpoints, routed here by [`dispatch_oci`].
 async fn dispatch_upload(
     context: &ServerContext,
     endpoint: UploadEndpoint,
@@ -319,7 +309,7 @@ async fn dispatch_upload(
                 PatchUploadRequest {
                     namespace,
                     session_id,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
+                    content_range: headers.chunk_range()?,
                     content_length: headers.content_length()?,
                 },
                 Box::new(incoming_into_async_read(incoming)),
@@ -337,7 +327,7 @@ async fn dispatch_upload(
                     namespace,
                     session_id,
                     digest,
-                    content_range: headers.chunk_range(CONTENT_RANGE)?,
+                    content_range: headers.chunk_range()?,
                     content_length: headers.content_length()?,
                 },
                 Box::new(incoming_into_async_read(incoming)),
@@ -397,34 +387,17 @@ async fn dispatch_angos(
             })
             .await?
             .into_response(registry.blob_stream_frame_size())?),
-        AngosEndpoint::GetLayerFileDetails {
-            namespace,
-            digest,
-            path,
-        } => Ok(registry
-            .handle_get_layer_file_details(LayerFileDetailsRequest {
-                namespace,
-                digest,
-                path,
-            })
+        AngosEndpoint::GetLayerFileDetails(request) => Ok(registry
+            .handle_get_layer_file_details(request)
             .await?
             .into_response()?),
         AngosEndpoint::ListUploads { namespace, page } => Ok(registry
             .handle_list_uploads(&namespace, page)
             .await?
             .into_response()?),
-        AngosEndpoint::ListPulls {
-            namespace,
-            reference,
-            page,
-        } => Ok(registry
-            .handle_list_pulls(ListPullsRequest {
-                namespace,
-                reference,
-                page,
-            })
-            .await?
-            .into_response()?),
+        AngosEndpoint::ListPulls(request) => {
+            Ok(registry.handle_list_pulls(request).await?.into_response()?)
+        }
         AngosEndpoint::ListRepositories { order, page } => Ok(registry
             .handle_list_repositories(order, page, &|namespace: &Namespace| {
                 context.catalog_lists_namespace(namespace, identity)
@@ -437,30 +410,19 @@ async fn dispatch_angos(
             })
             .await?
             .into_response()?),
-        AngosEndpoint::ListJobs { queue, n, after } => Ok(registry
-            .handle_list_jobs(ListJobsRequest { queue, n, after })
+        AngosEndpoint::ListJobs(request) => {
+            Ok(registry.handle_list_jobs(request).await?.into_response()?)
+        }
+        AngosEndpoint::ListFailedJobs(request) => Ok(registry
+            .handle_list_failed_jobs(request)
             .await?
             .into_response()?),
-        AngosEndpoint::ListFailedJobs { queue, n, after } => Ok(registry
-            .handle_list_failed_jobs(ListJobsRequest { queue, n, after })
-            .await?
-            .into_response()?),
-        AngosEndpoint::RetryJob { queue, storage_key } => Ok(registry
-            .handle_retry_job(RetryJobRequest { queue, storage_key })
-            .await?
-            .into_response()?),
-        AngosEndpoint::DeleteJob {
-            queue,
-            state,
-            storage_key,
-        } => Ok(registry
-            .handle_delete_job(DeleteJobRequest {
-                queue,
-                state,
-                storage_key,
-            })
-            .await?
-            .into_response()?),
+        AngosEndpoint::RetryJob(request) => {
+            Ok(registry.handle_retry_job(request).await?.into_response()?)
+        }
+        AngosEndpoint::DeleteJob(request) => {
+            Ok(registry.handle_delete_job(request).await?.into_response()?)
+        }
     }
 }
 

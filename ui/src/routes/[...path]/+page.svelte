@@ -3,8 +3,8 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { getRegistryName } from '#lib/config.svelte.js';
-	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, type ManifestResult, type NamespacesResponse, type RevisionsResponse, type UploadsResponse, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, blobUrl, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '#lib/api.js';
-	import { buildTree, buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, pathUrl, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '#lib/utils.js';
+	import { PAGE, fetchRevision, fetchRevisions, fetchUploads, fetchManifest, fetchNamespaces, fetchReferrers, type FetchResult, type ManifestResult, type NamespacesResponse, type RevisionsResponse, type UploadsResponse, deleteManifest as apiDeleteManifest, cancelUpload as apiCancelUpload, type UploadEntry, type ParentRef, type Manifest, type ManifestEntry, type ReferrerInfo, type RevisionSort, type SortOrder } from '#lib/api.js';
+	import { buildTreeRows, cascadeSummary, deleteCascade, descendantNamespaces, imageReference, isDigest, isInteractiveTarget, manifestUrl, selectedManifestsConfirmKey, type NamespaceDescendant, type TreeRowNode } from '#lib/utils.js';
 	import LoadingState from '#lib/components/LoadingState.svelte';
 	import ErrorState from '#lib/components/ErrorState.svelte';
 	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
@@ -102,13 +102,9 @@
 
 	function toggleExpand(digest: string, event: MouseEvent) {
 		event.stopPropagation();
-		const newExpanded = new Set(expanded);
-		if (newExpanded.has(digest)) {
-			newExpanded.delete(digest);
-		} else {
-			newExpanded.add(digest);
-		}
-		expanded = newExpanded;
+		const next = new Set(expanded);
+		if (!next.delete(digest)) next.add(digest);
+		expanded = next;
 	}
 
 	// A navigation: the route's load already fetched the new view, which
@@ -161,13 +157,10 @@
 		loadBrowse(data.path);
 	}
 
-	// Refreshes the view in place, keeping as many rows as are loaded: blanking
-	// it would read as the whole page reloading when only one row changed.
-	// `relist` fetches the namespace listing again, which is otherwise skipped:
-	// it is by far the most expensive of the three calls, at one store walk plus
-	// three backend listings per namespace, and an action touches only this
-	// namespace, whose descendants it lists are all unaffected. Above every
-	// repository there is nothing to list but the names the route resolved.
+	// Refreshes the view in place, keeping as many rows as are loaded. `relist`
+	// also refetches the namespace listing, by far the most expensive call, which
+	// an action on this namespace leaves unaffected. Above every repository there
+	// is nothing to list but the names the route resolved.
 	async function loadBrowse(namespace: string, relist = false) {
 		const token = ++loadToken;
 		const n = (loaded: number) => Math.max(loaded, PAGE);
@@ -190,8 +183,8 @@
 	) {
 		error = revisionsResult.error;
 		if (revisionsResult.data) {
-			manifests = revisionsResult.data.manifests ?? [];
-			rows = buildTreeRows(buildTree(manifests));
+			manifests = revisionsResult.data.manifests;
+			rows = buildTreeRows(manifests);
 			manifestsNext = revisionsResult.data.next;
 			manifestsTotal = revisionsResult.data.total;
 		}
@@ -270,7 +263,7 @@
 				// A platform manifest two indexes hold arrives with each; one copy stays.
 				const loaded = new Set(manifests.map((m) => m.digest));
 				manifests = [...manifests, ...page.manifests.filter((m) => !loaded.has(m.digest))];
-				rows = buildTreeRows(buildTree(manifests));
+				rows = buildTreeRows(manifests);
 				manifestsNext = page.next;
 				manifestsTotal = page.total;
 			}
@@ -307,27 +300,25 @@
 		manifest = result.manifest;
 		digest = result.digest;
 
-		if (digest && revisionsResult) {
-			if (revisionsResult.data) {
-				manifests = revisionsResult.data.manifests;
-				const entry = revisionsResult.data.manifests.find(m => m.digest === digest);
-				if (entry) {
-					tags = entry.tags;
-					referencedBy = entry.parents ?? [];
-				}
-				const newChildReferrers = new Map<string, ReferrerInfo[]>();
-				const newChildReferrersNext = new Map<string, string>();
-				for (const m of revisionsResult.data.manifests) {
-					if (m.referrers && m.referrers.length > 0) {
-						newChildReferrers.set(m.digest, m.referrers);
-					}
-					if (m.referrers_next) {
-						newChildReferrersNext.set(m.digest, m.referrers_next);
-					}
-				}
-				childReferrers = newChildReferrers;
-				childReferrersNext = newChildReferrersNext;
+		if (digest && revisionsResult?.data) {
+			manifests = revisionsResult.data.manifests;
+			const entry = manifests.find(m => m.digest === digest);
+			if (entry) {
+				tags = entry.tags;
+				referencedBy = entry.parents ?? [];
 			}
+			const newChildReferrers = new Map<string, ReferrerInfo[]>();
+			const newChildReferrersNext = new Map<string, string>();
+			for (const m of manifests) {
+				if (m.referrers && m.referrers.length > 0) {
+					newChildReferrers.set(m.digest, m.referrers);
+				}
+				if (m.referrers_next) {
+					newChildReferrersNext.set(m.digest, m.referrers_next);
+				}
+			}
+			childReferrers = newChildReferrers;
+			childReferrersNext = newChildReferrersNext;
 		}
 	}
 
@@ -371,7 +362,7 @@
 		} else if (digest && digest !== deletedReference) {
 			await goto(manifestUrl(data.path, digest));
 		} else {
-			await goto(pathUrl(data.path));
+			await goto(resolve(data.path));
 		}
 	}
 
@@ -387,22 +378,14 @@
 	// One checkbox, three meanings: a row the cascade holds is spared or taken
 	// back, anything else is picked or dropped from the selection itself.
 	function toggleManifestSelection(digest: string) {
-		if (sparedManifests.has(digest)) {
+		if (sparedManifests.has(digest) || impliedDeletes.has(digest)) {
 			const spared = new Set(sparedManifests);
-			spared.delete(digest);
+			if (!spared.delete(digest)) spared.add(digest);
 			sparedManifests = spared;
 			return;
 		}
-		if (impliedDeletes.has(digest)) {
-			sparedManifests = new Set(sparedManifests).add(digest);
-			return;
-		}
 		const selected = new Set(selectedManifests);
-		if (selected.has(digest)) {
-			selected.delete(digest);
-		} else {
-			selected.add(digest);
-		}
+		if (!selected.delete(digest)) selected.add(digest);
 		selectedManifests = selected;
 	}
 
@@ -413,6 +396,7 @@
 	// Deletes `digests` and what their going orphans, the roots first so a
 	// child is only ever removed once nothing names it. One request each: the
 	// registry has no bulk delete, and deleting stays per manifest there.
+	// Reports a partial failure and returns the digests that went.
 	async function deleteWithCascade(digests: string[]) {
 		const rootResults = await Promise.all(
 			digests.map((digest) => apiDeleteManifest(data.path, digest))
@@ -424,33 +408,30 @@
 			extra.map((digest) => apiDeleteManifest(data.path, digest))
 		);
 		const gone = new Set([...rootsGone, ...extra.filter((_, i) => extraResults[i] === null)]);
-		return { gone, failed: digests.length + extra.length - gone.size, total: digests.length + extra.length };
+		const total = digests.length + extra.length;
+		if (gone.size < total) {
+			actionError = `Could not delete ${total - gone.size} of ${total} manifests.`;
+		}
+		return gone;
 	}
 
 	async function deleteByReference(reference: string) {
+		deleting = true;
+		actionError = null;
 		// A tag delete keeps the manifest, so nothing cascades from it.
 		if (isDigest(reference)) {
-			deleting = true;
-			actionError = null;
-			const { gone, failed, total } = await deleteWithCascade([reference]);
+			const gone = await deleteWithCascade([reference]);
 			rows = rows.filter((row) => !gone.has(row.digest));
 			deleteConfirm = null;
 			deleting = false;
-			if (failed > 0) {
-				actionError = `Could not delete ${failed} of ${total} manifests.`;
-			}
 			if (gone.has(reference)) {
 				await reloadAfterDelete(reference);
 			}
 			return;
 		}
-		deleting = true;
-		actionError = null;
 		const err = await apiDeleteManifest(data.path, reference);
-		// The refresh below re-lists the whole namespace, which costs far more
-		// than the delete it reflects. Holding every delete control disabled for
-		// it is what made deleting a tag feel slow, so the controls come back as
-		// soon as the registry has answered.
+		// The controls come back as soon as the registry answers, not after the
+		// far slower refresh below.
 		deleting = false;
 		if (err) {
 			actionError = `Could not delete ${reference} (${err}).`;
@@ -474,17 +455,13 @@
 		if (!digest) return;
 		deleting = true;
 		actionError = null;
-		const { gone, failed, total } = await deleteWithCascade([digest]);
+		const gone = await deleteWithCascade([digest]);
 		deleting = false;
 		if (!gone.has(digest)) {
-			actionError = `Could not delete the manifest.`;
+			actionError = 'Could not delete the manifest.';
 			return;
 		}
-		// The view leaves for the namespace; a cascade failure is reported there.
-		if (failed > 0) {
-			actionError = `Could not delete ${failed} of ${total} manifests.`;
-		}
-		await goto(pathUrl(data.path));
+		await goto(resolve(data.path));
 	}
 
 	async function cancelUpload(uuid: string) {
@@ -500,22 +477,18 @@
 		deleting = false;
 	}
 
-	// One request per manifest: the registry has no bulk delete. Rows that
-	// went are dropped at once and the controls come back before the refresh,
-	// which reconciles what the deletes cascaded to.
+	// Rows that went are dropped at once and the controls come back before the
+	// refresh, which reconciles what the deletes cascaded to.
 	async function deleteSelectedManifests() {
 		deleting = true;
 		actionError = null;
-		const { gone, failed, total } = await deleteWithCascade([...selectedManifests]);
+		const gone = await deleteWithCascade([...selectedManifests]);
 		rows = rows.filter((row) => !gone.has(row.digest));
 		selectedManifests = new Set();
 		sparedManifests = new Set();
 		selectingManifests = false;
 		deleteConfirm = null;
 		deleting = false;
-		if (failed > 0) {
-			actionError = `Could not delete ${failed} of ${total} manifests.`;
-		}
 		await loadBrowse(data.path);
 	}
 
@@ -543,10 +516,10 @@
 <Breadcrumb items={[
 	{ label: 'Repositories', href: resolve('/') },
 	...(data.repository === null
-		? [{ label: data.path, href: pathUrl(data.path) }]
+		? [{ label: data.path, href: resolve(data.path) }]
 		: [
-			{ label: data.repository, href: pathUrl(data.repository) },
-			...(relativePath === '' ? [] : [{ label: relativePath, href: pathUrl(data.path) }])
+			{ label: data.repository, href: resolve(data.repository) },
+			...(relativePath === '' ? [] : [{ label: relativePath, href: resolve(data.path) }])
 		]),
 	...(isManifestView ? [{ label: data.reference ?? '' }] : [])
 ]} />
@@ -617,7 +590,6 @@
 		ondeletebyhash={deleteByHash}
 		deleteconfirmlabel={digest ? deleteConfirmLabel([digest]) : 'confirm'}
 		onconfirmchange={(value) => deleteConfirm = value}
-		getbloburl={(blobDigest) => blobUrl(data.path, blobDigest)}
 	/>
 {:else}
 	{#if pullThroughCache || immutableTags}
@@ -664,7 +636,7 @@
 				</thead>
 				<tbody>
 					{#each children as child (child.path)}
-						{@const href = pathUrl(child.path)}
+						{@const href = resolve(child.path)}
 						<tr class="clickable" onclick={(event) => { if (!isInteractiveTarget(event)) goto(href); }}>
 							<td><a class="row-link" {href}>{child.label}</a></td>
 							{#if counted}
@@ -700,8 +672,7 @@
 		{expanded}
 		ontoggleexpand={toggleExpand}
 		onconfirmchange={(value) => deleteConfirm = value}
-		ondeletemanifest={deleteByReference}
-		ondeletetag={deleteByReference}
+		ondelete={deleteByReference}
 		oncancelupload={cancelUpload}
 		onuploadselectionchange={(selected) => selectedUploads = selected}
 		oncancelselecteduploads={cancelSelectedUploads}
@@ -723,7 +694,6 @@
 {/if}
 
 <style>
-	/* The count and the table's actions on one line, the actions to the right. */
 	.lede-row {
 		display: flex;
 		align-items: center;

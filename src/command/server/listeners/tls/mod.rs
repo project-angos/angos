@@ -71,8 +71,6 @@ fn build_client_verifier(
     Ok(verifier)
 }
 
-/// Builds a [`TlsAcceptor`] from the server certificate/key and optional client
-/// CA bundle. Shared by the connector's initial construction and every reload.
 pub fn build_tls_acceptor(tls_config: &ServerTlsConfig) -> Result<TlsAcceptor, Error> {
     debug!("Detected TLS configuration");
     let server_certs = load_certificate_bundle(
@@ -116,7 +114,6 @@ impl TlsConnector {
         })
     }
 
-    /// Swap in an acceptor built from `tls_config`.
     pub fn reload(&self, tls_config: &ServerTlsConfig) -> Result<(), Error> {
         self.tls_acceptor
             .store(Arc::new(build_tls_acceptor(tls_config)?));
@@ -134,9 +131,7 @@ impl Connector for TlsConnector {
         remote_address: SocketAddr,
     ) -> Option<HandshakeResult<Self::Stream>> {
         let acceptor = Arc::clone(&self.tls_acceptor.load());
-        let result = acceptor.accept(tcp).await;
-
-        let tls = match result {
+        let tls = match acceptor.accept(tcp).await {
             Ok(tls) => tls,
             Err(e) => {
                 debug!("TLS handshake failed from {remote_address}: {e}");
@@ -165,7 +160,6 @@ impl Connector for TlsConnector {
     }
 }
 
-/// A TLS/mTLS listener: the shared shell over the [`TlsConnector`].
 pub type TlsListener = Listener<TlsConnector>;
 
 impl TlsListener {
@@ -174,8 +168,6 @@ impl TlsListener {
         Ok(Self::build(&config.base, connector, context))
     }
 
-    /// Apply a full listener config reload: rebuild the acceptor, then swap in
-    /// the new timeouts and context.
     pub fn notify_config_change(
         &self,
         config: &TlsListenerConfig,
@@ -187,7 +179,6 @@ impl TlsListener {
         Ok(())
     }
 
-    /// Apply a TLS-only reload (certificate rotation): rebuild the acceptor.
     pub fn notify_tls_config_change(&self, config: &ServerTlsConfig) -> Result<(), Error> {
         self.connector.reload(config)
     }

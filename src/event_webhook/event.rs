@@ -70,11 +70,8 @@ impl EventActor {
     /// Actor for an operation performed by the named internal process.
     pub fn internal(process: &str) -> Self {
         Self {
-            id: None,
-            username: None,
-            client_ip: None,
             internal: Some(process.to_string()),
-            principal: None,
+            ..Self::default()
         }
     }
 
@@ -227,20 +224,20 @@ pub struct Event {
 }
 
 impl Event {
-    fn new(
+    pub fn new(
         subject: EventSubject,
-        namespace: Namespace,
-        repository: String,
-        actor: Option<EventActor>,
+        namespace: &Namespace,
+        repository: &str,
+        actor: Option<&EventActor>,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
             timestamp: Utc::now(),
             kind: subject.kind(),
-            namespace,
+            namespace: namespace.clone(),
             subject,
-            actor,
-            repository,
+            actor: actor.cloned(),
+            repository: repository.to_string(),
         }
     }
 
@@ -257,14 +254,7 @@ impl Event {
         reference: &Reference,
         actor: Option<&EventActor>,
     ) -> Vec<Self> {
-        let event = |subject| {
-            Self::new(
-                subject,
-                namespace.clone(),
-                repository.to_string(),
-                actor.cloned(),
-            )
-        };
+        let event = |subject| Self::new(subject, namespace, repository, actor);
         match reference {
             Reference::Digest(digest) => vec![event(EventSubject::ManifestDelete {
                 digest: Some(digest.clone()),
@@ -283,81 +273,6 @@ impl Event {
         }
     }
 
-    /// The `ManifestPull` event a served `GET` emits. It names the tag the
-    /// client pulled by, which a pull by digest does not have.
-    pub fn pull_manifest(
-        namespace: &Namespace,
-        repository: &str,
-        digest: &Digest,
-        reference: &Reference,
-        actor: Option<&EventActor>,
-    ) -> Self {
-        Self::new(
-            EventSubject::ManifestPull {
-                digest: digest.clone(),
-                reference: reference.clone(),
-                tag: reference.as_tag().cloned(),
-            },
-            namespace.clone(),
-            repository.to_string(),
-            actor.cloned(),
-        )
-    }
-
-    /// The `BlobPush` event an upload completion, a cross-repo mount or a
-    /// cache fill emits.
-    pub fn push_blob(
-        namespace: &Namespace,
-        repository: &str,
-        digest: &Digest,
-        actor: Option<&EventActor>,
-    ) -> Self {
-        Self::new(
-            EventSubject::BlobPush {
-                digest: digest.clone(),
-            },
-            namespace.clone(),
-            repository.to_string(),
-            actor.cloned(),
-        )
-    }
-
-    /// The `BlobPull` event a served `GET` emits.
-    pub fn pull_blob(
-        namespace: &Namespace,
-        repository: &str,
-        digest: &Digest,
-        actor: Option<&EventActor>,
-    ) -> Self {
-        Self::new(
-            EventSubject::BlobPull {
-                digest: digest.clone(),
-            },
-            namespace.clone(),
-            repository.to_string(),
-            actor.cloned(),
-        )
-    }
-
-    /// The `ManifestPush` event alone, for a store that creates no tag.
-    pub fn push_manifest(
-        namespace: &Namespace,
-        repository: &str,
-        digest: &Digest,
-        reference: &Reference,
-        actor: Option<&EventActor>,
-    ) -> Self {
-        Self::new(
-            EventSubject::ManifestPush {
-                digest: digest.clone(),
-                reference: reference.clone(),
-            },
-            namespace.clone(),
-            repository.to_string(),
-            actor.cloned(),
-        )
-    }
-
     /// The `ManifestPush` event a put emits, a `TagCreate` when the reference
     /// is a tag, and one `TagCreate` per tag created via a `?tag=` query
     /// parameter.
@@ -369,8 +284,14 @@ impl Event {
         created_tags: &[Tag],
         actor: Option<&EventActor>,
     ) -> Vec<Self> {
-        let mut events = vec![Self::push_manifest(
-            namespace, repository, digest, reference, actor,
+        let mut events = vec![Self::new(
+            EventSubject::ManifestPush {
+                digest: digest.clone(),
+                reference: reference.clone(),
+            },
+            namespace,
+            repository,
+            actor,
         )];
         events.extend(
             reference
@@ -384,9 +305,9 @@ impl Event {
                             reference: reference.clone(),
                             tag: tag.clone(),
                         },
-                        namespace.clone(),
-                        repository.to_string(),
-                        actor.cloned(),
+                        namespace,
+                        repository,
+                        actor,
                     )
                 }),
         );
@@ -456,17 +377,16 @@ mod tests {
         assert_eq!(internal.audit_name(), "cache");
     }
 
+    /// The principal stays out of the webhook payload.
     #[test]
-    fn principal_stays_out_of_the_webhook_payload() {
+    fn actor_payload_keeps_its_published_fields() {
         let actor = EventActor::from(oidc_identity(json!({ "sub": "42" })));
         assert_eq!(serde_json::to_value(&actor).unwrap(), json!({}));
-    }
-
-    #[test]
-    fn event_actor_internal_serializes_only_the_process_name() {
         let actor = EventActor::internal("prune");
-        let json = serde_json::to_value(&actor).unwrap();
-        assert_eq!(json, json!({ "internal": "prune" }));
+        assert_eq!(
+            serde_json::to_value(&actor).unwrap(),
+            json!({ "internal": "prune" })
+        );
     }
 
     /// Every variant must name itself identically in the `X-Registry-Event`
@@ -573,7 +493,7 @@ mod tests {
 
         for (subject, mut expected) in cases {
             let namespace = Namespace::new("library/nginx").unwrap();
-            let event = Event::new(subject, namespace, "hub".to_string(), None);
+            let event = Event::new(subject, &namespace, "hub", None);
             expected["namespace"] = json!("library/nginx");
             expected["repository"] = json!("hub");
 

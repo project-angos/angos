@@ -19,7 +19,7 @@ use angos_oci::{
 use angos_oci_service::{Accepted, ManifestDescriptor, ManifestGet, ManifestWritten};
 
 use crate::cache_fill::CACHE_ACTOR;
-use crate::event_webhook::event::{Event, EventActor};
+use crate::event_webhook::event::{Event, EventActor, EventSubject};
 use crate::jobs::Queue;
 use crate::layer;
 use crate::policy::ImagePolicy;
@@ -70,15 +70,14 @@ struct PushedKeys<'a> {
 
 /// The validated inputs to [`Registry::store_manifest`]; the manifest bytes are
 /// passed separately.
-#[derive(Clone, Copy)]
-struct StoreManifest<'a> {
-    namespace: &'a Namespace,
-    reference: &'a Reference,
-    content_type: Option<&'a MediaType>,
-    created_tags: &'a [Tag],
-    reference_policy: ReferencePolicy,
-    created_at: Option<DateTime<Utc>>,
-    repository: Option<&'a Repository>,
+pub struct StoreManifest<'a> {
+    pub namespace: &'a Namespace,
+    pub reference: &'a Reference,
+    pub content_type: Option<&'a MediaType>,
+    pub created_tags: &'a [Tag],
+    pub reference_policy: ReferencePolicy,
+    pub created_at: Option<DateTime<Utc>>,
+    pub repository: Option<&'a Repository>,
 }
 
 /// What a replication job addresses, each variant carrying only the
@@ -220,7 +219,7 @@ enum ServeLocal<T> {
 
 /// Only a genuine miss is a 404; collapsing a backend fault into one makes a
 /// storage outage look like deleted images.
-fn hosted_manifest_error(namespace: &Namespace, reference: &Reference, error: Error) -> Error {
+pub fn hosted_manifest_error(namespace: &Namespace, reference: &Reference, error: Error) -> Error {
     match error {
         Error::NotFound | Error::ManifestUnknown => {
             debug!("No local manifest for {namespace}:{reference}");
@@ -293,9 +292,12 @@ async fn needs_upstream_pull(
         return Ok(false);
     }
 
-    Ok(!upstream
-        .is_upstream_digest_match(accepted_types, namespace, reference, local_digest)
-        .await?)
+    // An upstream that omits `Docker-Content-Digest` reads as re-pointed, so
+    // the body is refetched rather than served unverified.
+    let head = upstream
+        .head_manifest(accepted_types, namespace, reference)
+        .await?;
+    Ok(head.digest.as_ref() != Some(local_digest))
 }
 
 impl Registry {
@@ -308,27 +310,18 @@ impl Registry {
     ) -> Result<ManifestDescriptor, Error> {
         let anonymous = EventActor::default();
         let client = actor.as_ref().unwrap_or(&anonymous);
-        let repository = self.repository_for_namespace(&request.namespace).ok();
-        match repository.filter(|repository| repository.is_pull_through()) {
-            Some(upstream) => {
-                let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
-                self.head_cached_manifest(upstream, &request, is_tag_immutable, client)
-                    .await
-            }
-            None => {
-                self.head_hosted_manifest(&request.namespace, &request.reference, client)
-                    .await
-            }
+        let repository = self.resolver.resolve(&request.namespace);
+        if let Some(upstream) = repository.filter(|repository| repository.is_pull_through()) {
+            let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
+            return self
+                .head_cached_manifest(upstream, &request, is_tag_immutable, client)
+                .await;
         }
-    }
-
-    /// HEAD on a namespace no upstream backs: the local manifest or a 404.
-    async fn head_hosted_manifest(
-        &self,
-        namespace: &Namespace,
-        reference: &Reference,
-        client: &EventActor,
-    ) -> Result<ManifestDescriptor, Error> {
+        let HeadManifestRequest {
+            namespace,
+            reference,
+            ..
+        } = &request;
         let meta = self
             .head_local_manifest(namespace, reference)
             .await
@@ -407,19 +400,6 @@ impl Registry {
         .await
     }
 
-    /// Read a manifest/tag link for a client pull, recording its access time
-    /// under `client`'s identity when pull-time tracking is enabled.
-    async fn read_manifest_link(
-        &self,
-        namespace: &Namespace,
-        link: &LinkKind,
-        client: &EventActor,
-    ) -> Result<LinkMetadata, Error> {
-        let metadata = self.metadata_store.read_link(namespace, link).await?;
-        self.record_manifest_pull(namespace, link, client).await?;
-        Ok(metadata)
-    }
-
     /// Record one pull of `link` once the request has committed to serving it,
     /// so a probe that ends up not serving does not count as a pull. A pull
     /// that cannot be recorded fails: the pull history gates retention, so
@@ -481,71 +461,16 @@ impl Registry {
         })
     }
 
-    /// Test-only: the cached or hosted GET for an explicit `repository`,
-    /// without redirects.
-    #[cfg(test)]
-    pub async fn get_manifest_direct(
-        &self,
-        repository: Option<&Repository>,
-        accepted_types: &[MediaRange],
-        namespace: &Namespace,
-        reference: Reference,
-        is_tag_immutable: bool,
-        client: &EventActor,
-    ) -> Result<ManifestGet, Error> {
-        let request = GetManifestRequest {
-            namespace: namespace.clone(),
-            reference,
-            accepted_types: accepted_types.to_vec(),
-        };
-        match repository.filter(|repository| repository.is_pull_through()) {
-            Some(upstream) => {
-                self.get_cached_manifest(upstream, &request, is_tag_immutable, false, client)
-                    .await
-            }
-            None => self.get_hosted_manifest(&request, false, client).await,
-        }
-    }
-
-    /// GET on a namespace no upstream backs: the local manifest, as a
-    /// redirect when the link alone can answer, or a 404.
-    async fn get_hosted_manifest(
-        &self,
-        request: &GetManifestRequest,
-        allow_redirect: bool,
-        client: &EventActor,
-    ) -> Result<ManifestGet, Error> {
-        let GetManifestRequest {
-            namespace,
-            reference,
-            ..
-        } = request;
-        if allow_redirect
-            && self.config.redirect.manifest
-            && let Reference::Digest(digest) = reference
-            && let Some(response) = self
-                .try_redirect_via_link(namespace, digest, client)
-                .await?
-        {
-            return Ok(response);
-        }
-        self.get_local_manifest(namespace, reference, client)
-            .await
-            .map_err(|error| hosted_manifest_error(namespace, reference, error))
-    }
-
     /// GET on a pull-through namespace: the cached manifest while it is
-    /// current, else the upstream's, stored on the way out. A digest cannot
-    /// move upstream, so it redirects from its record alone; a mutable tag is
+    /// current, else the upstream's, stored on the way out. A mutable tag is
     /// checked against the upstream first, and served as cached when no
     /// upstream is available to check or refetch it.
     #[instrument(skip(upstream))]
-    async fn get_cached_manifest(
+    pub async fn get_cached_manifest(
         &self,
         upstream: &Repository,
         request: &GetManifestRequest,
         is_tag_immutable: bool,
-        allow_redirect: bool,
         client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let GetManifestRequest {
@@ -553,16 +478,6 @@ impl Registry {
             reference,
             accepted_types,
         } = request;
-        if allow_redirect
-            && self.config.redirect.manifest
-            && let Reference::Digest(digest) = reference
-            && let Some(response) = self
-                .try_redirect_via_link(namespace, digest, client)
-                .await?
-        {
-            return Ok(response);
-        }
-
         let local = self.get_local_manifest(namespace, reference, client).await;
         let serveable = serveable_cached(local, async |body| {
             needs_upstream_pull(
@@ -612,11 +527,13 @@ impl Registry {
 
         // Best effort: the client operation is the pull, so a delivery failure
         // must not fail it.
-        let event = Event::push_manifest(
+        let event = Event::new(
+            EventSubject::ManifestPush {
+                digest: digest.clone(),
+                reference: reference.clone(),
+            },
             namespace,
             &upstream.name,
-            &digest,
-            reference,
             Some(&EventActor::internal(CACHE_ACTOR)),
         );
         if let Err(error) = self.dispatch_events(&[event]).await {
@@ -624,7 +541,7 @@ impl Registry {
         }
 
         self.store_manifest(
-            &StoreManifest {
+            StoreManifest {
                 namespace,
                 reference,
                 content_type: media_type.as_ref(),
@@ -644,15 +561,15 @@ impl Registry {
         })
     }
 
-    async fn get_local_manifest(
+    pub async fn get_local_manifest(
         &self,
         namespace: &Namespace,
         reference: &Reference,
         client: &EventActor,
     ) -> Result<ManifestGet, Error> {
         let blob_link = LinkKind::from(reference);
-        let link = self
-            .read_manifest_link(namespace, &blob_link, client)
+        let link = self.metadata_store.read_link(namespace, &blob_link).await?;
+        self.record_manifest_pull(namespace, &blob_link, client)
             .await?;
 
         // A tag entry can outlive its manifest, whose bytes wait for the
@@ -692,34 +609,9 @@ impl Registry {
         }
     }
 
-    /// Test-only wrapper that stores a manifest without a replication `source_ts`.
-    #[cfg(test)]
-    #[instrument(skip(body))]
-    pub async fn put_manifest_direct(
+    pub async fn store_manifest(
         &self,
-        namespace: &Namespace,
-        reference: &Reference,
-        content_type: Option<&MediaType>,
-        body: &[u8],
-    ) -> Result<ManifestWritten, Error> {
-        self.store_manifest(
-            &StoreManifest {
-                namespace,
-                reference,
-                content_type,
-                created_tags: &[],
-                reference_policy: ReferencePolicy::Strict,
-                created_at: None,
-                repository: None,
-            },
-            body,
-        )
-        .await
-    }
-
-    async fn store_manifest(
-        &self,
-        write: &StoreManifest<'_>,
+        write: StoreManifest<'_>,
         body: &[u8],
     ) -> Result<ManifestWritten, Error> {
         let StoreManifest {
@@ -730,7 +622,7 @@ impl Registry {
             reference_policy,
             created_at,
             repository,
-        } = *write;
+        } = write;
         let mut manifest =
             Manifest::from_pushed(body, content_type).map_err(|e| Error::manifest_invalid(&e))?;
         let computed_digest = pushed_digest(reference, body)?;
@@ -803,7 +695,7 @@ impl Registry {
                     descriptor: descriptor.as_ref(),
                     tags: &written_tags,
                     claimed: &claimed_tags,
-                    media_type: effective_media_type.clone(),
+                    media_type: effective_media_type,
                     authored_at: created_at,
                 },
             )
@@ -836,7 +728,7 @@ impl Registry {
             namespace: namespace.clone(),
             reference: reference.clone(),
             digest: computed_digest,
-            subject: manifest.subject.map(|s| s.digest),
+            subject,
             created_tags: created_tags.to_vec(),
             changed,
         })
@@ -851,8 +743,9 @@ impl Registry {
     /// bytes before the clearance passed; so no record ever points at reclaimed
     /// bytes. The revision record lands next, which is what makes the digest
     /// resolvable; the referrer back-link and the tag entries land last, so a
-    /// resolvable tag always implies a complete manifest. A crash between any two leaves an over-approximated
-    /// reference or a tagless revision, both legal.
+    /// resolvable tag always implies a complete manifest. A crash between any
+    /// two leaves an over-approximated reference or a tagless revision, both
+    /// legal.
     async fn write_pushed_keys(
         &self,
         namespace: &Namespace,
@@ -862,15 +755,17 @@ impl Registry {
     ) -> Result<(bool, bool), Error> {
         let store = &self.metadata_store;
         store.pin_references(namespace, pins).await?;
-        try_join_all(
-            keys.stored
-                .iter()
-                .map(|digest| self.validate_manifest_reference(digest)),
-        )
+        try_join_all(keys.stored.iter().map(
+            async |digest| match self.blob_store.size(digest).await {
+                Ok(_) => Ok(()),
+                Err(Error::BlobUnknown | Error::NotFound) => Err(Error::ManifestBlobUnknown),
+                Err(error) => Err(error),
+            },
+        ))
         .await?;
 
         let digest_moved = store
-            .put_revision(namespace, digest, keys.media_type.clone(), keys.authored_at)
+            .put_revision(namespace, digest, keys.media_type, keys.authored_at)
             .await?;
 
         if let Some(subject) = keys.subject {
@@ -891,14 +786,6 @@ impl Registry {
                 .await?;
         }
         Ok((digest_moved, tag_moved))
-    }
-
-    async fn validate_manifest_reference(&self, digest: &Digest) -> Result<(), Error> {
-        match self.blob_store.size(digest).await {
-            Ok(_) => Ok(()),
-            Err(Error::BlobUnknown | Error::NotFound) => Err(Error::ManifestBlobUnknown),
-            Err(error) => Err(error),
-        }
     }
 
     /// Serves a client's manifest delete; only this entry point answers `202`,
@@ -987,55 +874,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Whether the reference counted as present before the delete, gating the
-    /// replication dispatch; absent only when the prior link is gone AND no tag
-    /// still points at it. A transient read error counts as present so a real
-    /// delete is never suppressed, and a racing write flipping this pre-read is
-    /// safe because over-dispatch is idempotent.
-    async fn manifest_delete_existed_before(
-        &self,
-        resolved_repository: Option<&Repository>,
-        namespace: &Namespace,
-        reference: &Reference,
-        pointing_tags: &[Tag],
-    ) -> bool {
-        match self
-            .prior_link_if_replicated(resolved_repository, namespace, reference)
-            .await
-        {
-            None => false,
-            Some(Err(Error::NotFound)) => !pointing_tags.is_empty(),
-            Some(_) => true,
-        }
-    }
-
-    /// Deletes the keys a digest reference holds; a tag reference is a single
-    /// tombstone the caller writes instead.
-    async fn delete_revision_keys(
-        &self,
-        namespace: &Namespace,
-        digest: &Digest,
-        subject: Option<&Digest>,
-        pointing_tags: &[Tag],
-        source_ts: Option<DateTime<Utc>>,
-    ) -> Result<(), Error> {
-        // Every tombstone first, then the referrer back-link, and the revision
-        // record last: a tag must never resolve to a manifest that is already
-        // gone. The config, layer and child links need no delete at all, since
-        // each is pinned by its per-referrer reference key, which goes stale on
-        // its own once this revision is gone. Reference keys are the
-        // collector's to remove, because a writer-side delete could unpin a
-        // blob a concurrent push is committing.
-        let store = &self.metadata_store;
-        for tag in pointing_tags {
-            store.put_tag_tombstone(namespace, tag, source_ts).await?;
-        }
-        if let Some(subject) = subject {
-            store.delete_referrer(namespace, subject, digest).await?;
-        }
-        store.delete_revision(namespace, digest).await
-    }
-
     /// Deletes the reference's links, reporting whether it counted as present
     /// beforehand (the replication-dispatch gate). A concurrently pushed tag
     /// appends its own newer entry and wins resolution by timestamp regardless
@@ -1053,7 +891,7 @@ impl Registry {
         // Every tag the delete drops: the reference itself, or the tags a
         // digest delete cascades to. Maintenance drops only a tag it could
         // have judged: one younger than the grace was pushed after it.
-        let grace = i64::try_from(self.metadata_store.gc_grace_secs).unwrap_or(i64::MAX);
+        let grace = i64::try_from(self.metadata_store.settings.gc_grace_secs).unwrap_or(i64::MAX);
         let dropped_tags: Vec<Tag> = match reference {
             Reference::Tag(tag) => vec![tag.clone()],
             Reference::Digest(digest) => self
@@ -1070,15 +908,29 @@ impl Registry {
                 .map(|(tag, _)| tag)
                 .collect(),
         };
-        // Only a digest delete cascades, so only its pointing tags can make
-        // the reference count as present.
-        let cascaded: &[Tag] = match reference {
-            Reference::Tag(_) => &[],
-            Reference::Digest(_) => &dropped_tags,
-        };
-        let existed_before = self
-            .manifest_delete_existed_before(resolved_repository, namespace, reference, cascaded)
-            .await;
+        // The replication-dispatch gate, read only when a downstream would
+        // enqueue so the replication-off path pays no extra read. A missing link
+        // still counts as present while a cascaded tag points at it, and a
+        // transient read error counts as present so a real delete is never
+        // suppressed; a racing write flipping this pre-read is safe because
+        // over-dispatch is idempotent.
+        let replicated = resolved_repository.is_some_and(|repository| {
+            repository
+                .replication
+                .iter()
+                .any(|downstream| downstream.enqueues_for(namespace.as_ref()))
+        });
+        let existed_before = replicated
+            && match self
+                .metadata_store
+                .read_link(namespace, &LinkKind::from(reference))
+                .await
+            {
+                Err(Error::NotFound) => {
+                    matches!(reference, Reference::Digest(_)) && !dropped_tags.is_empty()
+                }
+                _ => true,
+            };
         self.check_lww_not_superseded(namespace, &dropped_tags, source_ts, None)
             .await?;
 
@@ -1091,8 +943,20 @@ impl Registry {
                     .await?;
             }
             Reference::Digest(digest) => {
-                self.delete_revision_keys(namespace, digest, subject, &dropped_tags, source_ts)
-                    .await?;
+                // Every tombstone first, then the referrer back-link, and the
+                // revision record last: a tag must never resolve to a manifest
+                // that is already gone. The referenced blobs need no delete:
+                // each per-referrer key goes stale on its own once this revision
+                // is gone, and is the collector's to remove, since a writer-side
+                // delete could unpin a blob a concurrent push is committing.
+                let store = &self.metadata_store;
+                for tag in &dropped_tags {
+                    store.put_tag_tombstone(namespace, tag, source_ts).await?;
+                }
+                if let Some(subject) = subject {
+                    store.delete_referrer(namespace, subject, digest).await?;
+                }
+                store.delete_revision(namespace, digest).await?;
             }
         }
         Ok(existed_before)
@@ -1137,11 +1001,9 @@ impl Registry {
         }))
     }
 
-    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a redirect to it.
-    ///
-    /// Resolves a manifest GET to a presigned redirect or the manifest body,
-    /// then emits `manifest.pull` for the served digest. The redirect fast-path
-    /// needs the caller's consent (a client opts out with
+    /// `GET /v2/<name>/manifests/<reference>`: the manifest or a presigned
+    /// redirect to it, then a `manifest.pull` event for the served digest. The
+    /// redirect needs the caller's consent (a client opts out with
     /// `X-Angos-No-Redirect`) and an authoritative target.
     #[instrument(skip(self, request))]
     pub async fn handle_get_manifest(
@@ -1152,32 +1014,43 @@ impl Registry {
     ) -> Result<ManifestGet, Error> {
         let anonymous = EventActor::default();
         let client = actor.as_ref().unwrap_or(&anonymous);
-        let repository = self.repository_for_namespace(&request.namespace).ok();
+        let repository = self.resolver.resolve(&request.namespace);
         let repository_name = repository_name(repository);
 
-        let response = match repository.filter(|repository| repository.is_pull_through()) {
-            Some(upstream) => {
-                let is_tag_immutable = self.is_reference_immutable(repository, &request.reference);
-                self.get_cached_manifest(
-                    upstream,
-                    &request,
-                    is_tag_immutable,
-                    allow_redirect,
-                    client,
-                )
-                .await?
-            }
-            None => {
-                self.get_hosted_manifest(&request, allow_redirect, client)
+        let GetManifestRequest {
+            namespace,
+            reference,
+            ..
+        } = &request;
+        // A digest cannot move, upstream or not, so its record alone can answer.
+        let redirect = match reference {
+            Reference::Digest(digest) if allow_redirect && self.config.redirect.manifest => {
+                self.try_redirect_via_link(namespace, digest, client)
                     .await?
             }
+            _ => None,
+        };
+        let response = match (redirect, repository.filter(|r| r.is_pull_through())) {
+            (Some(response), _) => response,
+            (None, Some(upstream)) => {
+                let is_tag_immutable = self.is_reference_immutable(repository, reference);
+                self.get_cached_manifest(upstream, &request, is_tag_immutable, client)
+                    .await?
+            }
+            (None, None) => self
+                .get_local_manifest(namespace, reference, client)
+                .await
+                .map_err(|error| hosted_manifest_error(namespace, reference, error))?,
         };
 
-        let event = Event::pull_manifest(
-            &request.namespace,
+        let event = Event::new(
+            EventSubject::ManifestPull {
+                digest: response.digest().clone(),
+                reference: reference.clone(),
+                tag: reference.as_tag().cloned(),
+            },
+            namespace,
             &repository_name,
-            response.digest(),
-            &request.reference,
             actor.as_ref(),
         );
         self.dispatch_events(&[event]).await?;
@@ -1203,19 +1076,15 @@ impl Registry {
             return Ok(());
         }
 
-        let held = match self
+        match self
             .metadata_store
             .read_link(namespace, &LinkKind::Tag(tag.clone()))
             .await
         {
-            Ok(metadata) => metadata.target,
-            Err(Error::NotFound) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if held == *incoming_digest {
-            return Ok(());
+            Ok(held) if held.target != *incoming_digest => Err(immutable_overwrite(tag)),
+            Ok(_) | Err(Error::NotFound) => Ok(()),
+            Err(err) => Err(err),
         }
-        Err(immutable_overwrite(tag))
     }
 
     /// Last-writer-wins gate for a replication-originated write: refuses when
@@ -1271,14 +1140,9 @@ impl Registry {
         Ok(())
     }
 
-    /// What the push may reference, per `policy`: each policy checks that
-    /// `namespace` already owns each newly-referenced digest, the bytes being
-    /// checked once pinned (see [`Self::write_pushed_keys`]): Strict fails the
-    /// push, Permissive and Trusted keep the manifest but withhold the
-    /// ownership-granting link, so the namespace gains no read access to
-    /// content it never pushed. A Trusted push, the pull-through cache fill of
-    /// an upstream the namespace mirrors, also links digests with no stored
-    /// bytes, which its blob reads then fetch from the upstream.
+    /// The referenced digests the push may pin under `policy` (see
+    /// [`ReferencePolicy`]); their bytes are re-checked once pinned, in
+    /// [`Self::write_pushed_keys`].
     async fn enforce_reference_policy(
         &self,
         namespace: &Namespace,
@@ -1314,31 +1178,6 @@ impl Registry {
             }
         }
         Ok(allowed)
-    }
-
-    /// The prior local link for `reference`, read only when an event-enqueuing
-    /// downstream matches `namespace` so the replication-off path pays no extra
-    /// read. Read errors other than `NotFound` are surfaced rather than
-    /// collapsed to "absent", so a backend hiccup never suppresses a real
-    /// change.
-    async fn prior_link_if_replicated(
-        &self,
-        repository: Option<&Repository>,
-        namespace: &Namespace,
-        reference: &Reference,
-    ) -> Option<Result<LinkMetadata, Error>> {
-        let repository = repository?;
-
-        for downstream in &repository.replication {
-            if downstream.enqueues_for(namespace.as_ref()) {
-                return Some(
-                    self.metadata_store
-                        .read_link(namespace, &LinkKind::from(reference))
-                        .await,
-                );
-            }
-        }
-        None
     }
 
     /// Reads the body stream and stores the manifest. `tags` carries the
@@ -1415,7 +1254,7 @@ impl Registry {
         };
         let written = self
             .store_manifest(
-                &StoreManifest {
+                StoreManifest {
                     namespace: &namespace,
                     reference: &reference,
                     content_type: content_type.as_ref(),
@@ -1431,15 +1270,22 @@ impl Registry {
         // No-op suppression: re-dispatching a converged replay would keep a
         // mesh cycle alive, so only a write that changed local state (per
         // the links it moved) is replicated. Webhook events fire unconditionally.
+        // The path tag plus each `?tag=` created tag, so a by-digest push with
+        // tag params converges identically on every replica.
         if written.changed {
-            self.replicate_manifest_push(
-                resolved_repository,
-                &namespace,
-                &reference,
-                &created_tags,
-                &written.digest,
-            )
-            .await;
+            let tags = once(reference.as_tag()).chain(created_tags.iter().map(Some));
+            for tag in tags {
+                self.dispatch_replication(
+                    resolved_repository,
+                    &namespace,
+                    DispatchTarget::Push {
+                        tag,
+                        digest: &written.digest,
+                    },
+                    None,
+                )
+                .await;
+            }
         }
 
         Ok(written)
@@ -1460,28 +1306,6 @@ impl Registry {
             &format!("scan job for {namespace}@{digest}"),
         )
         .await;
-    }
-
-    /// Replicates a push for the path tag plus each `?tag=` created tag, so a
-    /// by-digest push with tag params converges identically on every replica.
-    async fn replicate_manifest_push(
-        &self,
-        repository: Option<&Repository>,
-        namespace: &Namespace,
-        reference: &Reference,
-        created_tags: &[Tag],
-        digest: &Digest,
-    ) {
-        let tags = once(reference.as_tag()).chain(created_tags.iter().map(Some));
-        for tag in tags {
-            self.dispatch_replication(
-                repository,
-                namespace,
-                DispatchTarget::Push { tag, digest },
-                None,
-            )
-            .await;
-        }
     }
 
     /// Fire-and-forget enqueue of replication push/delete jobs, one per matching
@@ -1571,7 +1395,7 @@ mod tests {
     use futures_util::future::join_all;
     use http::StatusCode;
     use http::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use wiremock::matchers::{any, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1591,8 +1415,8 @@ mod tests {
     use crate::registry::test_utils::{
         FSRegistryTestCase, RegistryTestCase, create_test_registry,
         create_test_registry_recording_pulls, create_test_registry_with, drop_links,
-        for_each_backend, get_blob, metadata_store_over, response_body, response_digest,
-        response_header, upload_blob,
+        for_each_backend, get_blob, get_manifest, metadata_store_over, put_manifest_direct,
+        response_body, response_digest, response_header, upload_blob,
     };
     use crate::registry::{Error, Registry};
     use crate::test_fixtures::client::test_client_config;
@@ -1629,54 +1453,16 @@ mod tests {
         "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba";
 
     fn create_raw_test_manifest() -> (Vec<u8>, MediaType) {
-        let manifest = json!({
-            "schemaVersion": 2,
-            "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
-            "config": {
-                "mediaType": CONFIG_MEDIA_TYPE,
-                "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                "size": 1234
-            },
-            "layers": [
-                {
-                    "mediaType": LAYER_MEDIA_TYPE,
-                    "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "size": 5678
-                }
-            ]
-        });
-
-        let content = serde_json::to_vec(&manifest).unwrap();
-        let media_type = MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap();
-        (content, media_type)
-    }
-
-    fn create_raw_test_manifest_with_subject() -> (Vec<u8>, MediaType) {
-        let manifest = json!({
-            "schemaVersion": 2,
-            "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
-            "subject": {
-                "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
-                "digest": MISSING_SUBJECT_DIGEST,
-                "size": 1234
-            },
-            "config": {
-                "mediaType": CONFIG_MEDIA_TYPE,
-                "digest": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                "size": 1234
-            },
-            "layers": [
-                {
-                    "mediaType": LAYER_MEDIA_TYPE,
-                    "digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "size": 5678
-                }
-            ]
-        });
-
-        let content = serde_json::to_vec(&manifest).unwrap();
-        let media_type = MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap();
-        (content, media_type)
+        manifest_with_references(
+            &"sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .parse()
+                .unwrap(),
+            1234,
+            &"sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .parse()
+                .unwrap(),
+            5678,
+        )
     }
 
     fn manifest_with_references(
@@ -1706,36 +1492,15 @@ mod tests {
         (content, MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap())
     }
 
-    fn manifest_with_subject_and_references(
-        config_digest: &Digest,
-        config_size: usize,
-        layer_digest: &Digest,
-        layer_size: usize,
-    ) -> (Vec<u8>, MediaType) {
-        let manifest = json!({
-            "schemaVersion": 2,
+    /// `manifest` as a referrer of the absent `MISSING_SUBJECT_DIGEST`.
+    fn with_subject((content, media_type): (Vec<u8>, MediaType)) -> (Vec<u8>, MediaType) {
+        let mut manifest: Value = serde_json::from_slice(&content).unwrap();
+        manifest["subject"] = json!({
             "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
-            "subject": {
-                "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
-                "digest": MISSING_SUBJECT_DIGEST,
-                "size": 1234
-            },
-            "config": {
-                "mediaType": CONFIG_MEDIA_TYPE,
-                "digest": config_digest,
-                "size": config_size
-            },
-            "layers": [
-                {
-                    "mediaType": LAYER_MEDIA_TYPE,
-                    "digest": layer_digest,
-                    "size": layer_size
-                }
-            ]
+            "digest": MISSING_SUBJECT_DIGEST,
+            "size": 1234
         });
-
-        let content = serde_json::to_vec(&manifest).unwrap();
-        (content, MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap())
+        (serde_json::to_vec(&manifest).unwrap(), media_type)
     }
 
     fn index_manifest_with_child(child_digest: &Digest) -> (Vec<u8>, MediaType) {
@@ -1774,16 +1539,16 @@ mod tests {
         )
     }
 
-    async fn create_test_manifest_with_subject(
+    /// A manifest distinct from [`create_test_manifest`]'s, its blobs uploaded too.
+    async fn create_second_manifest(
         registry: &Registry,
         namespace: &Namespace,
     ) -> (Vec<u8>, MediaType) {
-        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
-        let layer_content = b"test layer content";
+        let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
+        let layer_content = b"a different layer content";
         let config_digest = upload_blob(registry, namespace, config_content).await;
         let layer_digest = upload_blob(registry, namespace, layer_content).await;
-
-        manifest_with_subject_and_references(
+        manifest_with_references(
             &config_digest,
             config_content.len(),
             &layer_digest,
@@ -1798,12 +1563,11 @@ mod tests {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
             let namespace = &Namespace::new("never/configured").unwrap();
-            assert!(registry.repository_for_namespace(namespace).is_err());
+            assert!(registry.repository_for_namespace(namespace).is_none());
 
             let (content, media_type) = create_test_manifest(registry, namespace).await;
             let tag = Reference::Tag(Tag::new("latest").unwrap());
-            registry
-                .put_manifest_direct(namespace, &tag, Some(&media_type), &content)
+            put_manifest_direct(registry, namespace, &tag, Some(&media_type), &content)
                 .await
                 .unwrap();
 
@@ -1823,57 +1587,6 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response_body(stored).await, content);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_put_manifest() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo").unwrap();
-            let tag = "latest";
-            let (content, media_type) = create_test_manifest(registry, namespace).await;
-
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
-
-            let stored_manifest = registry
-                .get_manifest_direct(
-                    registry.repository_for_namespace(namespace).ok(),
-                    &[MediaRange::from(media_type.clone())],
-                    namespace,
-                    Reference::Tag(Tag::new(tag).unwrap()),
-                    false,
-                    &EventActor::default(),
-                )
-                .await
-                .unwrap();
-            let stored_manifest = expect_content(stored_manifest);
-
-            assert_eq!(stored_manifest.bytes, content);
-            assert_eq!(stored_manifest.media_type.unwrap(), media_type);
-            assert_eq!(stored_manifest.digest, response.digest);
-
-            let digest = response.digest.clone();
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Digest(digest.clone()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(response.digest.clone(), digest);
         })
         .await;
     }
@@ -1994,14 +1707,14 @@ mod tests {
             let (content, media_type) =
                 manifest_with_references(&missing_config, 256, &layer_digest, layer_content.len());
 
-            let Err(err) = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
+            let Err(err) = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
             else {
                 panic!("missing config must reject manifest push");
             };
@@ -2016,59 +1729,6 @@ mod tests {
                     .await
                     .is_err()
             );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn put_manifest_rejects_missing_layer_reference() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo/missing-layer").unwrap();
-            let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
-            let config_digest = upload_blob(registry, namespace, config_content).await;
-            let missing_layer = fixed_digest();
-            let (content, media_type) =
-                manifest_with_references(&config_digest, config_content.len(), &missing_layer, 512);
-
-            let Err(err) = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-            else {
-                panic!("missing layer must reject manifest push");
-            };
-
-            assert!(matches!(err, Error::ManifestBlobUnknown));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn put_manifest_rejects_missing_child_manifest_reference() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let namespace = &Namespace::new("test-repo/missing-child").unwrap();
-            let missing_child = fixed_digest();
-            let (content, media_type) = index_manifest_with_child(&missing_child);
-
-            let Err(err) = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-            else {
-                panic!("missing child manifest must reject index push");
-            };
-
-            assert!(matches!(err, Error::ManifestBlobUnknown));
         })
         .await;
     }
@@ -2090,14 +1750,14 @@ mod tests {
                 layer_content.len(),
             );
 
-            let Err(err) = registry
-                .put_manifest_direct(
-                    target_namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
+            let Err(err) = put_manifest_direct(
+                registry,
+                target_namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
             else {
                 panic!("cross-namespace references must reject manifest push");
             };
@@ -2119,16 +1779,15 @@ mod tests {
         }))
         .unwrap();
 
-        let error = case
-            .registry()
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("legacy").unwrap()),
-                Some(&MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap()),
-                &body,
-            )
-            .await
-            .expect_err("a schemaVersion other than 2 must not be stored");
+        let error = put_manifest_direct(
+            case.registry(),
+            &namespace,
+            &Reference::Tag(Tag::new("legacy").unwrap()),
+            Some(&MediaType::new(IMAGE_MANIFEST_MEDIA_TYPE).unwrap()),
+            &body,
+        )
+        .await
+        .expect_err("a schemaVersion other than 2 must not be stored");
 
         let Error::ManifestInvalid(message) = error else {
             panic!("expected ManifestInvalid, got {error:?}");
@@ -2142,17 +1801,17 @@ mod tests {
             let registry = test_case.registry();
             let namespace = &Namespace::new("test-repo/missing-subject").unwrap();
             let (content, media_type) =
-                create_test_manifest_with_subject(registry, namespace).await;
+                with_subject(create_test_manifest(registry, namespace).await);
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .expect("missing subject should not reject manifest push");
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .expect("missing subject should not reject manifest push");
 
             let subject: Digest = MISSING_SUBJECT_DIGEST.parse().unwrap();
             let digest = response.digest.clone();
@@ -2185,37 +1844,21 @@ mod tests {
             permissive_case.metadata_store(),
             false,
         );
-        permissive
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new("latest").unwrap()),
-                    content_type: Some(media_type.clone()),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content.clone()),
-            )
-            .await
-            .expect("permissive registry must accept a missing child manifest reference");
+        push_tag(
+            &permissive,
+            &namespace,
+            "latest",
+            &media_type,
+            &content,
+            None,
+        )
+        .await
+        .expect("permissive registry must accept a missing child manifest reference");
 
         let strict_case = FSRegistryTestCase::new();
         let strict =
             create_test_registry_with(strict_case.blob_store(), strict_case.metadata_store(), true);
-        let Err(err) = strict
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new("latest").unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
+        let Err(err) = push_tag(&strict, &namespace, "latest", &media_type, &content, None).await
         else {
             panic!("strict registry must reject a missing child manifest reference");
         };
@@ -2243,20 +1886,16 @@ mod tests {
             &layer_digest,
             layer_content.len(),
         );
-        permissive
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: attacker.clone(),
-                    reference: Reference::Tag(Tag::new("latest").unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("permissive registry accepts a push referencing unowned blobs");
+        push_tag(
+            &permissive,
+            &attacker,
+            "latest",
+            &media_type,
+            &content,
+            None,
+        )
+        .await
+        .expect("permissive registry accepts a push referencing unowned blobs");
 
         let ownership = permissive.metadata_store.as_ref();
         assert!(ownership.can_read(&owner, &layer_digest).await.unwrap());
@@ -2295,20 +1934,16 @@ mod tests {
 
         let attacker = Namespace::new("test-repo/attacker").unwrap();
         let (content, media_type) = index_manifest_with_child(&child_digest);
-        permissive
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: attacker.clone(),
-                    reference: Reference::Tag(Tag::new("latest").unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("permissive registry accepts an index referencing an unowned child manifest");
+        push_tag(
+            &permissive,
+            &attacker,
+            "latest",
+            &media_type,
+            &content,
+            None,
+        )
+        .await
+        .expect("permissive registry accepts an index referencing an unowned child manifest");
 
         let ownership = permissive.metadata_store.as_ref();
         assert!(ownership.can_read(&owner, &child_digest).await.unwrap());
@@ -2318,128 +1953,65 @@ mod tests {
         );
 
         let repository = permissive.repository_for_namespace(&attacker).unwrap();
-        let outcome = permissive
-            .get_manifest_direct(
-                Some(repository),
-                &[],
-                &attacker,
-                Reference::Digest(child_digest.clone()),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .map(|_| ());
+        let outcome = get_manifest(
+            &permissive,
+            Some(repository),
+            &[],
+            &attacker,
+            Reference::Digest(child_digest.clone()),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .map(|_| ());
         assert!(
             matches!(outcome, Err(Error::ManifestUnknown)),
             "attacker pull of the unowned child manifest must be unknown, got {outcome:?}"
         );
     }
 
-    /// The positive branch: a namespace pushing a manifest that references blobs it
-    /// already owns keeps every reference link, so the manifest and both blobs stay
-    /// pullable.
-    #[tokio::test]
-    async fn permissive_push_of_owned_references_yields_a_pullable_manifest() {
-        let case = FSRegistryTestCase::new();
-        let permissive = create_test_registry_with(case.blob_store(), case.metadata_store(), false);
-
-        let namespace = Namespace::new("test-repo/owner").unwrap();
-        let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
-        let layer_content = b"owned layer bytes";
-        let config_digest = upload_blob(&permissive, &namespace, config_content).await;
-        let layer_digest = upload_blob(&permissive, &namespace, layer_content).await;
-
-        let (content, media_type) = manifest_with_references(
-            &config_digest,
-            config_content.len(),
-            &layer_digest,
-            layer_content.len(),
-        );
-        permissive
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new("latest").unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("permissive registry accepts a push referencing owned blobs");
-
-        let ownership = permissive.metadata_store.as_ref();
-        assert!(
-            ownership
-                .can_read(&namespace, &config_digest)
-                .await
-                .unwrap()
-        );
-        assert!(ownership.can_read(&namespace, &layer_digest).await.unwrap());
-
-        let repository = permissive.repository_for_namespace(&namespace).unwrap();
-        permissive
-            .get_manifest_direct(
-                Some(repository),
-                &[],
-                &namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("the pushed manifest must be pullable by tag");
-        get_blob(
-            &permissive,
-            repository,
-            &[],
-            &namespace,
-            &config_digest,
-            None,
-        )
-        .await
-        .expect("the owned config blob must be pullable");
-        get_blob(
-            &permissive,
-            repository,
-            &[],
-            &namespace,
-            &layer_digest,
-            None,
-        )
-        .await
-        .expect("the owned layer blob must be pullable");
-    }
-
-    async fn pull_through_repository(server: &MockServer) -> Repository {
+    async fn pull_through_repository(server: &MockServer, name: &str) -> Repository {
         let cache = CacheConfig::Memory.to_backend().unwrap();
         let config = RepositoryConfig {
             upstream: vec![test_client_config(server.uri())],
             ..Default::default()
         };
-        Repository::new(
-            "test-repo",
-            &config,
-            &cache,
-            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        )
-        .await
-        .unwrap()
+        Repository::new(name, &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap()
     }
 
     async fn mount_manifest_without_digest_header(
         server: &MockServer,
+        repository: &str,
         reference: &str,
         body: &[u8],
     ) {
         Mock::given(method("GET"))
-            .and(path(format!("/v2/test-repo/manifests/{reference}")))
+            .and(path(format!("/v2/{repository}/manifests/{reference}")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(body)
-                    .insert_header("Content-Type", IMAGE_MANIFEST_MEDIA_TYPE),
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Answers HEADs of `latest` with a digest other than the one cached.
+    async fn mount_moved_latest(server: &MockServer, repository: &str) {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{repository}/manifests/latest")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        DOCKER_CONTENT_DIGEST,
+                        Digest::sha256_of_bytes(b"moved upstream")
+                            .to_string()
+                            .as_str(),
+                    )
+                    .insert_header(CONTENT_LENGTH, "0")
+                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
             )
             .mount(server)
             .await;
@@ -2454,21 +2026,20 @@ mod tests {
         let (content, _) = create_raw_test_manifest();
 
         let upstream = MockServer::start().await;
-        mount_manifest_without_digest_header(&upstream, "latest", &content).await;
-        let repository = pull_through_repository(&upstream).await;
+        mount_manifest_without_digest_header(&upstream, "test-repo", "latest", &content).await;
+        let repository = pull_through_repository(&upstream, "test-repo").await;
 
-        let manifest = case
-            .registry()
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &namespace,
-                Reference::Tag(Tag::new("latest").unwrap()),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("an upstream omitting Docker-Content-Digest must not fail the pull");
+        let manifest = get_manifest(
+            case.registry(),
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &namespace,
+            Reference::Tag(Tag::new("latest").unwrap()),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect("an upstream omitting Docker-Content-Digest must not fail the pull");
         let manifest = expect_content(manifest);
 
         assert_eq!(manifest.bytes, content);
@@ -2499,41 +2070,22 @@ mod tests {
         let accepted = [MediaRange::from(MediaType::docker_manifest())];
 
         let upstream = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{REPOSITORY}/manifests/latest")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(content.clone())
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
+        mount_manifest_without_digest_header(&upstream, REPOSITORY, "latest", &content).await;
 
-        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
-        let repository = Repository::new(
-            REPOSITORY,
-            &RepositoryConfig {
-                upstream: vec![test_client_config(upstream.uri())],
-                ..Default::default()
-            },
-            &cache_backend,
-            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let repository = pull_through_repository(&upstream, REPOSITORY).await;
 
         let pull = async |immutable_tag: bool| {
-            case.registry()
-                .get_manifest_direct(
-                    Some(&repository),
-                    &accepted,
-                    &namespace,
-                    Reference::Tag(Tag::new("latest").unwrap()),
-                    immutable_tag,
-                    &EventActor::default(),
-                )
-                .await
-                .expect("the pull must be served")
+            get_manifest(
+                case.registry(),
+                Some(&repository),
+                &accepted,
+                &namespace,
+                Reference::Tag(Tag::new("latest").unwrap()),
+                immutable_tag,
+                &EventActor::default(),
+            )
+            .await
+            .expect("the pull must be served")
         };
 
         pull(true).await;
@@ -2551,21 +2103,7 @@ mod tests {
         );
 
         // The upstream re-points the tag, so the stored copy no longer answers it.
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{REPOSITORY}/manifests/latest")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        DOCKER_CONTENT_DIGEST,
-                        Digest::sha256_of_bytes(b"moved upstream")
-                            .to_string()
-                            .as_str(),
-                    )
-                    .insert_header(CONTENT_LENGTH, "0")
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
+        mount_moved_latest(&upstream, REPOSITORY).await;
 
         pull(false).await;
         assert_eq!(
@@ -2589,60 +2127,26 @@ mod tests {
         let namespace = Namespace::new(REPOSITORY).unwrap();
         let (content, _) = create_raw_test_manifest();
         let accepted = [MediaRange::from(MediaType::docker_manifest())];
-        let manifest_path = format!("/v2/{REPOSITORY}/manifests/latest");
 
         let upstream = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(manifest_path.as_str()))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(content.clone())
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
-        Mock::given(method("HEAD"))
-            .and(path(manifest_path.as_str()))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        DOCKER_CONTENT_DIGEST,
-                        Digest::sha256_of_bytes(b"moved upstream")
-                            .to_string()
-                            .as_str(),
-                    )
-                    .insert_header(CONTENT_LENGTH, "0")
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
+        mount_manifest_without_digest_header(&upstream, REPOSITORY, "latest", &content).await;
+        mount_moved_latest(&upstream, REPOSITORY).await;
 
-        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
-        let repository = Repository::new(
-            REPOSITORY,
-            &RepositoryConfig {
-                upstream: vec![test_client_config(upstream.uri())],
-                ..Default::default()
-            },
-            &cache_backend,
-            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let repository = pull_through_repository(&upstream, REPOSITORY).await;
         let registry = case.registry();
         let tag = Reference::Tag(Tag::new("latest").unwrap());
         // Cached as an immutable tag, which the upstream is never asked about.
-        registry
-            .get_manifest_direct(
-                Some(&repository),
-                &accepted,
-                &namespace,
-                tag.clone(),
-                true,
-                &EventActor::default(),
-            )
-            .await
-            .unwrap();
+        get_manifest(
+            registry,
+            Some(&repository),
+            &accepted,
+            &namespace,
+            tag.clone(),
+            true,
+            &EventActor::default(),
+        )
+        .await
+        .unwrap();
         let seeded = upstream.received_requests().await.unwrap().len();
 
         registry
@@ -2680,38 +2184,19 @@ mod tests {
         content: &[u8],
     ) -> (MockServer, Repository) {
         let upstream = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{name}/manifests/latest")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(content.to_vec())
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
-        let cache_backend = CacheConfig::Memory.to_backend().unwrap();
-        let repository = Repository::new(
-            name,
-            &RepositoryConfig {
-                upstream: vec![test_client_config(upstream.uri())],
-                ..Default::default()
-            },
-            &cache_backend,
-            DEFAULT_MAX_MANIFEST_SIZE_BYTES,
+        mount_manifest_without_digest_header(&upstream, name, "latest", content).await;
+        let repository = pull_through_repository(&upstream, name).await;
+        get_manifest(
+            registry,
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &Namespace::new(name).unwrap(),
+            latest(),
+            true,
+            &EventActor::default(),
         )
         .await
-        .unwrap();
-        registry
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &Namespace::new(name).unwrap(),
-                latest(),
-                true,
-                &EventActor::default(),
-            )
-            .await
-            .expect("the upstream must fill the cache");
+        .expect("the upstream must fill the cache");
         upstream.reset().await;
         (upstream, repository)
     }
@@ -2732,17 +2217,17 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let manifest = registry
-            .get_manifest_direct(
-                Some(&repository),
-                &accepted,
-                &namespace,
-                latest(),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("a cached tag must be served while the upstream is down");
+        let manifest = get_manifest(
+            registry,
+            Some(&repository),
+            &accepted,
+            &namespace,
+            latest(),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect("a cached tag must be served while the upstream is down");
         assert_eq!(expect_content(manifest).bytes, content);
 
         let head = registry
@@ -2772,36 +2257,23 @@ mod tests {
         let registry = case.registry();
         let (content, _) = create_raw_test_manifest();
         let (upstream, repository) = cache_latest(registry, REPOSITORY, &content).await;
-        Mock::given(method("HEAD"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        DOCKER_CONTENT_DIGEST,
-                        Digest::sha256_of_bytes(b"moved upstream")
-                            .to_string()
-                            .as_str(),
-                    )
-                    .insert_header(CONTENT_LENGTH, "0")
-                    .insert_header(CONTENT_TYPE, IMAGE_MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&upstream)
-            .await;
+        mount_moved_latest(&upstream, REPOSITORY).await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(429))
             .mount(&upstream)
             .await;
 
-        let manifest = registry
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &Namespace::new(REPOSITORY).unwrap(),
-                latest(),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("a refetch the upstream cannot serve must fall back to the cache");
+        let manifest = get_manifest(
+            registry,
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &Namespace::new(REPOSITORY).unwrap(),
+            latest(),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect("a refetch the upstream cannot serve must fall back to the cache");
         assert_eq!(expect_content(manifest).bytes, content);
         assert_eq!(pull_through_count(REPOSITORY, "stale"), 1);
         assert_eq!(pull_through_count(REPOSITORY, "refresh"), 0);
@@ -2820,16 +2292,16 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let result = registry
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &Namespace::new("pull-through-deleted").unwrap(),
-                latest(),
-                false,
-                &EventActor::default(),
-            )
-            .await;
+        let result = get_manifest(
+            registry,
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &Namespace::new("pull-through-deleted").unwrap(),
+            latest(),
+            false,
+            &EventActor::default(),
+        )
+        .await;
         assert!(
             matches!(result, Err(Error::ManifestUnknown)),
             "a tag the upstream deleted must read as unknown, got: {:?}",
@@ -2847,19 +2319,18 @@ mod tests {
             .respond_with(ResponseTemplate::new(502))
             .mount(&upstream)
             .await;
-        let repository = pull_through_repository(&upstream).await;
+        let repository = pull_through_repository(&upstream, "test-repo").await;
 
-        let result = case
-            .registry()
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &Namespace::new("test-repo").unwrap(),
-                latest(),
-                false,
-                &EventActor::default(),
-            )
-            .await;
+        let result = get_manifest(
+            case.registry(),
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &Namespace::new("test-repo").unwrap(),
+            latest(),
+            false,
+            &EventActor::default(),
+        )
+        .await;
         assert!(
             matches!(result, Err(Error::UpstreamUnavailable(_))),
             "an outage with nothing cached must not read as a 404, got: {:?}",
@@ -2877,21 +2348,26 @@ mod tests {
         let requested = Digest::from_bytes(Algorithm::Sha512, &content);
 
         let upstream = MockServer::start().await;
-        mount_manifest_without_digest_header(&upstream, &requested.to_string(), &content).await;
-        let repository = pull_through_repository(&upstream).await;
+        mount_manifest_without_digest_header(
+            &upstream,
+            "test-repo",
+            &requested.to_string(),
+            &content,
+        )
+        .await;
+        let repository = pull_through_repository(&upstream, "test-repo").await;
 
-        let manifest = case
-            .registry()
-            .get_manifest_direct(
-                Some(&repository),
-                &[MediaRange::from(MediaType::docker_manifest())],
-                &namespace,
-                Reference::Digest(requested.clone()),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("a by-digest pull must survive a missing Docker-Content-Digest");
+        let manifest = get_manifest(
+            case.registry(),
+            Some(&repository),
+            &[MediaRange::from(MediaType::docker_manifest())],
+            &namespace,
+            Reference::Digest(requested.clone()),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect("a by-digest pull must survive a missing Docker-Content-Digest");
         let manifest = expect_content(manifest);
 
         assert_eq!(
@@ -2911,16 +2387,15 @@ mod tests {
         let tag = Tag::new("latest").unwrap();
 
         let (content, media_type) = create_test_manifest(case.registry(), namespace).await;
-        let response = case
-            .registry()
-            .put_manifest_direct(
-                namespace,
-                &Reference::Tag(tag.clone()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
+        let response = put_manifest_direct(
+            case.registry(),
+            namespace,
+            &Reference::Tag(tag.clone()),
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .unwrap();
 
         let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
             case.blob_store().object_store().clone(),
@@ -2944,17 +2419,17 @@ mod tests {
             .expect_err("a blob-store fault must abort the delete, not commit a partial cascade");
 
         let repository = case.registry().repository_for_namespace(namespace).unwrap();
-        case.registry()
-            .get_manifest_direct(
-                Some(repository),
-                &[MediaRange::from(media_type)],
-                namespace,
-                Reference::Tag(tag),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect("the aborted delete must leave the tag resolvable");
+        get_manifest(
+            case.registry(),
+            Some(repository),
+            &[MediaRange::from(media_type)],
+            namespace,
+            Reference::Tag(tag),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect("the aborted delete must leave the tag resolvable");
     }
 
     /// A reclaim whose liveness listing missed the push's pins deletes the bytes
@@ -2981,20 +2456,16 @@ mod tests {
         ));
         let registry =
             create_test_registry_with(case.blob_store(), metadata_store_over(hooked), false);
-        let error = registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(tag.clone()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
-            .await
-            .err();
+        let error = push_tag(
+            &registry,
+            &namespace,
+            tag.as_ref(),
+            &media_type,
+            &content,
+            None,
+        )
+        .await
+        .err();
 
         assert!(
             matches!(error, Some(Error::ManifestBlobUnknown)),
@@ -3068,17 +2539,17 @@ mod tests {
         let registry = create_test_registry(case.blob_store(), metadata_store_over(hooked));
         let repository = registry.repository_for_namespace(&namespace).unwrap();
 
-        let error = registry
-            .get_manifest_direct(
-                Some(repository),
-                &[],
-                &namespace,
-                Reference::Tag(tag),
-                false,
-                &EventActor::default(),
-            )
-            .await
-            .expect_err("a failing metadata store must not read as a successful lookup");
+        let error = get_manifest(
+            &registry,
+            Some(repository),
+            &[],
+            &namespace,
+            Reference::Tag(tag),
+            false,
+            &EventActor::default(),
+        )
+        .await
+        .expect_err("a failing metadata store must not read as a successful lookup");
 
         assert!(
             !matches!(error, Error::ManifestUnknown),
@@ -3094,44 +2565,44 @@ mod tests {
             let tag = "latest";
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
 
-            let manifest = registry
-                .get_manifest_direct(
-                    registry.repository_for_namespace(namespace).ok(),
-                    &[MediaRange::from(media_type.clone())],
-                    namespace,
-                    Reference::Tag(Tag::new(tag).unwrap()),
-                    false,
-                    &EventActor::default(),
-                )
-                .await
-                .unwrap();
+            let manifest = get_manifest(
+                registry,
+                registry.repository_for_namespace(namespace),
+                &[MediaRange::from(media_type.clone())],
+                namespace,
+                Reference::Tag(Tag::new(tag).unwrap()),
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .unwrap();
             let manifest = expect_content(manifest);
 
             assert_eq!(manifest.bytes, content);
             assert_eq!(manifest.media_type.unwrap(), media_type);
             assert_eq!(manifest.digest, response.digest.clone());
 
-            let manifest = registry
-                .get_manifest_direct(
-                    registry.repository_for_namespace(namespace).ok(),
-                    &[MediaRange::from(media_type.clone())],
-                    namespace,
-                    Reference::Digest(response.digest.clone()),
-                    false,
-                    &EventActor::default(),
-                )
-                .await
-                .unwrap();
+            let manifest = get_manifest(
+                registry,
+                registry.repository_for_namespace(namespace),
+                &[MediaRange::from(media_type.clone())],
+                namespace,
+                Reference::Digest(response.digest.clone()),
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .unwrap();
             let manifest = expect_content(manifest);
 
             assert_eq!(manifest.bytes, content);
@@ -3149,15 +2620,15 @@ mod tests {
             let tag = "latest";
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
             let pushed_digest = response.digest.clone();
 
             let manifest = registry
@@ -3253,15 +2724,15 @@ mod tests {
             metadata_store_over(hooked),
         );
         let (content, media_type) = create_test_manifest(&registry, namespace).await;
-        registry
-            .put_manifest_direct(
-                namespace,
-                &Reference::Tag(tag_name.clone()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap();
+        put_manifest_direct(
+            &registry,
+            namespace,
+            &Reference::Tag(tag_name.clone()),
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .unwrap();
 
         // Counting stamps rather than entry keys: two stamps by one client inside
         // the same millisecond share a key by design, so a key count cannot tell
@@ -3312,15 +2783,15 @@ mod tests {
             let tag = "latest";
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
 
             registry
                 .remove_manifest(
@@ -3333,17 +2804,17 @@ mod tests {
                 .unwrap();
 
             assert!(
-                registry
-                    .get_manifest_direct(
-                        registry.repository_for_namespace(namespace).ok(),
-                        &[MediaRange::from(media_type.clone())],
-                        namespace,
-                        Reference::Tag(Tag::new(tag).unwrap()),
-                        false,
-                        &EventActor::default(),
-                    )
-                    .await
-                    .is_err()
+                get_manifest(
+                    registry,
+                    registry.repository_for_namespace(namespace),
+                    &[MediaRange::from(media_type.clone())],
+                    namespace,
+                    Reference::Tag(Tag::new(tag).unwrap()),
+                    false,
+                    &EventActor::default(),
+                )
+                .await
+                .is_err()
             );
 
             registry
@@ -3357,75 +2828,17 @@ mod tests {
                 .unwrap();
 
             assert!(
-                registry
-                    .get_manifest_direct(
-                        registry.repository_for_namespace(namespace).ok(),
-                        &[MediaRange::from(media_type.clone())],
-                        namespace,
-                        Reference::Digest(response.digest.clone()),
-                        false,
-                        &EventActor::default(),
-                    )
-                    .await
-                    .is_err()
-            );
-        })
-        .await;
-    }
-
-    /// A digest `delete_manifest` never reclaims bytes: the collector does, once
-    /// every reference is stale, so a concurrent grant from another repository
-    /// can never be stranded (conformance `MANIFEST_BLOB_UNKNOWN`).
-    #[tokio::test]
-    async fn delete_manifest_leaves_bytes_for_the_collector() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let first = &Namespace::new("test-repo/first").unwrap();
-            let second = &Namespace::new("test-repo/second").unwrap();
-
-            let layer_content = b"shared layer content";
-            let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
-            let layer_digest = upload_blob(registry, first, layer_content).await;
-            let config_digest = upload_blob(registry, first, config_content).await;
-            let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
-            let manifest = json!({
-                "schemaVersion": 2,
-                "mediaType": media_type,
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": config_digest.to_string(),
-                    "size": config_content.len()
-                },
-                "layers": [{
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                    "digest": layer_digest.to_string(),
-                    "size": layer_content.len()
-                }]
-            });
-            let manifest_content = serde_json::to_vec(&manifest).unwrap();
-            let response = registry
-                .put_manifest_direct(
-                    first,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &manifest_content,
+                get_manifest(
+                    registry,
+                    registry.repository_for_namespace(namespace),
+                    &[MediaRange::from(media_type.clone())],
+                    namespace,
+                    Reference::Digest(response.digest.clone()),
+                    false,
+                    &EventActor::default(),
                 )
                 .await
-                .unwrap();
-            let digest = response.digest.clone();
-
-            // A second repo holds a reference; the delete must not touch the bytes.
-            let ownership = registry.metadata_store.as_ref();
-            ownership.grant(second, &digest).await.unwrap();
-            let reference = Reference::Digest(digest.clone());
-            registry
-                .remove_manifest(None, None, first, &reference)
-                .await
-                .unwrap();
-
-            assert!(
-                registry.blob_store.read(&digest).await.is_ok(),
-                "the bytes are the collector's to reclaim, never the delete's"
+                .is_err()
             );
         })
         .await;
@@ -3441,16 +2854,16 @@ mod tests {
             let namespace = &Namespace::new("test-repo").unwrap();
 
             let (manifest_content, media_type) = create_test_manifest(registry, namespace).await;
-            let digest = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &manifest_content,
-                )
-                .await
-                .unwrap()
-                .digest;
+            let digest = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap()
+            .digest;
 
             let reference = Reference::Digest(digest.clone());
             registry
@@ -3475,16 +2888,16 @@ mod tests {
                 matches!(revision, Err(Error::NotFound)),
                 "the digest delete must remove the revision record, got: {revision:?}"
             );
-            let resolved = registry
-                .get_manifest_direct(
-                    registry.repository_for_namespace(namespace).ok(),
-                    &[MediaRange::from(media_type.clone())],
-                    namespace,
-                    Reference::Tag(fresh),
-                    false,
-                    &EventActor::default(),
-                )
-                .await;
+            let resolved = get_manifest(
+                registry,
+                registry.repository_for_namespace(namespace),
+                &[MediaRange::from(media_type.clone())],
+                namespace,
+                Reference::Tag(fresh),
+                false,
+                &EventActor::default(),
+            )
+            .await;
             assert!(
                 resolved.is_err(),
                 "a surviving racing tag must read as gone, not serve the deleted manifest"
@@ -3502,34 +2915,22 @@ mod tests {
             let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
             let layer_digest = upload_blob(registry, namespace, layer_content).await;
             let config_digest = upload_blob(registry, namespace, config_content).await;
-            let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
-            let manifest = json!({
-                "schemaVersion": 2,
-                "mediaType": media_type,
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": config_digest,
-                    "size": config_content.len()
-                },
-                "layers": [
-                    {
-                        "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                        "digest": layer_digest,
-                        "size": layer_content.len()
-                    }
-                ]
-            });
-            let manifest_content = serde_json::to_vec(&manifest).unwrap();
+            let (manifest_content, media_type) = manifest_with_references(
+                &config_digest,
+                config_content.len(),
+                &layer_digest,
+                layer_content.len(),
+            );
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &manifest_content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap();
             let manifest_digest = response.digest.clone();
 
             let manifest_blob_result = registry
@@ -3592,7 +2993,7 @@ mod tests {
                 .unwrap();
 
             // Ownership revoked; the stale entries and the bytes wait for the collector.
-            let ownership = registry.metadata_store();
+            let ownership = &registry.metadata_store;
             for digest in [&layer_digest, &config_digest] {
                 let refs = ownership.read_blob_index_namespace(namespace, digest).await;
                 assert!(
@@ -3608,7 +3009,6 @@ mod tests {
     async fn concurrent_same_digest_pushes_keep_upload_ownership() {
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
-        let media_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
         let layer_content = b"shared zot benchmark layer content";
         let config_content = br#"{"architecture":"amd64","os":"linux"}"#;
 
@@ -3619,32 +3019,21 @@ mod tests {
         let pushes = namespaces.iter().map(|namespace| async {
             let layer_digest = upload_blob(registry, namespace, layer_content).await;
             let config_digest = upload_blob(registry, namespace, config_content).await;
-            let manifest = json!({
-                "schemaVersion": 2,
-                "mediaType": media_type,
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": config_digest,
-                    "size": config_content.len()
-                },
-                "layers": [
-                    {
-                        "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                        "digest": layer_digest,
-                        "size": layer_content.len()
-                    }
-                ]
-            });
-            let manifest_content = serde_json::to_vec(&manifest).unwrap();
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    Some(&media_type),
-                    &manifest_content,
-                )
-                .await
-                .unwrap();
+            let (manifest_content, media_type) = manifest_with_references(
+                &config_digest,
+                config_content.len(),
+                &layer_digest,
+                layer_content.len(),
+            );
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                Some(&media_type),
+                &manifest_content,
+            )
+            .await
+            .unwrap();
             (layer_digest, response.digest)
         });
 
@@ -3682,7 +3071,7 @@ mod tests {
             "the config comes first, then the layers in manifest order"
         );
 
-        let (content, _) = create_raw_test_manifest_with_subject();
+        let (content, _) = with_subject(create_raw_test_manifest());
         let manifest = Manifest::from_slice(&content).unwrap();
         assert_eq!(
             referenced_digests(&manifest),
@@ -3700,15 +3089,15 @@ mod tests {
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
         let namespace = &Namespace::new("test-repo").unwrap();
-        let put_err = registry
-            .put_manifest_direct(
-                namespace,
-                &Reference::Tag(Tag::new("latest").unwrap()),
-                None,
-                malformed,
-            )
-            .await
-            .expect_err("expected Err from put_manifest");
+        let put_err = put_manifest_direct(
+            registry,
+            namespace,
+            &Reference::Tag(Tag::new("latest").unwrap()),
+            None,
+            malformed,
+        )
+        .await
+        .expect_err("expected Err from put_manifest");
         match put_err {
             Error::ManifestInvalid(s) => {
                 assert!(
@@ -3728,16 +3117,15 @@ mod tests {
         let wrong_type = MediaType::new("application/vnd.oci.image.manifest.v1+json").unwrap();
         let test_case = FSRegistryTestCase::new();
 
-        let err = test_case
-            .registry()
-            .put_manifest_direct(
-                &Namespace::new("test-repo").unwrap(),
-                &Reference::Tag(Tag::new("latest").unwrap()),
-                Some(&wrong_type),
-                &content,
-            )
-            .await
-            .expect_err("expected error on media type mismatch");
+        let err = put_manifest_direct(
+            test_case.registry(),
+            &Namespace::new("test-repo").unwrap(),
+            &Reference::Tag(Tag::new("latest").unwrap()),
+            Some(&wrong_type),
+            &content,
+        )
+        .await
+        .expect_err("expected error on media type mismatch");
         assert!(
             matches!(err, Error::ManifestInvalid(_)),
             "expected ManifestInvalid for media type mismatch, got: {err:?}"
@@ -3774,23 +3162,6 @@ mod tests {
                 limit: DEFAULT_MAX_MANIFEST_SIZE_BYTES
             }
         ));
-    }
-
-    #[test]
-    fn a_subject_only_manifest_references_nothing() {
-        let body = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "subject": {
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": "sha256:9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba",
-                "size": 512
-            }
-        }))
-        .unwrap();
-
-        let manifest = Manifest::from_slice(&body).expect("subject-only manifest must parse");
-        let digests = referenced_digests(&manifest);
-        assert!(digests.is_empty(), "{digests:?}");
     }
 
     #[test]
@@ -3838,15 +3209,15 @@ mod tests {
             let tag = "latest";
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-            let put_response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
+            let put_response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
 
             let response = registry
                 .handle_get_manifest(
@@ -3910,17 +3281,17 @@ mod tests {
             let repository = registry
                 .repository_for_namespace(namespace)
                 .expect("get repository failed");
-            let stored_manifest = registry
-                .get_manifest_direct(
-                    Some(repository),
-                    &[MediaRange::from(media_type.clone())],
-                    namespace,
-                    Reference::Tag(Tag::new(tag).unwrap()),
-                    false,
-                    &EventActor::default(),
-                )
-                .await
-                .expect("get manifest failed");
+            let stored_manifest = get_manifest(
+                registry,
+                Some(repository),
+                &[MediaRange::from(media_type.clone())],
+                namespace,
+                Reference::Tag(Tag::new(tag).unwrap()),
+                false,
+                &EventActor::default(),
+            )
+            .await
+            .expect("get manifest failed");
             let stored_manifest = expect_content(stored_manifest);
 
             assert_eq!(stored_manifest.bytes, content);
@@ -3937,40 +3308,40 @@ mod tests {
             let namespace = &Namespace::new("test-repo/delete-many-tags").unwrap();
             let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
             let (content_b, media_type_b) =
-                create_test_manifest_with_subject(registry, namespace).await;
+                with_subject(create_test_manifest(registry, namespace).await);
 
-            let response_a = registry
-                .put_manifest_direct(
+            let response_a = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("tag-0").unwrap()),
+                Some(&media_type_a),
+                &content_a,
+            )
+            .await
+            .unwrap();
+
+            for i in 1..20 {
+                put_manifest_direct(
+                    registry,
                     namespace,
-                    &Reference::Tag(Tag::new("tag-0").unwrap()),
+                    &Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
                     Some(&media_type_a),
                     &content_a,
                 )
                 .await
                 .unwrap();
-
-            for i in 1..20 {
-                registry
-                    .put_manifest_direct(
-                        namespace,
-                        &Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
-                        Some(&media_type_a),
-                        &content_a,
-                    )
-                    .await
-                    .unwrap();
             }
 
             for i in 0..20 {
-                registry
-                    .put_manifest_direct(
-                        namespace,
-                        &Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
-                        Some(&media_type_b),
-                        &content_b,
-                    )
-                    .await
-                    .unwrap();
+                put_manifest_direct(
+                    registry,
+                    namespace,
+                    &Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
+                    Some(&media_type_b),
+                    &content_b,
+                )
+                .await
+                .unwrap();
             }
 
             registry
@@ -3987,34 +3358,34 @@ mod tests {
 
             for i in 0..20 {
                 assert!(
-                    registry
-                        .get_manifest_direct(
-                            Some(repository),
-                            &[MediaRange::from(media_type_a.clone())],
-                            namespace,
-                            Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
-                            false,
-                            &EventActor::default(),
-                        )
-                        .await
-                        .is_err(),
+                    get_manifest(
+                        registry,
+                        Some(repository),
+                        &[MediaRange::from(media_type_a.clone())],
+                        namespace,
+                        Reference::Tag(Tag::new(&format!("tag-{i}")).unwrap()),
+                        false,
+                        &EventActor::default(),
+                    )
+                    .await
+                    .is_err(),
                     "tag-{i} should have been deleted"
                 );
             }
 
             for i in 0..20 {
                 assert!(
-                    registry
-                        .get_manifest_direct(
-                            Some(repository),
-                            &[MediaRange::from(media_type_b.clone())],
-                            namespace,
-                            Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
-                            false,
-                            &EventActor::default(),
-                        )
-                        .await
-                        .is_ok(),
+                    get_manifest(
+                        registry,
+                        Some(repository),
+                        &[MediaRange::from(media_type_b.clone())],
+                        namespace,
+                        Reference::Tag(Tag::new(&format!("other-{i}")).unwrap()),
+                        false,
+                        &EventActor::default(),
+                    )
+                    .await
+                    .is_ok(),
                     "other-{i} should still exist"
                 );
             }
@@ -4038,15 +3409,15 @@ mod tests {
             let tag = "latest";
             let (content, media_type) = create_test_manifest(registry, namespace).await;
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new(tag).unwrap()),
-                    Some(&media_type),
-                    &content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new(tag).unwrap()),
+                Some(&media_type),
+                &content,
+            )
+            .await
+            .unwrap();
 
             let digest_link = LinkKind::Digest(response.digest.clone());
             let link_meta = registry
@@ -4077,15 +3448,15 @@ mod tests {
             let namespace = &Namespace::new("test-repo/no-content-type").unwrap();
             let (content, _media_type) = create_test_manifest(registry, namespace).await;
 
-            let response = registry
-                .put_manifest_direct(
-                    namespace,
-                    &Reference::Tag(Tag::new("latest").unwrap()),
-                    None,
-                    &content,
-                )
-                .await
-                .unwrap();
+            let response = put_manifest_direct(
+                registry,
+                namespace,
+                &Reference::Tag(Tag::new("latest").unwrap()),
+                None,
+                &content,
+            )
+            .await
+            .unwrap();
 
             let digest_link = registry
                 .metadata_store
@@ -4122,15 +3493,15 @@ mod tests {
         let (manifest_bytes, media_type) = create_test_manifest(registry, &namespace).await;
         let digest = Digest::sha256_of_bytes(&manifest_bytes);
 
-        registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("v1").unwrap()),
-                Some(&media_type),
-                &manifest_bytes,
-            )
-            .await
-            .expect("split-backend manifest push must succeed");
+        put_manifest_direct(
+            registry,
+            &namespace,
+            &Reference::Tag(Tag::new("v1").unwrap()),
+            Some(&media_type),
+            &manifest_bytes,
+        )
+        .await
+        .expect("split-backend manifest push must succeed");
 
         assert_eq!(
             registry.blob_store.read(&digest).await.unwrap(),
@@ -4167,12 +3538,15 @@ mod tests {
 
     // Receiver-side last-writer-wins (LWW)
 
-    async fn seed_tag(
+    /// A client push of `body` as `tag`, with no `?tag=` params.
+    async fn push_tag(
         registry: &Registry,
         namespace: &Namespace,
         tag: &str,
-    ) -> (Vec<u8>, MediaType) {
-        let (content, media_type) = create_test_manifest(registry, namespace).await;
+        media_type: &MediaType,
+        body: &[u8],
+        source_ts: Option<DateTime<Utc>>,
+    ) -> Result<ManifestWritten, Error> {
         registry
             .handle_put_manifest(
                 None,
@@ -4181,10 +3555,20 @@ mod tests {
                     reference: Reference::Tag(Tag::new(tag).unwrap()),
                     content_type: Some(media_type.clone()),
                     tags: Vec::new(),
-                    source_ts: None,
+                    source_ts,
                 },
-                Cursor::new(content.clone()),
+                Cursor::new(body.to_vec()),
             )
+            .await
+    }
+
+    async fn seed_tag(
+        registry: &Registry,
+        namespace: &Namespace,
+        tag: &str,
+    ) -> (Vec<u8>, MediaType) {
+        let (content, media_type) = create_test_manifest(registry, namespace).await;
+        push_tag(registry, namespace, tag, &media_type, &content, None)
             .await
             .expect("seed tag push");
         (content, media_type)
@@ -4217,20 +3601,16 @@ mod tests {
         // ordinal), so the exact round-trip assertion feeds a ms-precision input.
         let source_ts = (Utc::now() - Duration::hours(3)).trunc_subsecs(3);
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: Some(source_ts),
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("replicated push must store");
+        push_tag(
+            registry,
+            namespace,
+            tag,
+            &media_type,
+            &content,
+            Some(source_ts),
+        )
+        .await
+        .expect("replicated push must store");
 
         assert_eq!(
             local_created_at(registry, namespace, tag).await,
@@ -4248,56 +3628,13 @@ mod tests {
 
         let before = Utc::now();
         let (content, media_type) = create_test_manifest(registry, namespace).await;
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
+        push_tag(registry, namespace, tag, &media_type, &content, None)
             .await
             .expect("client push must store");
 
         assert!(
             local_created_at(registry, namespace, tag).await >= before,
             "a client write (no source_ts) must stamp the local clock"
-        );
-    }
-
-    #[tokio::test]
-    async fn accept_put_manifest_rejects_lww_older_source_ts() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("lww-repo").unwrap();
-        let tag = "latest";
-
-        let (content, media_type) = seed_tag(registry, namespace, tag).await;
-        let created_at = local_created_at(registry, namespace, tag).await;
-        let older = created_at - Duration::seconds(60);
-
-        let result = registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: Some(older),
-                },
-                Cursor::new(content),
-            )
-            .await
-            .err();
-
-        assert!(
-            matches!(result, Some(Error::ReplicationSuperseded(_))),
-            "older source_ts must be superseded by the newer local tag, got: {result:?}"
         );
     }
 
@@ -4312,48 +3649,9 @@ mod tests {
         let created_at = local_created_at(registry, namespace, tag).await;
         let newer = created_at + Duration::seconds(60);
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: Some(newer),
-                },
-                Cursor::new(content),
-            )
+        push_tag(registry, namespace, tag, &media_type, &content, Some(newer))
             .await
             .expect("newer source_ts must win over the older local tag");
-    }
-
-    #[tokio::test]
-    async fn accept_put_manifest_accepts_lww_equal_source_ts() {
-        // Rejecting an equal-timestamp converged replay (a regression to `>=`)
-        // would make two converged nodes bounce 409s.
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("lww-repo").unwrap();
-        let tag = "latest";
-
-        let (content, media_type) = seed_tag(registry, namespace, tag).await;
-        let created_at = local_created_at(registry, namespace, tag).await;
-
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: Some(created_at),
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("equal source_ts must converge (not be superseded)");
     }
 
     /// Two distinct manifests in `namespace`, returned larger digest first.
@@ -4362,17 +3660,7 @@ mod tests {
         namespace: &Namespace,
     ) -> ((Vec<u8>, MediaType), (Vec<u8>, MediaType)) {
         let first = create_test_manifest(registry, namespace).await;
-
-        let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
-        let layer_content = b"a different layer content";
-        let config_digest = upload_blob(registry, namespace, config_content).await;
-        let layer_digest = upload_blob(registry, namespace, layer_content).await;
-        let second = manifest_with_references(
-            &config_digest,
-            config_content.len(),
-            &layer_digest,
-            layer_content.len(),
-        );
+        let second = create_second_manifest(registry, namespace).await;
 
         let first_digest = Digest::sha256_of_bytes(&first.0);
         let second_digest = Digest::sha256_of_bytes(&second.0);
@@ -4396,33 +3684,11 @@ mod tests {
             two_manifests_by_digest_order(registry, namespace).await;
         let ts = Utc::now() - Duration::hours(1);
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(larger_mt),
-                    tags: Vec::new(),
-                    source_ts: Some(ts),
-                },
-                Cursor::new(larger),
-            )
+        push_tag(registry, namespace, tag, &larger_mt, &larger, Some(ts))
             .await
             .expect("seed the larger-digest manifest");
 
-        let result = registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(smaller_mt),
-                    tags: Vec::new(),
-                    source_ts: Some(ts),
-                },
-                Cursor::new(smaller),
-            )
+        let result = push_tag(registry, namespace, tag, &smaller_mt, &smaller, Some(ts))
             .await
             .err();
         assert!(
@@ -4443,33 +3709,11 @@ mod tests {
         let larger_digest = Digest::sha256_of_bytes(&larger);
         let ts = Utc::now() - Duration::hours(1);
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(smaller_mt),
-                    tags: Vec::new(),
-                    source_ts: Some(ts),
-                },
-                Cursor::new(smaller),
-            )
+        push_tag(registry, namespace, tag, &smaller_mt, &smaller, Some(ts))
             .await
             .expect("seed the smaller-digest manifest");
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(larger_mt),
-                    tags: Vec::new(),
-                    source_ts: Some(ts),
-                },
-                Cursor::new(larger),
-            )
+        push_tag(registry, namespace, tag, &larger_mt, &larger, Some(ts))
             .await
             .expect("an equal-timestamp write with a larger digest must win");
 
@@ -4717,60 +3961,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_manifest_reports_changed_from_the_links_it_moved() {
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("test-repo").unwrap();
-        let tag_ref = Reference::Tag(Tag::new("latest").unwrap());
-
-        let (content_a, media_type_a) = create_test_manifest(registry, namespace).await;
-
-        let first = registry
-            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_a), &content_a)
-            .await
-            .expect("fresh tag push");
-        assert!(first.changed, "a fresh tag push must report changed");
-
-        let replay = registry
-            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_a), &content_a)
-            .await
-            .expect("tag re-assert");
-        assert!(
-            !replay.changed,
-            "a tag re-asserted to the same digest must report unchanged"
-        );
-
-        let digest_ref = Reference::Digest(first.digest.clone());
-        let digest_replay = registry
-            .put_manifest_direct(namespace, &digest_ref, Some(&media_type_a), &content_a)
-            .await
-            .expect("digest re-push");
-        assert!(
-            !digest_replay.changed,
-            "re-pushing an already-present revision must report unchanged"
-        );
-
-        let layer_content = b"a different layer content";
-        let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
-        let config_digest = upload_blob(registry, namespace, config_content).await;
-        let layer_digest = upload_blob(registry, namespace, layer_content).await;
-        let (content_b, media_type_b) = manifest_with_references(
-            &config_digest,
-            config_content.len(),
-            &layer_digest,
-            layer_content.len(),
-        );
-        let moved = registry
-            .put_manifest_direct(namespace, &tag_ref, Some(&media_type_b), &content_b)
-            .await
-            .expect("tag move");
-        assert!(
-            moved.changed,
-            "moving the tag to a different digest must report changed"
-        );
-    }
-
-    #[tokio::test]
     async fn accept_put_manifest_accepts_lww_when_local_absent() {
         let test_case = FSRegistryTestCase::new();
         let registry = test_case.registry();
@@ -4780,20 +3970,16 @@ mod tests {
         let (content, media_type) = create_test_manifest(registry, namespace).await;
         let very_old = Utc::now() - Duration::days(3650);
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: Some(very_old),
-                },
-                Cursor::new(content),
-            )
-            .await
-            .expect("absent local tag must accept any source_ts");
+        push_tag(
+            registry,
+            namespace,
+            tag,
+            &media_type,
+            &content,
+            Some(very_old),
+        )
+        .await
+        .expect("absent local tag must accept any source_ts");
     }
 
     #[tokio::test]
@@ -4900,18 +4086,7 @@ mod tests {
         let (content, media_type) = seed_tag(registry, namespace, tag).await;
         let created_at = local_created_at(registry, namespace, tag).await;
 
-        registry
-            .handle_put_manifest(
-                None,
-                PutManifestRequest {
-                    namespace: namespace.clone(),
-                    reference: Reference::Tag(Tag::new(tag).unwrap()),
-                    content_type: Some(media_type),
-                    tags: Vec::new(),
-                    source_ts: None,
-                },
-                Cursor::new(content),
-            )
+        push_tag(registry, namespace, tag, &media_type, &content, None)
             .await
             .expect("idempotent re-push of the same digest");
 
@@ -5045,71 +4220,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_delete_stamped_source_ts_suppressed_when_local_tag_newer_else_proceeds() {
-        // Exercises the prune wire round trip: source_ts is stamped, serialized to
-        // RFC 3339 (the `X-Angos-Source-Timestamp` header), and reparsed before
-        // reaching `remove_manifest`.
-        let test_case = FSRegistryTestCase::new();
-        let registry = test_case.registry();
-        let namespace = &Namespace::new("prune-repo").unwrap();
-        let tag = "stray";
-
-        seed_tag(registry, namespace, tag).await;
-        let created_at = local_created_at(registry, namespace, tag).await;
-
-        // Suppressed: the stamped source_ts predates the local tag.
-        let decided_before = created_at - Duration::seconds(60);
-        let stamped = decided_before.to_rfc3339();
-        let reparsed = DateTime::parse_from_rfc3339(&stamped)
-            .expect("stamped source_ts must be valid RFC 3339")
-            .with_timezone(&Utc);
-
-        let result = registry
-            .remove_manifest(
-                None,
-                Some(reparsed),
-                namespace,
-                &Reference::Tag(Tag::new(tag).unwrap()),
-            )
-            .await
-            .err();
-        assert!(
-            matches!(result, Some(Error::ReplicationSuperseded(_))),
-            "a prune delete must be suppressed when the downstream tag is strictly newer, got: {result:?}"
-        );
-        registry
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
-            .await
-            .expect("a superseded prune delete must preserve the downstream tag");
-
-        // Proceeds: the stamped source_ts is newer than the local tag.
-        let decided_after = created_at + Duration::seconds(60);
-        let stamped = decided_after.to_rfc3339();
-        let reparsed = DateTime::parse_from_rfc3339(&stamped)
-            .expect("stamped source_ts must be valid RFC 3339")
-            .with_timezone(&Utc);
-
-        registry
-            .remove_manifest(
-                None,
-                Some(reparsed),
-                namespace,
-                &Reference::Tag(Tag::new(tag).unwrap()),
-            )
-            .await
-            .expect("a prune delete must proceed when its source_ts is newer than the tag");
-        let result = registry
-            .metadata_store
-            .read_link(namespace, &LinkKind::Tag(Tag::new(tag).unwrap()))
-            .await;
-        assert!(
-            matches!(result, Err(Error::NotFound)),
-            "the downstream tag must be gone after an applied prune delete, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn replication_superseded_maps_to_distinct_oci_code() {
         let superseded: ServerError = Error::ReplicationSuperseded("newer".to_string()).into();
         let conflict: ServerError = Error::Conflict("immutable".to_string()).into();
@@ -5143,15 +4253,17 @@ mod tests {
         use tempfile::TempDir;
 
         use angos_oci::request::PutManifestRequest;
-        use angos_oci::{Digest, MediaType, Namespace, Reference, Tag};
+        use angos_oci::{Digest, Namespace, Reference, Tag};
 
         use crate::jobs::Queue;
         use crate::jobs::store::{ClaimMode, JobStore};
-        use crate::registry::manifest::tests::{create_test_manifest, manifest_with_references};
+        use crate::registry::manifest::tests::{
+            create_second_manifest, create_test_manifest, push_tag,
+        };
         use crate::registry::metadata_store::LinkKind;
         use crate::registry::test_utils::{
             FsTestStack, downstream_client, drop_links, fs_test_stack, repository_with_downstream,
-            single_repo_resolver, sole_pending_payload, upload_blob,
+            single_repo_resolver, sole_pending_payload,
         };
         use crate::registry::{Registry, RegistryConfig};
         use crate::replication::REPLICATION_DELETE_MANIFEST_KIND;
@@ -5200,24 +4312,6 @@ mod tests {
             job_store.complete(claimed).await.unwrap();
         }
 
-        /// A second, distinct manifest, with its blobs pre-uploaded so the push
-        /// validates.
-        async fn create_second_manifest(
-            registry: &Registry,
-            namespace: &Namespace,
-        ) -> (Vec<u8>, MediaType) {
-            let config_content = br#"{"architecture":"arm64","os":"linux"}"#;
-            let layer_content = b"a different layer content";
-            let config_digest = upload_blob(registry, namespace, config_content).await;
-            let layer_digest = upload_blob(registry, namespace, layer_content).await;
-            manifest_with_references(
-                &config_digest,
-                config_content.len(),
-                &layer_digest,
-                layer_content.len(),
-            )
-        }
-
         #[tokio::test]
         async fn tagged_push_dispatches_only_when_tag_moves() {
             let (registry, job_store, _dir) = build_registry();
@@ -5226,18 +4320,7 @@ mod tests {
 
             let (content_a, media_type) = create_test_manifest(&registry, &namespace).await;
 
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type.clone()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content_a.clone()),
-                )
+            push_tag(&registry, &namespace, tag, &media_type, &content_a, None)
                 .await
                 .expect("first tag push");
             assert_eq!(
@@ -5253,18 +4336,7 @@ mod tests {
             // With the queue empty the gate itself, not the dedup index, must
             // suppress the replay. This per-node drop is what terminates mesh
             // cycles without origin tracking.
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type.clone()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content_a.clone()),
-                )
+            push_tag(&registry, &namespace, tag, &media_type, &content_a, None)
                 .await
                 .expect("re-assert same tag->digest");
             assert_eq!(
@@ -5274,18 +4346,7 @@ mod tests {
             );
 
             let (content_b, media_type_b) = create_second_manifest(&registry, &namespace).await;
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type_b),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content_b),
-                )
+            push_tag(&registry, &namespace, tag, &media_type_b, &content_b, None)
                 .await
                 .expect("move tag to a new digest");
             assert_eq!(
@@ -5447,18 +4508,7 @@ mod tests {
             let tag = "latest";
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content),
-                )
+            push_tag(&registry, &namespace, tag, &media_type, &content, None)
                 .await
                 .expect("seed tag push");
             let baseline = pending(&job_store).await;
@@ -5505,18 +4555,7 @@ mod tests {
             let tag = "latest";
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type.clone()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content.clone()),
-                )
+            push_tag(&registry, &namespace, tag, &media_type, &content, None)
                 .await
                 .expect("seed tag push");
             drain_one(&job_store).await;
@@ -5538,18 +4577,7 @@ mod tests {
                 "the first delete must enqueue one job"
             );
 
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content),
-                )
+            push_tag(&registry, &namespace, tag, &media_type, &content, None)
                 .await
                 .expect("re-push tag");
             assert_eq!(
@@ -5588,20 +4616,16 @@ mod tests {
             // Seed via a replicated push so the tag's created_at predates the delete.
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let push_ts = Utc::now() - Duration::hours(2);
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new(tag).unwrap()),
-                        content_type: Some(media_type),
-                        tags: Vec::new(),
-                        source_ts: Some(push_ts),
-                    },
-                    Cursor::new(content),
-                )
-                .await
-                .expect("seed replicated tag push");
+            push_tag(
+                &registry,
+                &namespace,
+                tag,
+                &media_type,
+                &content,
+                Some(push_ts),
+            )
+            .await
+            .expect("seed replicated tag push");
             drain_one(&job_store).await;
 
             let delete_ts = Utc::now() - Duration::hours(1);
@@ -5634,18 +4658,7 @@ mod tests {
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let digest = Digest::sha256_of_bytes(&content);
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new("latest").unwrap()),
-                        content_type: Some(media_type),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content),
-                )
+            push_tag(&registry, &namespace, "latest", &media_type, &content, None)
                 .await
                 .expect("seed tag push");
             drain_one(&job_store).await;
@@ -5680,18 +4693,7 @@ mod tests {
 
             let (content, media_type) = create_test_manifest(&registry, &namespace).await;
             let digest = Digest::sha256_of_bytes(&content);
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(Tag::new("latest").unwrap()),
-                        content_type: Some(media_type),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(content),
-                )
+            push_tag(&registry, &namespace, "latest", &media_type, &content, None)
                 .await
                 .expect("seed tag push");
             drain_one(&job_store).await;
@@ -5725,7 +4727,6 @@ mod tests {
     mod dispatch_replication_tests {
         use std::sync::Arc;
 
-        use chrono::{Duration, Utc};
         use regex::Regex;
         use tempfile::TempDir;
 
@@ -5735,16 +4736,16 @@ mod tests {
         use crate::jobs::store::{ClaimMode, JobStore};
         use crate::metrics_provider::initialize_metrics;
         use crate::registry::manifest::tests::{
-            DispatchTarget, MISSING_SUBJECT_DIGEST, create_test_manifest_with_subject,
+            DispatchTarget, MISSING_SUBJECT_DIGEST, create_test_manifest, with_subject,
         };
         use crate::registry::test_utils::{
-            FsTestStack, downstream_client, fs_test_stack, repository_with_replication,
-            single_repo_resolver, sole_pending_payload,
+            FsTestStack, downstream_client, fs_test_stack, put_manifest_direct,
+            repository_with_replication, single_repo_resolver, sole_pending_payload,
+            test_downstream,
         };
         use crate::registry::{Registry, RegistryConfig, Repository};
         use crate::replication::{
-            REPLICATION_DELETE_MANIFEST_KIND, REPLICATION_PUSH_MANIFEST_KIND,
-            ReplicationDownstream, ReplicationJob, ReplicationMode,
+            REPLICATION_PUSH_MANIFEST_KIND, ReplicationDownstream, ReplicationJob, ReplicationMode,
         };
 
         const REPO: &str = "nginx";
@@ -5761,11 +4762,7 @@ mod tests {
             ReplicationDownstream {
                 mode,
                 namespace_filter,
-                ..ReplicationDownstream::new(
-                    name.to_string(),
-                    downstream_client("https://unused.test"),
-                    4,
-                )
+                ..test_downstream(name.to_string(), downstream_client("https://unused.test"))
             }
         }
 
@@ -5801,21 +4798,14 @@ mod tests {
             build_registry_with(repository_with(ReplicationMode::EventReconcile, Vec::new()))
         }
 
-        /// The payload carries the correct downstream/namespace/tag/digest/kind and
-        /// a populated `source_ts`.
-        #[tokio::test]
-        async fn dispatch_replication_payload_is_well_formed() {
-            initialize_metrics();
-            let (registry, job_store, _dir) = build_registry();
-
+        /// Dispatches a push of `SAMPLE_DIGEST` as `v1` in `NAMESPACE`.
+        async fn dispatch_sample_push(registry: &Registry) {
             let namespace = Namespace::new(NAMESPACE).unwrap();
             let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-            let repository = registry.resolver.resolve(&namespace);
             let tag = Tag::new("v1").unwrap();
             registry
                 .dispatch_replication(
-                    repository,
+                    registry.resolver.resolve(&namespace),
                     &namespace,
                     DispatchTarget::Push {
                         tag: Some(&tag),
@@ -5824,6 +4814,16 @@ mod tests {
                     None,
                 )
                 .await;
+        }
+
+        /// The payload carries the correct downstream/namespace/tag/digest/kind and
+        /// a populated `source_ts`.
+        #[tokio::test]
+        async fn dispatch_replication_payload_is_well_formed() {
+            initialize_metrics();
+            let (registry, job_store, _dir) = build_registry();
+
+            dispatch_sample_push(&registry).await;
 
             let payload = sole_pending_payload(&job_store).await;
             let target = payload.target();
@@ -5855,22 +4855,7 @@ mod tests {
                 ],
             ));
 
-            let namespace = Namespace::new(NAMESPACE).unwrap();
-            let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-            let repository = registry.resolver.resolve(&namespace);
-            let tag = Tag::new("v1").unwrap();
-            registry
-                .dispatch_replication(
-                    repository,
-                    &namespace,
-                    DispatchTarget::Push {
-                        tag: Some(&tag),
-                        digest: &digest,
-                    },
-                    None,
-                )
-                .await;
+            dispatch_sample_push(&registry).await;
 
             let keys = job_store
                 .list_pending(Queue::Replication, 16)
@@ -5903,17 +4888,18 @@ mod tests {
             let (registry, job_store, _dir) = build_registry();
 
             let namespace = Namespace::new(NAMESPACE).unwrap();
-            let (body, media_type) = create_test_manifest_with_subject(&registry, &namespace).await;
-            let referrer = registry
-                .put_manifest_direct(
-                    &namespace,
-                    &Reference::Tag(Tag::new("v1").unwrap()),
-                    Some(&media_type),
-                    &body,
-                )
-                .await
-                .expect("the referrer manifest must push")
-                .digest;
+            let (body, media_type) =
+                with_subject(create_test_manifest(&registry, &namespace).await);
+            let referrer = put_manifest_direct(
+                &registry,
+                &namespace,
+                &Reference::Tag(Tag::new("v1").unwrap()),
+                Some(&media_type),
+                &body,
+            )
+            .await
+            .expect("the referrer manifest must push")
+            .digest;
 
             registry
                 .remove_manifest(None, None, &namespace, &Reference::Digest(referrer))
@@ -5944,59 +4930,13 @@ mod tests {
             );
         }
 
-        /// A caller-provided timestamp (an inbound replicated delete's author
-        /// time) propagates verbatim; a re-stamped `now()` would let the bounced
-        /// delete outrank a recreate authored in between.
-        #[tokio::test]
-        async fn dispatch_replication_uses_provided_source_ts_verbatim() {
-            initialize_metrics();
-            let (registry, job_store, _dir) = build_registry();
-
-            let namespace = Namespace::new(NAMESPACE).unwrap();
-            let author_ts = Utc::now() - Duration::hours(3);
-
-            let repository = registry.resolver.resolve(&namespace);
-            let tag = Tag::new("v1").unwrap();
-            registry
-                .dispatch_replication(
-                    repository,
-                    &namespace,
-                    DispatchTarget::TagDelete { tag: &tag },
-                    Some(author_ts),
-                )
-                .await;
-
-            let payload = sole_pending_payload(&job_store).await;
-            assert_eq!(payload.kind(), REPLICATION_DELETE_MANIFEST_KIND);
-            assert_eq!(
-                payload.target().source_ts,
-                Some(author_ts),
-                "a provided source_ts must propagate verbatim, not be re-stamped"
-            );
-        }
-
         #[tokio::test]
         async fn dispatch_replication_skips_reconcile_only_downstream() {
             initialize_metrics();
             let (registry, job_store, _dir) =
                 build_registry_with(repository_with(ReplicationMode::ReconcileOnly, Vec::new()));
 
-            let namespace = Namespace::new(NAMESPACE).unwrap();
-            let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-            let repository = registry.resolver.resolve(&namespace);
-            let tag = Tag::new("v1").unwrap();
-            registry
-                .dispatch_replication(
-                    repository,
-                    &namespace,
-                    DispatchTarget::Push {
-                        tag: Some(&tag),
-                        digest: &digest,
-                    },
-                    None,
-                )
-                .await;
+            dispatch_sample_push(&registry).await;
 
             assert_eq!(
                 job_store
@@ -6016,22 +4956,7 @@ mod tests {
                 vec![Regex::new("^other/.*").unwrap()],
             ));
 
-            let namespace = Namespace::new(NAMESPACE).unwrap();
-            let digest: Digest = SAMPLE_DIGEST.parse().unwrap();
-
-            let repository = registry.resolver.resolve(&namespace);
-            let tag = Tag::new("v1").unwrap();
-            registry
-                .dispatch_replication(
-                    repository,
-                    &namespace,
-                    DispatchTarget::Push {
-                        tag: Some(&tag),
-                        digest: &digest,
-                    },
-                    None,
-                )
-                .await;
+            dispatch_sample_push(&registry).await;
 
             assert_eq!(
                 job_store
@@ -6140,20 +5065,16 @@ mod tests {
         let namespace = Namespace::new("test-repo/app").unwrap();
         let tag = Tag::new("v1.0.0").unwrap();
 
-        let push = async |body: &'static [u8]| {
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(tag.clone()),
-                        content_type: Some(MediaType::oci_manifest()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(body.to_vec()),
-                )
-                .await
+        let push = async |body: &[u8]| {
+            push_tag(
+                registry,
+                &namespace,
+                tag.as_ref(),
+                &MediaType::oci_manifest(),
+                body,
+                None,
+            )
+            .await
         };
 
         push(RELEASE)
@@ -6225,20 +5146,16 @@ mod tests {
             .unwrap();
         assert!(claimed);
 
-        let push = async |body: &'static [u8]| {
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(tag.clone()),
-                        content_type: Some(MediaType::oci_manifest()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(body.to_vec()),
-                )
-                .await
+        let push = async |body: &[u8]| {
+            push_tag(
+                registry,
+                &namespace,
+                tag.as_ref(),
+                &MediaType::oci_manifest(),
+                body,
+                None,
+            )
+            .await
         };
 
         let result = push(REBUILD).await;
@@ -6261,20 +5178,16 @@ mod tests {
         let namespace = Namespace::new("test-repo/app").unwrap();
         let tag = Tag::new("v1.0.0").unwrap();
 
-        let push = async |tag: &Tag, body: &'static [u8]| {
-            registry
-                .handle_put_manifest(
-                    None,
-                    PutManifestRequest {
-                        namespace: namespace.clone(),
-                        reference: Reference::Tag(tag.clone()),
-                        content_type: Some(MediaType::oci_manifest()),
-                        tags: Vec::new(),
-                        source_ts: None,
-                    },
-                    Cursor::new(body.to_vec()),
-                )
-                .await
+        let push = async |tag: &Tag, body: &[u8]| {
+            push_tag(
+                registry,
+                &namespace,
+                tag.as_ref(),
+                &MediaType::oci_manifest(),
+                body,
+                None,
+            )
+            .await
         };
         let delete = async |tag: &Tag| {
             registry
@@ -6306,41 +5219,5 @@ mod tests {
         push(&stale, REBUILD)
             .await
             .expect("deleting must free a claim no entry backs");
-    }
-
-    /// An excluded tag stays writable while the rest of the repository is frozen.
-    #[tokio::test]
-    async fn an_excluded_tag_remains_writable() {
-        let test_case = FSRegistryTestCase::with_immutable_tags();
-        let registry = test_case.registry();
-        let namespace = Namespace::new("test-repo/app").unwrap();
-
-        let response = registry
-        .handle_put_manifest(
-            None,
-            PutManifestRequest {
-                namespace: namespace.clone(),
-                reference: Reference::Tag(Tag::new("latest").unwrap()),
-                content_type: Some(MediaType::oci_manifest()),
-                tags: Vec::new(),
-                source_ts: None,
-            },
-            Cursor::new(
-                br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#
-                    .to_vec(),
-            ),
-        )
-        .await;
-
-        let response = response
-            .expect("an excluded tag must stay writable")
-            .into_response()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            *response_header(&response, &LOCATION),
-            format!("/v2/{namespace}/manifests/latest"),
-            "the write must be reported at the tag it created"
-        );
     }
 }

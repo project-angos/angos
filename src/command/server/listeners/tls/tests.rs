@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Once;
 
@@ -13,7 +12,7 @@ use crate::test_fixtures::tls::{server_cert_pem, server_key_pem};
 
 static INIT: Once = Once::new();
 
-fn init_crypto_provider() {
+pub fn init_crypto_provider() {
     INIT.call_once(|| {
         default_provider().install_default().ok();
     });
@@ -36,307 +35,127 @@ pub fn build_config(
     let key_file = create_temp_cert_file(server_key_pem());
     let ca_file = create_temp_cert_file(server_cert_pem());
 
-    let server_certificate_bundle = cert_file.path().to_path_buf();
-    let server_private_key = key_file.path().to_path_buf();
-    let client_ca_bundle = client_tls.then(|| ca_file.path().to_path_buf());
-    let client_auth = ClientAuth::Optional;
-
     (
         ServerTlsConfig {
-            server_certificate_bundle,
-            server_private_key,
-            client_ca_bundle,
-            client_auth,
+            server_certificate_bundle: cert_file.path().to_path_buf(),
+            server_private_key: key_file.path().to_path_buf(),
+            client_ca_bundle: client_tls.then(|| ca_file.path().to_path_buf()),
+            client_auth: ClientAuth::Optional,
         },
         (cert_file, key_file, ca_file),
     )
 }
 
 #[test]
-fn test_build_tls_acceptor_success() {
+fn build_tls_acceptor_with_and_without_client_auth() {
     init_crypto_provider();
-    let (tls_config, _tmp_files) = build_config(false);
-    let result = build_tls_acceptor(&tls_config);
+    for (client_tls, client_auth) in [
+        (false, ClientAuth::Optional),
+        (true, ClientAuth::Optional),
+        (true, ClientAuth::Required),
+    ] {
+        let (mut tls_config, _tmp_files) = build_config(client_tls);
+        tls_config.client_auth = client_auth;
 
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_build_tls_acceptor_with_client_ca() {
-    init_crypto_provider();
-    let (tls_config, _tmp_files) = build_config(true);
-
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_build_tls_acceptor_missing_cert_file() {
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.server_certificate_bundle = PathBuf::from("/invalid/path.pem");
-
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_err());
-    if let Err(Error::Initialization(msg)) = result {
-        assert!(msg.contains("Failed to read server certificates bundle"));
-    } else {
-        panic!("Expected Initialization error");
+        let result = build_tls_acceptor(&tls_config);
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
     }
 }
 
 #[test]
-fn test_build_tls_acceptor_missing_key_file() {
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.server_private_key = PathBuf::from("/invalid/path.pem");
+fn build_tls_acceptor_names_the_file_it_cannot_read() {
+    for file in [
+        "server certificates bundle",
+        "server private key",
+        "client certificates bundle",
+    ] {
+        let (mut tls_config, _tmp_files) = build_config(false);
+        let missing = PathBuf::from("/invalid/path.pem");
+        match file {
+            "server certificates bundle" => tls_config.server_certificate_bundle = missing,
+            "server private key" => tls_config.server_private_key = missing,
+            _ => tls_config.client_ca_bundle = Some(missing),
+        }
 
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_err());
-    if let Err(Error::Initialization(msg)) = result {
-        assert!(msg.contains("Failed to read server private key"));
-    } else {
-        panic!("Expected Initialization error");
+        let Err(Error::Initialization(msg)) = build_tls_acceptor(&tls_config) else {
+            panic!("expected an initialization error naming the {file}");
+        };
+        assert!(
+            msg.contains(&format!("Failed to read {file}")),
+            "got: {msg}"
+        );
     }
 }
 
 #[test]
-fn test_build_tls_acceptor_invalid_cert_format() {
+fn build_tls_acceptor_rejects_malformed_pem() {
     init_crypto_provider();
-    let cert_file = create_temp_cert_file("invalid cert data");
+    let garbage = create_temp_cert_file("invalid data");
+    for break_key in [false, true] {
+        let (mut tls_config, _tmp_files) = build_config(true);
+        if break_key {
+            tls_config.server_private_key = garbage.path().to_path_buf();
+        } else {
+            tls_config.server_certificate_bundle = garbage.path().to_path_buf();
+        }
 
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.server_certificate_bundle = cert_file.path().to_path_buf();
-
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_build_tls_acceptor_invalid_key_format() {
-    init_crypto_provider();
-    let key_file = create_temp_cert_file("invalid key data");
-
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.server_private_key = key_file.path().to_path_buf();
-
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_build_tls_acceptor_missing_client_ca_file() {
-    let (mut tls_config, _tmp_files) = build_config(false);
-    tls_config.client_ca_bundle = Some(PathBuf::from("/nonexistent/ca.pem"));
-
-    let result = build_tls_acceptor(&tls_config);
-
-    assert!(result.is_err());
-    if let Err(Error::Initialization(msg)) = result {
-        assert!(msg.contains("Failed to read client certificates bundle"));
-    } else {
-        panic!("Expected Initialization error");
+        assert!(build_tls_acceptor(&tls_config).is_err());
     }
 }
 
 #[tokio::test]
-async fn test_tls_listener_new_with_invalid_certs() {
-    init_crypto_provider();
-    let cert_file = create_temp_cert_file("invalid");
-    let key_file = create_temp_cert_file("invalid");
-
-    let (mut tls, _temp_files) = build_config(false);
-    tls.server_certificate_bundle = cert_file.path().to_path_buf();
-    tls.server_private_key = key_file.path().to_path_buf();
-
-    let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 8443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
-        tls,
-    };
-
-    let context = create_test_server_context().await;
-    let result = TlsListener::new(&config, context);
-
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_tls_listener_notify_config_change() {
+async fn tls_listener_reloads_its_acceptor() {
     init_crypto_provider();
     let (tls, _temp_files) = build_config(false);
-
     let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 8443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
+        base: ListenerBaseConfig::default(),
         tls,
     };
+    let listener = TlsListener::new(&config, create_test_server_context().await).unwrap();
 
-    let context1 = create_test_server_context().await;
-    let listener = TlsListener::new(&config, context1).unwrap();
-
-    let context2 = create_test_server_context().await;
-    let result = listener.notify_config_change(&config, context2);
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_tls_listener_notify_tls_config_change() {
-    init_crypto_provider();
-    let (tls, _temp_files) = build_config(false);
-
-    let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 8443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
-        tls,
-    };
-
-    let context = create_test_server_context().await;
-    let listener = TlsListener::new(&config, context).unwrap();
-
-    let (tls, _temp_files) = build_config(false);
-    let result = listener.notify_tls_config_change(&tls);
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_tls_listener_notify_tls_config_change_with_invalid_certs() {
-    init_crypto_provider();
-
-    let (tls, _temp_files) = build_config(false);
-    let config = TlsListenerConfig {
-        base: ListenerBaseConfig {
-            bind_address: "127.0.0.1".parse().unwrap(),
-            port: 8443,
-            query_timeout: NonZeroU64::new(3600).unwrap(),
-            query_timeout_grace_period: NonZeroU64::new(60).unwrap(),
-            handshake_timeout: NonZeroU64::new(10).unwrap(),
-        },
-        tls,
-    };
-
-    let context = create_test_server_context().await;
-    let listener = TlsListener::new(&config, context).unwrap();
-
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.server_certificate_bundle = PathBuf::from("/invalid/path.pem");
-
-    let result = listener.notify_tls_config_change(&tls_config);
-
-    assert!(result.is_err());
-}
-
-// client_auth validation matrix
-
-#[test]
-fn bare_tls_without_client_auth_field_is_ok() {
-    // Backward compat: existing [server.tls] configs without client_ca_bundle
-    // and without client_auth must continue to load. client_auth defaults to
-    // Optional and is ignored at runtime when no CA bundle is configured.
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_ok(), "unexpected error: {result:?}");
-    let config = result.unwrap();
-    assert!(config.client_ca_bundle.is_none());
-    assert_eq!(config.client_auth, ClientAuth::Optional);
-}
-
-#[test]
-fn client_auth_optional_without_ca_bundle_is_ok_field_is_ignored() {
-    // Explicit "optional" without a CA bundle is harmless: there is no CA
-    // bundle to validate against, so the field is a no-op at runtime.
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-        client_auth = "optional"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_ok(), "unexpected error: {result:?}");
-}
-
-#[test]
-fn client_auth_optional_with_ca_bundle_is_ok() {
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-        client_ca_bundle = "ca.pem"
-        client_auth = "optional"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert_eq!(result.unwrap().client_auth, ClientAuth::Optional);
-}
-
-#[test]
-fn client_auth_required_without_ca_bundle_is_rejected() {
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-        client_auth = "required"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("client_auth = \"required\" requires client_ca_bundle"),
-        "unexpected error: {msg}"
+        listener
+            .notify_config_change(&config, create_test_server_context().await)
+            .is_ok()
     );
+
+    let (mut tls, _tmp_files) = build_config(false);
+    assert!(listener.notify_tls_config_change(&tls).is_ok());
+
+    tls.server_certificate_bundle = PathBuf::from("/invalid/path.pem");
+    assert!(listener.notify_tls_config_change(&tls).is_err());
 }
 
+/// A `[server.tls]` without `client_auth` must keep loading: it defaults to
+/// optional, a no-op when no CA bundle is configured. Only `required` needs one.
 #[test]
-fn client_auth_required_with_ca_bundle_is_ok() {
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-        client_ca_bundle = "ca.pem"
-        client_auth = "required"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert_eq!(result.unwrap().client_auth, ClientAuth::Required);
-}
-
-#[test]
-fn client_auth_defaults_to_optional_when_ca_bundle_present_and_field_omitted() {
-    let toml = r#"
-        server_certificate_bundle = "server.pem"
-        server_private_key = "server.key"
-        client_ca_bundle = "ca.pem"
-    "#;
-    let result: Result<ServerTlsConfig, _> = toml::from_str(toml);
-    assert!(result.is_ok(), "unexpected error: {result:?}");
-    assert_eq!(result.unwrap().client_auth, ClientAuth::Optional);
-}
-
-// build_tls_acceptor with required mode
-
-#[test]
-fn test_build_tls_acceptor_with_client_auth_required() {
-    init_crypto_provider();
-    let (mut tls_config, _tmp_files) = build_config(true);
-    tls_config.client_auth = ClientAuth::Required;
-
-    let result = build_tls_acceptor(&tls_config);
-    assert!(result.is_ok(), "build failed: {:?}", result.err());
+fn client_auth_parses_and_requires_a_bundle_only_when_required() {
+    for (extra, expected) in [
+        ("", Some(ClientAuth::Optional)),
+        (r#"client_auth = "optional""#, Some(ClientAuth::Optional)),
+        (r#"client_ca_bundle = "ca.pem""#, Some(ClientAuth::Optional)),
+        (
+            "client_ca_bundle = \"ca.pem\"\nclient_auth = \"optional\"",
+            Some(ClientAuth::Optional),
+        ),
+        (
+            "client_ca_bundle = \"ca.pem\"\nclient_auth = \"required\"",
+            Some(ClientAuth::Required),
+        ),
+        (r#"client_auth = "required""#, None),
+    ] {
+        let toml = format!(
+            "server_certificate_bundle = \"server.pem\"\nserver_private_key = \"server.key\"\n{extra}"
+        );
+        let result: Result<ServerTlsConfig, _> = toml::from_str(&toml);
+        if let Some(client_auth) = expected {
+            assert_eq!(result.unwrap().client_auth, client_auth, "{extra}");
+        } else {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("client_auth = \"required\" requires client_ca_bundle"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
 }

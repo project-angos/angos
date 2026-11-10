@@ -37,38 +37,34 @@ use angos_oci::response::{ManifestHeadResponse, ManifestResponse, TagsListRespon
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaRange, MediaType, Tag};
 
 use angos_cache::Cache;
-use angos_mtls_client::{BasicAuth, ClientTls, MtlsClientBuilder};
+use angos_mtls_client::{BasicAuth, ClientTls, build_client};
 use angos_secret::Secret;
 
 use crate::auth::token_index_cache_key;
 pub use crate::error::Error;
 pub use crate::write::UploadSession;
 
-/// Classifies a non-success read status: a true 404 maps to `not_found` so
-/// callers can tell a genuinely absent object from a transient probe failure,
-/// a 405 maps to `Unsupported` (the remote rejects the method), and a 416
-/// answers a ranged blob fetch the remote cannot satisfy.
-fn classify_read_failure(status: StatusCode, op: &str, not_found: Error) -> Error {
-    match status {
-        StatusCode::NOT_FOUND => not_found,
-        StatusCode::METHOD_NOT_ALLOWED => Error::Unsupported,
-        StatusCode::RANGE_NOT_SATISFIABLE => Error::RangeNotSatisfiable,
-        _ => Error::Internal(format!("{op}: downstream returned status {status}")),
+/// Only a true 404 maps to `not_found`, so a transient failure never reads as
+/// an absent object.
+fn require_success(response: Response, op: &str, not_found: Error) -> Result<Response, Error> {
+    match response.status() {
+        status if status.is_success() => Ok(response),
+        StatusCode::NOT_FOUND => Err(not_found),
+        StatusCode::METHOD_NOT_ALLOWED => Err(Error::Unsupported),
+        StatusCode::RANGE_NOT_SATISFIABLE => Err(Error::RangeNotSatisfiable),
+        status => Err(Error::Internal(format!(
+            "{op}: downstream returned status {status}"
+        ))),
     }
 }
 
 /// The location without its query string, which on an upload-session URL
 /// carries signed state that must not reach the logs.
 fn without_query(location: &str) -> &str {
-    match location.split_once('?') {
-        Some((base, _)) => base,
-        None => location,
-    }
+    location.split_once('?').map_or(location, |(base, _)| base)
 }
 
-/// A `403` is terminal: the credential is valid and simply lacks the scope, so
-/// no retry can clear it. Applied to the refreshed attempt as well, which is
-/// the normal scope-denied token flow.
+/// A `403` is terminal: the credential is valid but lacks the scope.
 fn denied_if_forbidden(response: &Response) -> Result<(), Error> {
     if response.status() == StatusCode::FORBIDDEN {
         return Err(Error::Denied("Access forbidden".to_string()));
@@ -76,18 +72,13 @@ fn denied_if_forbidden(response: &Response) -> Result<(), Error> {
     Ok(())
 }
 
-/// The media type a manifest answer was served under, `None` when the remote
-/// sent no `Content-Type` or one that is not a media type. Read apart from the
-/// other headers because only this one may carry a parameter section.
+/// Read apart from [`parse_header`] because `Content-Type` may carry parameters.
 fn response_media_type(response: &Response) -> Option<MediaType> {
     let content_type = response.headers().get(CONTENT_TYPE)?.to_str().ok()?;
 
     MediaType::from_content_type(content_type).ok()
 }
 
-/// Reads and parses a required response header, naming it in an `Internal` error
-/// when it is absent or unparseable (a protocol fault, not an unsupported
-/// operation).
 fn parse_header<T: FromStr>(
     response: &Response,
     header: impl AsHeaderName + Display,
@@ -179,14 +170,11 @@ pub struct RegistryClient {
 }
 
 impl RegistryClient {
-    /// Configured basic-auth username, `None` when the client is anonymous.
     /// Scopes cached bearer tokens so clients never share across identities.
     fn auth_username(&self) -> Option<&str> {
         self.basic_auth.as_ref().map(|auth| auth.username.as_str())
     }
 
-    /// A client over the base `url`: `client` carries the resolved
-    /// TLS/redirect/timeout policy and `cache` is the shared token/auth cache.
     #[must_use]
     pub fn new(
         url: String,
@@ -205,10 +193,6 @@ impl RegistryClient {
         }
     }
 
-    /// Builds a registry client from a parsed [`RegistryClientConfig`]; the
-    /// single production construction path for upstreams and replication
-    /// downstreams.
-    ///
     /// # Errors
     ///
     /// Returns [`Error::Initialization`] when the TLS files cannot be loaded or
@@ -220,13 +204,14 @@ impl RegistryClient {
     ) -> Result<Self, Error> {
         // No whole-transfer deadline: a connect bound plus a per-read stall
         // bound so replicating a large blob is not capped by total time.
-        let client = MtlsClientBuilder::new()
-            .with_redirect_policy(Policy::limited(config.max_redirect as usize))
-            .with_connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .with_read_timeout(Duration::from_secs(config.read_timeout_secs))
-            .with_tls(&config.tls)
-            .build()
-            .map_err(Error::Initialization)?;
+        let client = build_client(
+            Client::builder()
+                .redirect(Policy::limited(config.max_redirect as usize))
+                .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+                .read_timeout(Duration::from_secs(config.read_timeout_secs)),
+            &config.tls,
+        )
+        .map_err(Error::Initialization)?;
 
         Ok(Self::new(
             config.url.clone(),
@@ -248,20 +233,19 @@ impl RegistryClient {
 
         Ok(self
             .send_with_auth_retry_capturing(location, |auth| async move {
-                self.send(method, accepted_types, location, auth.as_deref(), range)
+                self.build_request(method, accepted_types, location, auth.as_deref(), range)
+                    .send()
                     .await
+                    .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
             })
             .await?
             .0)
     }
 
-    /// Cached-token-then-single-refresh-retry orchestration for replayable-body
-    /// requests, also returning the auth header which produced the final
-    /// response: a streamed upload `PUT` to a server-assigned session URL
-    /// reuses it, as that URL never issues its own challenge and a consumed
-    /// stream cannot be replayed to refresh a token. `send_once` may run twice
-    /// (cached header, then one refreshed token on `401`), so it must clone any
-    /// captured-by-value request state per attempt.
+    /// Sends with the cached token, then once more with a refreshed one on a
+    /// `401`, returning the auth header that produced the final response: a
+    /// streamed upload `PUT` reuses it, since its session URL never challenges
+    /// and a consumed stream cannot be replayed.
     async fn send_with_auth_retry_capturing<F, Fut>(
         &self,
         location: &str,
@@ -295,15 +279,13 @@ impl RegistryClient {
     }
 
     async fn cached_auth_header(&self, location: &str) -> Option<String> {
-        let url = match Url::parse(location) {
-            Ok(url) => url,
+        match Url::parse(location) {
+            Ok(url) => self.cached_auth_header_for_url(&url).await,
             Err(e) => {
                 warn!("Unable to parse upstream URL for auth cache lookup: {e}");
-                return None;
+                None
             }
-        };
-
-        self.cached_auth_header_for_url(&url).await
+        }
     }
 
     async fn refresh_auth_header(
@@ -353,20 +335,6 @@ impl RegistryClient {
         }
     }
 
-    async fn send(
-        &self,
-        method: &Method,
-        accepted_types: &[MediaRange],
-        location: &str,
-        auth_header: Option<&str>,
-        range: Option<&HeaderValue>,
-    ) -> Result<Response, Error> {
-        self.build_request(method, accepted_types, location, auth_header, range)
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
-    }
-
     fn build_request(
         &self,
         method: &Method,
@@ -388,25 +356,18 @@ impl RegistryClient {
         request
     }
 
-    /// Sends a HEAD request for a blob and returns its digest and size.
-    ///
     /// # Errors
     ///
     /// Returns an error when the upstream request fails, rejects access, omits required
     /// headers, or reports that the blob is unknown.
     pub async fn head_blob(&self, request: HeadBlobRequest) -> Result<(Digest, u64), Error> {
         let location = client::blob_path(&self.url, &request.namespace, &request.digest);
-        let response = self
-            .query(&Method::HEAD, &request.accepted_types, &location, None)
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(classify_read_failure(
-                response.status(),
-                "head_blob",
-                Error::BlobUnknown,
-            ));
-        }
+        let response = require_success(
+            self.query(&Method::HEAD, &request.accepted_types, &location, None)
+                .await?,
+            "head_blob",
+            Error::BlobUnknown,
+        )?;
 
         // A CDN the registry redirects to answers without the digest header;
         // the blob asked for by digest is that digest.
@@ -505,8 +466,6 @@ impl RegistryClient {
         .await
     }
 
-    /// Walks a paginated listing from `location`, accumulating what `parse`
-    /// reads out of each page body. `op` names the listing in errors.
     async fn list_paginated<T, F>(
         &self,
         location: &str,
@@ -560,8 +519,7 @@ impl RegistryClient {
         Ok(items)
     }
 
-    /// Extracts the `Link` rel="next" continuation URL (`<...>; rel="next"`),
-    /// resolved against the response's final URL, or `None` when absent.
+    /// The `Link` rel="next" URL, resolved against the response's final URL.
     fn parse_next_link(response: &Response) -> Option<String> {
         let header = response.headers().get(LINK)?.to_str().ok()?;
         let target = client::next_page_target(header)?;
@@ -592,22 +550,17 @@ impl RegistryClient {
             .map(HeaderValue::try_from)
             .transpose()
             .map_err(|e| Error::Internal(format!("unusable Range header: {e}")))?;
-        let response = self
-            .query(
+        let response = require_success(
+            self.query(
                 &Method::GET,
                 &request.accepted_types,
                 &location,
                 range.as_ref(),
             )
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(classify_read_failure(
-                response.status(),
-                "get_blob",
-                Error::BlobUnknown,
-            ));
-        }
+            .await?,
+            "get_blob",
+            Error::BlobUnknown,
+        )?;
 
         // RFC 9110 lets a server ignore `Range` and answer `200` with the whole
         // blob, so the status is what says which body arrived. A `206` without
@@ -641,17 +594,12 @@ impl RegistryClient {
         request: HeadManifestRequest,
     ) -> Result<ManifestHeadResponse, Error> {
         let location = client::manifest_path(&self.url, &request.namespace, &request.reference);
-        let response = self
-            .query(&Method::HEAD, &request.accepted_types, &location, None)
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(classify_read_failure(
-                response.status(),
-                "head_manifest",
-                Error::ManifestUnknown,
-            ));
-        }
+        let response = require_success(
+            self.query(&Method::HEAD, &request.accepted_types, &location, None)
+                .await?,
+            "head_manifest",
+            Error::ManifestUnknown,
+        )?;
 
         let media_type = response_media_type(&response);
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST).ok();
@@ -678,17 +626,12 @@ impl RegistryClient {
         request: GetManifestRequest,
     ) -> Result<ManifestResponse, Error> {
         let location = client::manifest_path(&self.url, &request.namespace, &request.reference);
-        let response = self
-            .query(&Method::GET, &request.accepted_types, &location, None)
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(classify_read_failure(
-                response.status(),
-                "get_manifest",
-                Error::ManifestUnknown,
-            ));
-        }
+        let response = require_success(
+            self.query(&Method::GET, &request.accepted_types, &location, None)
+                .await?,
+            "get_manifest",
+            Error::ManifestUnknown,
+        )?;
 
         let media_type = response_media_type(&response);
         let digest = parse_header(&response, DOCKER_CONTENT_DIGEST).ok();

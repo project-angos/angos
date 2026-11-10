@@ -1,11 +1,4 @@
-//! S3-compatible storage client.
-//!
-//! This module is the single seam between the rest of the crate and "the
-//! wire": all `reqwest`, `hmac`, `sha2`, `quick_xml` and other HTTP/S3
-//! implementation details live behind `client`, `xml` and `ops`. Anything
-//! exported from this module is intentionally framework-neutral (`Bytes`,
-//! `io::Error`, the storage-level [`Error`] and a handful of plain-data record
-//! types).
+//! S3-compatible storage client. Nothing HTTP- or XML-specific is exported.
 
 use std::future::Future;
 
@@ -29,13 +22,12 @@ pub use crate::ops::UploadedPart;
 
 #[derive(Clone, Debug)]
 pub struct Backend {
-    pub s3_client: S3Client,
-    pub encoded_bucket: String,
-    pub key_prefix: String,
-    pub multipart_copy_threshold: u64,
-    pub multipart_copy_chunk_size: u64,
-    pub multipart_copy_jobs: usize,
-    pub circuit_breaker: CircuitBreaker,
+    s3_client: S3Client,
+    key_prefix: String,
+    multipart_copy_threshold: u64,
+    multipart_copy_chunk_size: u64,
+    multipart_copy_jobs: usize,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl Backend {
@@ -81,7 +73,6 @@ impl Backend {
 
         Ok(Self {
             s3_client,
-            encoded_bucket: client::encode_bucket(&config.bucket),
             key_prefix: config.key_prefix.clone(),
             multipart_copy_threshold: config.multipart_copy_threshold.as_u64(),
             multipart_copy_chunk_size: config.multipart_copy_chunk_size.as_u64(),
@@ -93,16 +84,9 @@ impl Backend {
         })
     }
 
-    /// Run `op` behind the circuit breaker: fail fast while the breaker is
-    /// open, otherwise execute it and feed the outcome back. `NotFound`,
-    /// `PreconditionFailed` and `Rejected` count as success since the backend
-    /// answered; only a transport failure or a 5xx says it is unhealthy, so a
-    /// single denied action cannot cascade into an outage.
-    ///
-    /// # Errors
-    /// Returns [`Error::Io`] when the circuit breaker has tripped on repeated
-    /// upstream failures; otherwise forwards `op`'s error.
-    pub async fn guarded<T>(&self, op: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+    /// `NotFound`, `PreconditionFailed` and `Rejected` count as success since
+    /// the backend answered, so denied actions cannot cascade into an outage.
+    async fn guarded<T>(&self, op: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
         self.circuit_breaker.check()?;
         let result = op.await;
         match &result {
@@ -114,8 +98,7 @@ impl Backend {
         result
     }
 
-    #[must_use]
-    pub fn full_key(&self, path: &str) -> String {
+    fn full_key(&self, path: &str) -> String {
         if self.key_prefix.is_empty() {
             path.to_string()
         } else {
@@ -135,48 +118,26 @@ mod tests {
         config
     }
 
-    #[test]
-    fn test_new_multipart_part_size_too_small() {
-        let result = Backend::new(&test_config(|c| c.multipart_part_size = ByteSize::mib(4)));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    #[test]
-    fn test_new_multipart_part_size_too_large() {
-        let result = Backend::new(&test_config(|c| c.multipart_part_size = ByteSize::gib(6)));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    /// A zero threshold opens the breaker before the first failure, and a zero
+    /// A zero breaker threshold opens before the first failure, and a zero
     /// timeout expires every request: both make the client answer nothing.
     #[test]
-    fn test_new_rejects_a_zero_circuit_breaker_threshold() {
-        let result = Backend::new(&test_config(|c| c.circuit_breaker_threshold = 0));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    #[test]
-    fn test_new_rejects_zero_operation_timeouts() {
-        let result = Backend::new(&test_config(|c| c.operation_timeout_secs = 0));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-        let result = Backend::new(&test_config(|c| c.operation_attempt_timeout_secs = 0));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    #[test]
-    fn test_new_multipart_copy_chunk_size_too_large() {
-        let result = Backend::new(&test_config(|c| {
-            c.multipart_copy_chunk_size = ByteSize::gib(6);
-        }));
-        assert!(matches!(result, Err(Error::Configuration(_))));
-    }
-
-    #[test]
-    fn test_new_multipart_copy_chunk_size_too_small() {
-        let result = Backend::new(&test_config(|c| {
-            c.multipart_copy_chunk_size = ByteSize::mib(4);
-        }));
-        assert!(matches!(result, Err(Error::Configuration(_))));
+    fn test_new_rejects_out_of_range_settings() {
+        let overrides: [fn(&mut BackendConfig); 7] = [
+            |c| c.multipart_part_size = ByteSize::mib(4),
+            |c| c.multipart_part_size = ByteSize::gib(6),
+            |c| c.multipart_copy_chunk_size = ByteSize::mib(4),
+            |c| c.multipart_copy_chunk_size = ByteSize::gib(6),
+            |c| c.circuit_breaker_threshold = 0,
+            |c| c.operation_timeout_secs = 0,
+            |c| c.operation_attempt_timeout_secs = 0,
+        ];
+        for (index, override_config) in overrides.into_iter().enumerate() {
+            let result = Backend::new(&test_config(override_config));
+            assert!(
+                matches!(result, Err(Error::Configuration(_))),
+                "override {index} must be rejected"
+            );
+        }
     }
 
     #[test]

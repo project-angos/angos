@@ -1,6 +1,5 @@
 <script lang="ts">
-	import type { Manifest } from '#lib/api.js';
-	import { fetchBlobJson } from '#lib/api.js';
+	import { fetchBlobJson, type Manifest } from '#lib/api.js';
 	import { parseSarif, SEVERITIES, type ParsedReport, type Severity } from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import LoadingState from './LoadingState.svelte';
@@ -41,8 +40,7 @@
 
 	function toggle(severity: Severity) {
 		const next = new Set(hidden);
-		if (next.has(severity)) next.delete(severity);
-		else next.add(severity);
+		if (!next.delete(severity)) next.add(severity);
 		hidden = next;
 	}
 

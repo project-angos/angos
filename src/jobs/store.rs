@@ -232,35 +232,15 @@ pub struct JobQueueConfig {
     pub retry_backoff_max_ms: u64,
 }
 
-impl JobQueueConfig {
-    #[must_use]
-    pub fn retry_policy(&self) -> JobRetryPolicy {
-        JobRetryPolicy {
-            max_attempts: self.max_attempts,
-            backoff_min_ms: self.retry_backoff_min_ms,
-            backoff_max_ms: self.retry_backoff_max_ms,
-            claim_ttl_secs: self.claim_ttl_secs,
-        }
-    }
-}
-
-/// The retry budget, backoff bounds, and claim-lease TTL a [`JobStore`]
-/// applies, sourced from [`JobQueueConfig`] for the durable queue.
-#[derive(Clone, Copy, Debug)]
-pub struct JobRetryPolicy {
-    pub max_attempts: u32,
-    pub backoff_min_ms: u64,
-    pub backoff_max_ms: u64,
-    pub claim_ttl_secs: u64,
-}
-
-impl Default for JobRetryPolicy {
+impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
-            max_attempts: default_job_max_attempts(),
-            backoff_min_ms: default_retry_backoff_min_ms(),
-            backoff_max_ms: default_retry_backoff_max_ms(),
             claim_ttl_secs: default_claim_ttl_secs(),
+            pending_refresh_interval_secs: default_pending_refresh_interval_secs(),
+            pending_ready_horizon_secs: default_pending_ready_horizon_secs(),
+            max_attempts: default_job_max_attempts(),
+            retry_backoff_min_ms: default_retry_backoff_min_ms(),
+            retry_backoff_max_ms: default_retry_backoff_max_ms(),
         }
     }
 }
@@ -278,7 +258,7 @@ fn default_retry_backoff_max_ms() -> u64 {
 }
 
 fn default_claim_ttl_secs() -> u64 {
-    CLAIM_TTL_SECS
+    60
 }
 
 /// Floor on `claim_ttl_secs`. The holder refreshes at a third of the lease,
@@ -289,7 +269,6 @@ const MIN_CLAIM_TTL_SECS: u64 = 3;
 /// when several server replicas refresh in parallel.
 const MIN_PENDING_REFRESH_INTERVAL_SECS: u64 = 5;
 
-/// Rejects a value below the `MIN` floor.
 fn at_least<'de, D: Deserializer<'de>, const MIN: u64>(deserializer: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(deserializer)?;
     if value < MIN {
@@ -395,16 +374,6 @@ pub fn parse_not_before(storage_key: &str) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(i64::try_from(millis).ok()?)
 }
 
-/// Hex unix-millis prefix marking the upper bound of the ready window: storage
-/// keys comparing lexicographically greater are scheduled past the horizon and
-/// excluded from the gauge count. Keys hold the same millis a `u64` does, so a
-/// horizon too far out to represent saturates into counting all of them.
-fn pending_ready_cutoff_prefix(horizon_secs: u64) -> String {
-    let now_millis = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
-    let millis = horizon_secs.saturating_mul(1000).saturating_add(now_millis);
-    format!("{millis:016x}")
-}
-
 /// On-disk shape of the per-`lock_key` dedup index file, holding the
 /// `storage_key` of the most-recent pending file for that key.
 ///
@@ -416,11 +385,18 @@ pub struct LockKeyIndex {
     pub storage_key: String,
 }
 
-fn serialize_lock_key_index(storage_key: &str) -> Result<Vec<u8>, Error> {
+fn serialize_lock_key_index(storage_key: &str) -> Result<Bytes, Error> {
     serde_json::to_vec(&LockKeyIndex {
         storage_key: storage_key.to_string(),
     })
+    .map(Bytes::from)
     .map_err(|e| Error::Storage(format!("failed to serialize lock-key index: {e}")))
+}
+
+fn envelope_body(envelope: &JobEnvelope) -> Result<Bytes, Error> {
+    serde_json::to_vec(envelope)
+        .map(Bytes::from)
+        .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))
 }
 
 fn parse_lock_key_index(bytes: &[u8]) -> Result<LockKeyIndex, Error> {
@@ -462,10 +438,6 @@ const CLAIM_SPREAD: usize = 64;
 /// refresh tick; read the cap value as "at least this many".
 const MAX_REPORTED_PENDING: u64 = 10_000;
 
-/// Default lease on a claim key, overridden by
-/// `[global.job_queue].claim_ttl_secs`.
-const CLAIM_TTL_SECS: u64 = 60;
-
 /// Advisory-claim settle floor: how long a racing claimant's PUT gets to land
 /// before the verify read decides the winner.
 const ADVISORY_SETTLE_BASE_MS: u64 = 100;
@@ -481,13 +453,21 @@ struct ClaimRecord {
     expires_at: DateTime<Utc>,
 }
 
-/// Pending storage keys a process's claim loops are working on.
-type InFlight = Arc<Mutex<HashSet<String>>>;
+/// A fresh claim record for `instance`: its expiry and the bytes to store.
+fn claim_body(instance: &str, claim_ttl_secs: i64) -> Result<(DateTime<Utc>, Bytes), Error> {
+    let record = ClaimRecord {
+        instance: instance.to_string(),
+        expires_at: Utc::now() + ChronoDuration::seconds(claim_ttl_secs),
+    };
+    let body = serde_json::to_vec(&record)
+        .map_err(|e| Error::Storage(format!("claim serialization failed: {e}")))?;
+    Ok((record.expires_at, Bytes::from(body)))
+}
 
 /// A pending key reserved in [`JobStore::in_flight`] until dropped, so sibling
 /// claim loops skip it without touching the store.
 struct Reservation {
-    in_flight: InFlight,
+    in_flight: Arc<Mutex<HashSet<String>>>,
     storage_key: String,
 }
 
@@ -507,15 +487,13 @@ pub struct JobClaim {
     key: String,
     instance: String,
     lost: CancellationToken,
-    refresher: Option<JoinHandle<()>>,
+    refresher: JoinHandle<()>,
     _reservation: Reservation,
 }
 
 impl Drop for JobClaim {
     fn drop(&mut self) {
-        if let Some(refresher) = self.refresher.take() {
-            refresher.abort();
-        }
+        self.refresher.abort();
     }
 }
 
@@ -533,27 +511,6 @@ impl ClaimedJob {
     /// handler mid-execution.
     pub fn lock_lost(&self) -> CancellationToken {
         self.claim.lost.clone()
-    }
-
-    /// Test-only: a claimed job over a hand-built claim, so runner tests can
-    /// drive the lost-claim branch without a backend.
-    #[cfg(test)]
-    pub fn for_test(envelope: JobEnvelope, storage_key: String, lost: CancellationToken) -> Self {
-        let claim = JobClaim {
-            key: job_claim_path(&envelope.lock_key),
-            instance: String::new(),
-            lost,
-            refresher: None,
-            _reservation: Reservation {
-                in_flight: InFlight::default(),
-                storage_key: storage_key.clone(),
-            },
-        };
-        Self {
-            envelope,
-            storage_key,
-            claim,
-        }
     }
 }
 
@@ -613,12 +570,12 @@ pub struct JobStore {
     claim_ttl_secs: i64,
     /// Without it every local loop walks the same queue head, paying a body
     /// read and a failed claim per job a sibling already holds.
-    in_flight: InFlight,
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl JobStore {
     /// Construct a `JobStore` over the metadata store's backend, which the
-    /// queue always shares, with the default retry policy. `worker_id` is a
+    /// queue always shares, with the default queue tunables. `worker_id` is a
     /// structured-log tag (empty for producer-only instances) and `claim_mode`
     /// comes from [`ensure_claim_support`].
     pub fn new(metadata_store: &MetadataStore, worker_id: &str, claim_mode: ClaimMode) -> Self {
@@ -626,21 +583,22 @@ impl JobStore {
             metadata_store,
             worker_id,
             claim_mode,
-            JobRetryPolicy::default(),
+            &JobQueueConfig::default(),
         )
     }
 
-    /// [`Self::new`] with an operator-configured retry policy.
+    /// [`Self::new`] with the operator-configured retry budget, backoff bounds
+    /// and claim lease.
     pub fn with_retry_policy(
         metadata_store: &MetadataStore,
         worker_id: &str,
         claim_mode: ClaimMode,
-        retry: JobRetryPolicy,
+        retry: &JobQueueConfig,
     ) -> Self {
         let backoff = || {
             Backoff::exponential(
-                Duration::from_millis(retry.backoff_min_ms),
-                Duration::from_millis(retry.backoff_max_ms),
+                Duration::from_millis(retry.retry_backoff_min_ms),
+                Duration::from_millis(retry.retry_backoff_max_ms),
             )
         };
         Self {
@@ -654,7 +612,7 @@ impl JobStore {
             claim_ttl_secs: i64::try_from(retry.claim_ttl_secs)
                 .unwrap_or(i64::MAX)
                 .clamp(1, 86_400),
-            in_flight: InFlight::default(),
+            in_flight: Arc::default(),
         }
     }
 
@@ -745,7 +703,12 @@ impl JobStore {
     /// `[..., now + ready_horizon_secs]`. Capped at `MAX_REPORTED_PENDING`.
     pub async fn count_pending(&self, queue: Queue, ready_horizon_secs: u64) -> Result<u64, Error> {
         let prefix = job_pending_dir(queue.as_str());
-        let cutoff_prefix = pending_ready_cutoff_prefix(ready_horizon_secs);
+        // A horizon too far out to represent saturates into counting every key.
+        let now_millis = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
+        let cutoff_millis = ready_horizon_secs
+            .saturating_mul(1000)
+            .saturating_add(now_millis);
+        let cutoff_prefix = format!("{cutoff_millis:016x}");
         let mut names = self.store.list_in_order(&prefix);
         let mut count: u64 = 0;
         while count < MAX_REPORTED_PENDING
@@ -816,30 +779,6 @@ impl JobStore {
         Ok(false)
     }
 
-    /// Retire the dedup index of a just-claimed job so a same-`lock_key` enqueue
-    /// arriving mid-execution starts a fresh pending file instead of coalescing
-    /// into the running job and dropping its write.
-    ///
-    /// `false` means the index may still point at `storage_key`, so the claim
-    /// must not proceed.
-    async fn retire_claimed_index(
-        &self,
-        queue: Queue,
-        lock_key: &LockKey,
-        storage_key: &str,
-    ) -> bool {
-        match self
-            .cleanup_index_if_ours(queue, lock_key, storage_key)
-            .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(%lock_key, error = %e, "Failed to retire dedup index at claim");
-                false
-            }
-        }
-    }
-
     /// Delete the dedup index when it still points at `storage_key` (or does not
     /// parse). Read-then-delete, so a producer re-pointing the index in the
     /// window loses its entry: a missed dedup, never a lost job, since pending
@@ -899,7 +838,7 @@ impl JobStore {
             key,
             instance,
             lost,
-            refresher: Some(refresher),
+            refresher,
             _reservation: reservation,
         }))
     }
@@ -927,7 +866,14 @@ impl JobStore {
         instance: &str,
     ) -> Result<Option<DateTime<Utc>>, Error> {
         match self.claim_mode {
-            ClaimMode::Atomic => self.put_claim_if_absent(key, instance).await,
+            ClaimMode::Atomic => {
+                let (expires_at, body) = claim_body(instance, self.claim_ttl_secs)?;
+                Ok(self
+                    .store
+                    .create_if_absent(key, body)
+                    .await?
+                    .then_some(expires_at))
+            }
             ClaimMode::Advisory => self.put_claim_advisory(key, instance).await,
         }
     }
@@ -951,7 +897,7 @@ impl JobStore {
             Err(StorageError::NotFound) => {}
             Err(e) => return Err(Error::from(e)),
         }
-        let (_, body) = self.claim_body(instance)?;
+        let (_, body) = claim_body(instance, self.claim_ttl_secs)?;
         self.store.put(key, body).await?;
         sleep(Duration::from_millis(
             ADVISORY_SETTLE_BASE_MS + jitter_below(ADVISORY_SETTLE_JITTER_MS + 1),
@@ -965,29 +911,6 @@ impl JobStore {
             Err(StorageError::NotFound) => Ok(None),
             Err(e) => Err(Error::from(e)),
         }
-    }
-
-    /// Atomically create the claim record; returns its `expires_at` when the
-    /// create won, `None` when the key already exists.
-    async fn put_claim_if_absent(
-        &self,
-        key: &str,
-        instance: &str,
-    ) -> Result<Option<DateTime<Utc>>, Error> {
-        let (expires_at, body) = self.claim_body(instance)?;
-        let created = self.store.create_if_absent(key, body).await?;
-        Ok(created.then_some(expires_at))
-    }
-
-    /// A fresh claim record for `instance`: its expiry and the bytes to store.
-    fn claim_body(&self, instance: &str) -> Result<(DateTime<Utc>, Bytes), Error> {
-        let record = ClaimRecord {
-            instance: instance.to_string(),
-            expires_at: Utc::now() + ChronoDuration::seconds(self.claim_ttl_secs),
-        };
-        let body = serde_json::to_vec(&record)
-            .map_err(|e| Error::Storage(format!("claim serialization failed: {e}")))?;
-        Ok((record.expires_at, Bytes::from(body)))
     }
 
     /// Whether the claim at `key` is safe to take over: its lease lapsed, or
@@ -1018,10 +941,8 @@ impl JobStore {
 
     /// Release a claim the holder still owns; a lost or taken-over claim is
     /// left for its new owner.
-    async fn release_claim(&self, mut claim: JobClaim) {
-        if let Some(refresher) = claim.refresher.take() {
-            refresher.abort();
-        }
+    async fn release_claim(&self, claim: JobClaim) {
+        claim.refresher.abort();
         if claim.lost.is_cancelled() {
             return;
         }
@@ -1067,15 +988,11 @@ impl JobStore {
         let pending_path = job_pending_path(envelope.queue.as_str(), &storage_key);
         let index_path = job_lock_key_index_path(envelope.queue.as_str(), &envelope.lock_key);
 
-        let pending_body = Bytes::from(
-            serde_json::to_vec(&envelope)
-                .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
-        );
-        let index_body = Bytes::from(serialize_lock_key_index(&storage_key)?);
+        let pending_body = envelope_body(&envelope)?;
+        let index_body = serialize_lock_key_index(&storage_key)?;
 
-        let objects = &self.store;
-        let outcome = if objects.create_if_absent(&index_path, index_body).await? {
-            objects
+        let outcome = if self.store.create_if_absent(&index_path, index_body).await? {
+            self.store
                 .create_if_absent(&pending_path, pending_body)
                 .await?;
             "miss"
@@ -1108,21 +1025,32 @@ impl JobStore {
         }
     }
 
-    /// Drop a pending record whose body will not parse: the scan walks keys in
-    /// ascending time order, so leaving it would strand every job queued after
-    /// it. Both queues converge without it, since a cache fill re-enqueues on
-    /// the next pull-through and a replication push on the next write or sweep.
-    async fn discard_poison_pending(&self, queue: Queue, storage_key: &str, reason: &str) {
-        let path = job_pending_path(queue.as_str(), storage_key);
-        match self.store.delete(&path).await {
-            Ok(()) => {
-                warn!("job queue: discarded unreadable pending job '{storage_key}': {reason}");
+    /// A pending envelope to claim, `None` when it is gone or will not parse.
+    /// An unparseable one is dropped: the scan walks keys in ascending time
+    /// order, so leaving it would strand every job queued after it. Both queues
+    /// converge without it, since a cache fill re-enqueues on the next
+    /// pull-through and a replication push on the next write or sweep.
+    async fn read_claimable(
+        &self,
+        queue: Queue,
+        storage_key: &str,
+    ) -> Result<Option<JobEnvelope>, Error> {
+        match self.read_pending(queue, storage_key).await {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(Error::NotFound) => Ok(None),
+            Err(Error::Corrupt(reason)) => {
+                let path = job_pending_path(queue.as_str(), storage_key);
+                match self.store.delete(&path).await {
+                    Ok(()) => warn!(
+                        "job queue: discarded unreadable pending job '{storage_key}': {reason}"
+                    ),
+                    Err(e) => warn!(
+                        "job queue: unreadable pending job '{storage_key}' ({reason}) not deleted: {e}"
+                    ),
+                }
+                Ok(None)
             }
-            Err(e) => {
-                warn!(
-                    "job queue: unreadable pending job '{storage_key}' ({reason}) not deleted: {e}"
-                );
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1148,42 +1076,33 @@ impl JobStore {
             let Some(reservation) = self.reserve(&storage_key) else {
                 continue;
             };
-            let envelope = match self.read_pending(queue, &storage_key).await {
-                Ok(e) => e,
-                Err(Error::NotFound) => continue,
-                Err(Error::Corrupt(e)) => {
-                    self.discard_poison_pending(queue, &storage_key, &e).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let Some(envelope) = self.read_claimable(queue, &storage_key).await? else {
+                continue;
             };
             if let Some(claim) = self.try_claim(&envelope.lock_key, reservation).await? {
                 // Re-read under the claim: another worker may have completed this
                 // job between the first read and the claim, and re-running the
                 // stale envelope could dead-letter a finished job.
-                let envelope = match self.read_pending(queue, &storage_key).await {
-                    Ok(envelope) => envelope,
-                    Err(Error::NotFound) => {
+                let envelope = match self.read_claimable(queue, &storage_key).await {
+                    Ok(Some(envelope)) => envelope,
+                    result => {
                         self.release_claim(claim).await;
+                        result?;
                         continue;
-                    }
-                    Err(Error::Corrupt(e)) => {
-                        self.discard_poison_pending(queue, &storage_key, &e).await;
-                        self.release_claim(claim).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        self.release_claim(claim).await;
-                        return Err(e);
                     }
                 };
                 // Claiming while the index still points here would coalesce every
                 // same-`lock_key` enqueue into this job for the whole execution
                 // and drop its write, so leave the job for the next scan.
-                if !self
-                    .retire_claimed_index(queue, &envelope.lock_key, &storage_key)
+                if let Err(e) = self
+                    .cleanup_index_if_ours(queue, &envelope.lock_key, &storage_key)
                     .await
                 {
+                    warn!(
+                        lock_key = %envelope.lock_key,
+                        error = %e,
+                        "Failed to retire dedup index at claim"
+                    );
                     self.release_claim(claim).await;
                     continue;
                 }
@@ -1251,7 +1170,9 @@ impl JobStore {
     }
 
     /// Record a failure: re-queue with backoff, or dead-letter once the retry
-    /// budget is exhausted.
+    /// budget is exhausted. The retry rewrites the pending file under a new
+    /// storage key encoding the bumped `not_before`, then deletes the old one; a
+    /// crash between the two re-runs the old envelope.
     pub async fn fail(&self, claimed: ClaimedJob, err: &str) -> Result<FailOutcome, Error> {
         let new_attempts = claimed.envelope.attempts.saturating_add(1);
 
@@ -1263,7 +1184,7 @@ impl JobStore {
 
         let ClaimedJob {
             envelope,
-            storage_key,
+            storage_key: old_storage_key,
             claim,
         } = claimed;
         let delay = self.retry_backoff.delay(new_attempts);
@@ -1272,20 +1193,6 @@ impl JobStore {
             attempts: new_attempts,
             ..envelope
         };
-
-        self.fail_retry(claim, updated, storage_key, next_at).await
-    }
-
-    /// Rewrite the pending file under a new storage key encoding the bumped
-    /// `not_before`, then delete the old one; a crash between the two re-runs the
-    /// old envelope, which handler idempotency covers.
-    async fn fail_retry(
-        &self,
-        claim: JobClaim,
-        updated: JobEnvelope,
-        old_storage_key: String,
-        next_at: DateTime<Utc>,
-    ) -> Result<FailOutcome, Error> {
         // A lost claim must not touch queue state the key's new holder now owns.
         if claim.lost.is_cancelled() {
             warn!(
@@ -1299,11 +1206,8 @@ impl JobStore {
         let old_pending_path = job_pending_path(updated.queue.as_str(), &old_storage_key);
         let index_path = job_lock_key_index_path(updated.queue.as_str(), &updated.lock_key);
 
-        let pending_body = Bytes::from(
-            serde_json::to_vec(&updated)
-                .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
-        );
-        let index_body = Bytes::from(serialize_lock_key_index(&new_storage_key)?);
+        let pending_body = envelope_body(&updated)?;
+        let index_body = serialize_lock_key_index(&new_storage_key)?;
 
         let rewrite = async {
             self.store.put(&new_pending_path, pending_body).await?;
@@ -1388,10 +1292,7 @@ impl JobStore {
 
         let new_storage_key = make_storage_key(Utc::now(), &envelope.id);
         let pending_path = job_pending_path(queue.as_str(), &new_storage_key);
-        let pending_body = Bytes::from(
-            serde_json::to_vec(&envelope)
-                .map_err(|e| Error::Storage(format!("envelope serialization failed: {e}")))?,
-        );
+        let pending_body = envelope_body(&envelope)?;
 
         // Pending first, so a crash duplicates into a re-runnable job rather
         // than losing the record.
@@ -1511,18 +1412,14 @@ async fn refresh_claim_loop(
             continue;
         };
         last_verified_expiry = expires_at;
-        let record = ClaimRecord {
-            instance: instance.clone(),
-            expires_at: Utc::now() + ChronoDuration::seconds(claim_ttl_secs),
-        };
-        let Ok(body) = serde_json::to_vec(&record) else {
+        let Ok((expires_at, body)) = claim_body(&instance, claim_ttl_secs) else {
             lost.cancel();
             return;
         };
         // A missed stamp is survivable inside the lease: the next tick retries,
         // and an actual lapse is what `lost` reports.
-        if store.put(&key, Bytes::from(body)).await.is_ok() {
-            last_verified_expiry = record.expires_at;
+        if store.put(&key, body).await.is_ok() {
+            last_verified_expiry = expires_at;
         }
     }
 }
@@ -1594,4 +1491,4 @@ pub async fn queue_depth_refresh_loop(
 
 #[cfg(test)]
 #[path = "store_tests.rs"]
-mod tests;
+pub mod tests;

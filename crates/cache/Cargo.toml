@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 
-[features]
-# Exposes the failure-injecting stub backend to dependents' tests.
-test-util = []
-
 [dependencies]
 angos-secret = { workspace = true }
 redis = { version = "1.8.0", features = ["tokio-comp", "connection-manager"] }

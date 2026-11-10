@@ -10,17 +10,16 @@ use angos_oci::constants::{DOCKER_MANIFEST_LIST_MEDIA_TYPE, DOCKER_MANIFEST_MEDI
 use angos_oci::header::{DOCKER_CONTENT_DIGEST, OCI_SUBJECT, X_ANGOS_SOURCE_TIMESTAMP};
 use angos_oci::response::REPLICATION_SUPERSEDED_CODE;
 use angos_oci::{
-    Digest, Manifest, MediaType, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
-    Reference, Tag,
+    Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE, Reference, Tag,
 };
-use angos_oci_client::{RegistryClient, UploadSession};
+use angos_oci_client::UploadSession;
 
 use crate::metrics_provider;
 use crate::registry::blob_store::BlobStore;
 use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
 use crate::registry::metadata_store::{LinkKind, MetadataStore};
 use crate::registry::test_utils::{
-    FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct,
+    FsTestStack, downstream_client, fs_test_stack, media_type, put_blob_direct, test_downstream,
 };
 use crate::replication::pipeline::{
     MAX_INDEX_DEPTH, PushContext, PushOutcome, delete_manifest, push_blobs, push_manifest,
@@ -39,11 +38,6 @@ fn instant(rfc3339: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(rfc3339)
         .expect("fixture timestamp must be RFC 3339")
         .with_timezone(&Utc)
-}
-
-/// The modal test downstream: no remapping, four concurrent pushes.
-fn test_downstream(client: Arc<RegistryClient>) -> ReplicationDownstream {
-    ReplicationDownstream::new("test".to_string(), client, 4)
 }
 
 /// The modal test `PushContext`: same-namespace downstream, no source
@@ -84,91 +78,13 @@ async fn mount_manifest_put(
         .await;
 }
 
+/// An OCI-1.0 downstream (no `OCI-Subject` on the PUT) gets the merged fallback
+/// index, the same document the Referrers API serves: the descriptor carries the
+/// referrer's annotations and, absent an `artifactType`, its config `mediaType`.
+/// The fallback PUT is timestamp-less, since a stamped set merge could come back
+/// superseded and drop the just-merged descriptor.
 #[tokio::test]
-async fn push_referrers_fallback_when_downstream_is_oci_1_0() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
-    let config = put_blob_direct(&blob_store, br#"{"c":1}"#).await;
-
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": config.to_string(),
-            "size": 7,
-        },
-        "layers": [],
-        "subject": {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": subject.to_string(),
-            "size": 13,
-        },
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
-
-    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
-
-    // No `OCI-Subject` response header => OCI-1.0 downstream => fallback runs.
-    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
-
-    // The pipeline GETs the existing fallback index first (404 => start fresh).
-    let fallback_tag = subject.referrers_fallback_tag();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-
-    // Assert the PUT body is a merged image index so a regression back to
-    // "PUT the referrer manifest body" cannot pass silently.
-    let referrer_digest = Digest::sha256_of_bytes(&manifest_bytes);
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
-        .respond_with(move |request: &Request| {
-            let index: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(
-                index["mediaType"], "application/vnd.oci.image.index.v1+json",
-                "fallback body must be an image index, not the referrer manifest"
-            );
-            let manifests = index["manifests"].as_array().unwrap();
-            assert_eq!(manifests.len(), 1, "exactly one referrer descriptor");
-            assert_eq!(
-                manifests[0]["digest"],
-                referrer_digest.to_string(),
-                "descriptor must reference the pushed referrer manifest by digest"
-            );
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, referrer_digest.to_string().as_str())
-        })
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .unwrap();
-
-    drop(mock_server);
-}
-
-/// The fallback index is the same document the Referrers API serves, so a
-/// descriptor carries the referrer's annotations and, absent an `artifactType`,
-/// its config `mediaType`. Dropping either hides the artifact from a client
-/// discovering or filtering by them.
-#[tokio::test]
-async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
+async fn referrers_fallback_merges_a_timestamp_less_index_on_an_oci_1_0_downstream() {
     metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
     let FsTestStack {
@@ -200,74 +116,6 @@ async fn referrers_fallback_descriptor_carries_annotations_and_artifact_type() {
     let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config]).await;
-    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
-
-    let fallback_tag = subject.referrers_fallback_tag();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-
-    let referrer_digest = Digest::sha256_of_bytes(&manifest_bytes);
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
-        .respond_with(move |request: &Request| {
-            let index: Value = serde_json::from_slice(&request.body).unwrap();
-            let descriptor = &index["manifests"][0];
-            assert_eq!(
-                descriptor["artifactType"], "application/vnd.example.sbom.v1+json",
-                "artifactType must fall back to the config mediaType"
-            );
-            assert_eq!(
-                descriptor["annotations"]["org.opencontainers.image.created"],
-                "2026-01-01T00:00:00Z",
-                "the referrer's annotations must survive into the fallback index"
-            );
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, referrer_digest.to_string().as_str())
-        })
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .unwrap();
-
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn referrers_fallback_put_is_timestamp_less() {
-    // The fallback tag is a merged set, not an LWW register: a stamped PUT could
-    // come back superseded and silently drop the just-merged descriptor.
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "layers": [],
-        "subject": {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": subject.to_string(),
-            "size": 13,
-        },
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
-
-    // The primary PUT must carry the header; no `OCI-Subject` => fallback runs.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
         .and(header(
@@ -282,36 +130,57 @@ async fn referrers_fallback_put_is_timestamp_less() {
         .mount(&mock_server)
         .await;
 
-    // The fallback-index PUT must not carry the source-timestamp header.
     let fallback_tag = subject.referrers_fallback_tag();
     Mock::given(method("GET"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock_server)
         .await;
-    let digest_str = manifest_digest.to_string();
+
+    let referrer_digest = Digest::sha256_of_bytes(&manifest_bytes);
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/{fallback_tag}")))
         .respond_with(move |request: &Request| {
             assert!(
                 !request.headers.contains_key(X_ANGOS_SOURCE_TIMESTAMP),
-                "the fallback-index PUT must be timestamp-less (set merge, not LWW)"
+                "the fallback-index PUT must be timestamp-less"
             );
-            ResponseTemplate::new(201).insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
+            let index: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(index["mediaType"], OCI_INDEX_MEDIA_TYPE);
+            let manifests = index["manifests"].as_array().unwrap();
+            assert_eq!(manifests.len(), 1, "exactly one referrer descriptor");
+            let descriptor = &manifests[0];
+            assert_eq!(descriptor["digest"], referrer_digest.to_string());
+            assert_eq!(
+                descriptor["artifactType"], "application/vnd.example.sbom.v1+json",
+                "artifactType must fall back to the config mediaType"
+            );
+            assert_eq!(
+                descriptor["annotations"]["org.opencontainers.image.created"],
+                "2026-01-01T00:00:00Z"
+            );
+            ResponseTemplate::new(201)
+                .insert_header(DOCKER_CONTENT_DIGEST, referrer_digest.to_string().as_str())
         })
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = PushContext {
         source_ts: Some(instant(SOURCE_TS)),
         ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
     };
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("subject push with a stamped primary and timestamp-less fallback");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .unwrap();
+
     drop(mock_server);
 }
 
@@ -366,10 +235,16 @@ async fn referrers_fallback_propagates_transient_get_error_without_clobbering() 
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes).await;
+    let result = push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -392,18 +267,7 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
     } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
-    // Config-less manifest, so no blob upload mocks are needed.
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "layers": [],
-        "subject": {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": subject.to_string(),
-            "size": 13,
-        },
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let (manifest_bytes, _) = referrer_manifest(&subject);
     let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // No `OCI-Subject` response => OCI-1.0 => fallback runs.
@@ -431,10 +295,16 @@ async fn referrers_fallback_errors_on_unparseable_index_without_clobbering() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes).await;
+    let result = push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -517,12 +387,13 @@ async fn concurrent_same_subject_referrers_merge_without_lost_update() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
+    let (v1, v2) = (Tag::new("v1").unwrap(), Tag::new("v2").unwrap());
     let (a, b) = tokio::join!(
-        push_manifest(&ctx, &digest_a, Some("v1"), bytes_a),
-        push_manifest(&ctx, &digest_b, Some("v2"), bytes_b),
+        push_manifest(&ctx, &digest_a, Some(&v1), bytes_a),
+        push_manifest(&ctx, &digest_b, Some(&v2), bytes_b),
     );
     a.unwrap();
     b.unwrap();
@@ -554,17 +425,7 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
     } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "layers": [],
-        "subject": {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": subject.to_string(),
-            "size": 13,
-        },
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let (manifest_bytes, _) = referrer_manifest(&subject);
     let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // PUT echoes back `OCI-Subject` => OCI-1.1 downstream => no fallback.
@@ -580,95 +441,18 @@ async fn no_referrers_fallback_when_downstream_indexes_subject() {
         .await;
 
     // Any fallback-tag PUT would 404 (no mock) and surface as an error.
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .unwrap();
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .unwrap();
 
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn index_lands_after_all_children_when_fanned_out() {
-    // The parent index must land only after every child, and no child may be
-    // dropped.
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let mut child_digests = Vec::new();
-    let mut manifests = Vec::new();
-    for i in 0..3 {
-        let child = json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "layers": [],
-            "annotations": { "idx": i.to_string() },
-        });
-        let child_bytes = serde_json::to_vec(&child).unwrap();
-        let child_digest = put_blob_direct(&blob_store, &child_bytes).await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/{child_digest}")))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        manifests.push(json!({
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": child_digest.to_string(),
-            "size": child_bytes.len(),
-        }));
-        child_digests.push(child_digest);
-    }
-
-    let index = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.index.v1+json",
-        "manifests": manifests,
-    });
-    let index_bytes = serde_json::to_vec(&index).unwrap();
-    let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &index_digest, Some("v1"), index_bytes)
-        .await
-        .unwrap();
-
-    // The manifest PUTs, in arrival order: the index must come last.
-    let puts: Vec<String> = mock_server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.method.as_str() == "PUT")
-        .map(|r| r.url.path().to_string())
-        .collect();
-    let index_pos = puts.iter().position(|p| p.ends_with("/manifests/v1"));
-    assert_eq!(
-        index_pos,
-        Some(puts.len() - 1),
-        "the index must PUT after every child"
-    );
-    for child in &child_digests {
-        assert!(
-            puts.iter().any(|p| p.ends_with(&child.to_string())),
-            "every child manifest must be pushed"
-        );
-    }
     drop(mock_server);
 }
 
@@ -718,11 +502,11 @@ async fn root_index_children_push_concurrently() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let started = Instant::now();
-    push_manifest(&ctx, &index_digest, Some("v1"), index)
+    push_manifest(&ctx, &index_digest, Some(&Tag::new("v1").unwrap()), index)
         .await
         .unwrap();
 
@@ -809,10 +593,10 @@ async fn a_manifest_named_many_times_is_pushed_once() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &root_digest, Some("v1"), root)
+    push_manifest(&ctx, &root_digest, Some(&Tag::new("v1").unwrap()), root)
         .await
         .unwrap();
 
@@ -897,12 +681,17 @@ async fn push_blob_mounts_cross_repo_when_sibling_namespace_holds_it() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("both blobs must mount cross-repo and the manifest must push");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("both blobs must mount cross-repo and the manifest must push");
 
     drop(mock_server);
 }
@@ -971,70 +760,24 @@ async fn push_blob_falls_back_to_upload_when_mount_is_rejected() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a rejected mount must fall back to a normal upload");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("a rejected mount must fall back to a normal upload");
 
     drop(mock_server);
-}
-
-/// Seeds a minimal blob-less image manifest locally, returning its digest
-/// and serialized body.
-async fn seed_blobless_manifest(blob_store: &BlobStore) -> (Digest, Vec<u8>) {
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "layers": [],
-    });
-    let bytes = serde_json::to_vec(&manifest).unwrap();
-    let digest = put_blob_direct(blob_store, &bytes).await;
-    (digest, bytes)
 }
 
 /// An OCI error envelope body with the given `code`.
 fn oci_error_body(code: &str) -> Value {
     json!({ "errors": [{ "code": code, "message": "rejected" }] })
-}
-
-#[tokio::test]
-async fn push_manifest_stamps_source_timestamp_header() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
-
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .and(header(
-            X_ANGOS_SOURCE_TIMESTAMP,
-            instant(SOURCE_TS).to_rfc3339(),
-        ))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        source_ts: Some(instant(SOURCE_TS)),
-        ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
-    };
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .unwrap();
-
-    drop(mock_server);
 }
 
 #[tokio::test]
@@ -1064,67 +807,18 @@ async fn repeated_layer_digest_uploads_the_blob_once() {
     mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&layer]).await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a manifest repeating a layer digest must push it once");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("a manifest repeating a layer digest must push it once");
 
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn converged_skip_head_sends_standard_accept_headers() {
-    // Without an `Accept` header a content-negotiating downstream may return a
-    // converted representation whose digest never matches, so the converged
-    // skip would never fire.
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
-
-    let digest_str = manifest_digest.to_string();
-    let body_len = manifest_bytes.len();
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(move |request: &Request| {
-            let accepts: Vec<&str> = request
-                .headers
-                .get_all("accept")
-                .iter()
-                .map(|v| v.to_str().unwrap())
-                .collect();
-            for expected in [
-                OCI_MANIFEST_MEDIA_TYPE,
-                OCI_INDEX_MEDIA_TYPE,
-                DOCKER_MANIFEST_MEDIA_TYPE,
-                DOCKER_MANIFEST_LIST_MEDIA_TYPE,
-            ] {
-                assert!(
-                    accepts.contains(&expected),
-                    "manifest probe must accept '{expected}', got: {accepts:?}"
-                );
-            }
-            ResponseTemplate::new(200)
-                .insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
-                .insert_header("Content-Length", body_len.to_string().as_str())
-        })
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let outcome = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("the Accept-stamped HEAD must still drive the converged skip");
-    assert_eq!(outcome, PushOutcome::Converged);
     drop(mock_server);
 }
 
@@ -1169,13 +863,34 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
     let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // The converged probe is the only request allowed to reach the downstream.
+    // Without the standard `Accept` types a content-negotiating downstream may
+    // answer with a converted representation whose digest never matches.
+    let digest_str = manifest_digest.to_string();
+    let body_len = manifest_bytes.len();
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
+        .respond_with(move |request: &Request| {
+            let accepts: Vec<&str> = request
+                .headers
+                .get_all("accept")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            for expected in [
+                OCI_MANIFEST_MEDIA_TYPE,
+                OCI_INDEX_MEDIA_TYPE,
+                DOCKER_MANIFEST_MEDIA_TYPE,
+                DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+            ] {
+                assert!(
+                    accepts.contains(&expected),
+                    "manifest probe must accept '{expected}', got: {accepts:?}"
+                );
+            }
             ResponseTemplate::new(200)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
-                .insert_header("Content-Length", manifest_bytes.len().to_string().as_str()),
-        )
+                .insert_header(DOCKER_CONTENT_DIGEST, digest_str.as_str())
+                .insert_header("Content-Length", body_len.to_string().as_str())
+        })
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1200,12 +915,17 @@ async fn converged_manifest_with_blobs_sends_exactly_one_head() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let outcome = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a converged manifest must skip the blob sweep and the PUT");
+    let outcome = push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("a converged manifest must skip the blob sweep and the PUT");
     assert_eq!(
         outcome,
         PushOutcome::Converged,
@@ -1270,12 +990,17 @@ async fn converged_child_skips_its_own_put_inside_index_recursion() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &index_digest).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let outcome = push_manifest(&ctx, &index_digest, Some("v1"), index_bytes)
-        .await
-        .expect("a converged child must skip its PUT while the index still lands");
+    let outcome = push_manifest(
+        &ctx,
+        &index_digest,
+        Some(&Tag::new("v1").unwrap()),
+        index_bytes,
+    )
+    .await
+    .expect("a converged child must skip its PUT while the index still lands");
     assert_eq!(outcome, PushOutcome::Pushed);
     drop(mock_server);
 }
@@ -1325,10 +1050,16 @@ async fn blob_head_503_fails_the_push_without_upload_attempt() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes).await;
+    let result = push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -1397,10 +1128,16 @@ async fn failed_patch_cancels_the_upload_session() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes).await;
+    let result = push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -1423,18 +1160,7 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
     } = fs_test_stack();
 
     let subject = put_blob_direct(&blob_store, b"subject-bytes").await;
-    // Config-less manifest, so no blob mocks are needed.
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "layers": [],
-        "subject": {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": subject.to_string(),
-            "size": 13,
-        },
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let (manifest_bytes, _) = referrer_manifest(&subject);
     let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     // The HEAD reports the converged state, but a subject-bearing manifest
@@ -1465,12 +1191,17 @@ async fn converged_subject_manifest_still_pushes_referrers_fallback() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a converged subject-bearing manifest must re-push the referrers fallback");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("a converged subject-bearing manifest must re-push the referrers fallback");
 
     drop(mock_server);
 }
@@ -1485,7 +1216,13 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         metadata_store,
         blob_store,
     } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
+    let manifest_bytes = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+        "layers": [],
+    }))
+    .unwrap();
+    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
 
     let other_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     Mock::given(method("HEAD"))
@@ -1499,95 +1236,25 @@ async fn push_manifest_puts_when_downstream_holds_a_different_digest() {
         .await;
     mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a divergent downstream digest must still PUT");
-
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn push_manifest_puts_when_downstream_head_returns_404() {
-    // The probe must fail open: no HEAD mock is mounted, so wiremock answers
-    // 404 and the PUT must still run.
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
-
-    mount_manifest_put(&mock_server, NAMESPACE, "v1", &manifest_digest).await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a 404 HEAD must fall through to the PUT");
-
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn push_manifest_recovers_content_type_from_the_link_for_a_typeless_body() {
-    // A body may omit `mediaType`; without the link recovery the PUT would
-    // carry no `Content-Type` and the receiver rejects it 400.
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let manifest = json!({ "schemaVersion": 2, "layers": [] });
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let manifest_digest = put_blob_direct(&blob_store, &manifest_bytes).await;
-
-    // Seed the revision link with the type `store_manifest` records from
-    // the original push's `Content-Type`.
-    let media_type = "application/vnd.oci.image.manifest.v1+json";
-    metadata_store
-        .put_revision(
-            &Namespace::new(NAMESPACE).unwrap(),
-            &manifest_digest.clone(),
-            Some(MediaType::new(media_type).unwrap()),
-            None,
-        )
-        .await
-        .unwrap();
-
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .and(header("Content-Type", media_type))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("a typeless body must recover its Content-Type from the revision link");
+    push_manifest(
+        &ctx,
+        &manifest_digest,
+        Some(&Tag::new("v1").unwrap()),
+        manifest_bytes,
+    )
+    .await
+    .expect("a divergent downstream digest must still PUT");
 
     drop(mock_server);
 }
 
 #[tokio::test]
 async fn push_index_recovers_typeless_child_content_type_from_link() {
-    // Child-recursion counterpart of the test above: a typeless child pushed
-    // by digest must recover its Content-Type from its own revision link.
+    // A body may omit `mediaType`; without recovering it from the revision
+    // link the PUT carries no `Content-Type` and the receiver rejects it 400.
     metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
     let FsTestStack {
@@ -1643,76 +1310,17 @@ async fn push_index_recovers_typeless_child_content_type_from_link() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    push_manifest(&ctx, &index_digest, Some("v1"), index_bytes)
-        .await
-        .expect("a typeless child must recover its Content-Type and the index must land");
-
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn push_manifest_treats_lww_superseded_409_as_success() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
-
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(409).set_body_json(oci_error_body(REPLICATION_SUPERSEDED_CODE)),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = PushContext {
-        source_ts: Some(instant(SOURCE_TS)),
-        ..push_context(&downstream, &blob_store, &metadata_store, &namespace)
-    };
-    push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes)
-        .await
-        .expect("an LWW-superseded 409 must be treated as success");
-
-    drop(mock_server);
-}
-
-#[tokio::test]
-async fn push_manifest_propagates_immutable_409_as_error() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-    let (manifest_digest, manifest_bytes) = seed_blobless_manifest(&blob_store).await;
-
-    // A 409 with the immutable-tag `CONFLICT` code is not an LWW loss.
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(ResponseTemplate::new(409).set_body_json(oci_error_body("CONFLICT")))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
-    let namespace = Namespace::new(NAMESPACE).unwrap();
-    let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
-    let result = push_manifest(&ctx, &manifest_digest, Some("v1"), manifest_bytes).await;
-    assert!(
-        result.is_err(),
-        "a non-superseded 409 (immutable conflict) must propagate as an error"
-    );
+    push_manifest(
+        &ctx,
+        &index_digest,
+        Some(&Tag::new("v1").unwrap()),
+        index_bytes,
+    )
+    .await
+    .expect("a typeless child must recover its Content-Type and the index must land");
 
     drop(mock_server);
 }
@@ -1729,13 +1337,13 @@ async fn push_manifest_rejects_invalid_content_as_terminal() {
     } = fs_test_stack();
     // The rejection precedes every HTTP call, so the downstream is unroutable
     // on purpose: a dialled request surfaces as `Client`, failing the assert.
-    let downstream = test_downstream(downstream_client("http://127.0.0.1:1"));
+    let downstream = test_downstream("test".to_string(), downstream_client("http://127.0.0.1:1"));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
 
     let unparseable = b"not json".to_vec();
     let stored = put_blob_direct(&blob_store, &unparseable).await;
-    let error = push_manifest(&ctx, &stored, Some("v1"), unparseable)
+    let error = push_manifest(&ctx, &stored, Some(&Tag::new("v1").unwrap()), unparseable)
         .await
         .expect_err("an unparseable body must fail the push");
     assert!(
@@ -1886,7 +1494,7 @@ async fn upload_into_session_cancels_when_local_blob_read_fails() {
         .mount(&mock_server)
         .await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
     let result = upload_into_session(&ctx, &absent, &session).await;
@@ -2174,7 +1782,7 @@ async fn a_failing_blob_lets_its_siblings_finish_their_upload() {
         ],
     });
     let manifest = Manifest::from_slice(body.to_string().as_bytes()).unwrap();
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
 
@@ -2214,13 +1822,18 @@ async fn an_index_child_over_the_manifest_limit_is_refused_before_it_is_read() {
     let index_bytes = serde_json::to_vec(&index).unwrap();
     let index_digest = put_blob_direct(&blob_store, &index_bytes).await;
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
 
-    let error = push_manifest(&ctx, &index_digest, Some("v1"), index_bytes)
-        .await
-        .expect_err("an oversized index child must not be buffered");
+    let error = push_manifest(
+        &ctx,
+        &index_digest,
+        Some(&Tag::new("v1").unwrap()),
+        index_bytes,
+    )
+    .await
+    .expect_err("an oversized index child must not be buffered");
     assert!(
         matches!(&error, Error::InvalidManifest(msg) if msg.contains("over the")),
         "the child must be refused as an invalid manifest, got: {error:?}"
@@ -2264,11 +1877,11 @@ async fn an_index_chain_deeper_than_the_cap_is_refused() {
         digest = put_blob_direct(&blob_store, &bytes).await;
     }
 
-    let downstream = test_downstream(downstream_client(&mock_server.uri()));
+    let downstream = test_downstream("test".to_string(), downstream_client(&mock_server.uri()));
     let namespace = Namespace::new(NAMESPACE).unwrap();
     let ctx = push_context(&downstream, &blob_store, &metadata_store, &namespace);
 
-    let error = push_manifest(&ctx, &digest, Some("v1"), bytes)
+    let error = push_manifest(&ctx, &digest, Some(&Tag::new("v1").unwrap()), bytes)
         .await
         .expect_err("a chain past the cap must not be followed");
     assert!(

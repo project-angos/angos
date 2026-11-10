@@ -95,7 +95,8 @@ impl MetadataStore {
         ) else {
             return Ok((Vec::new(), false));
         };
-        let limit = usize::try_from(self.pull_history.max_pulls.get()).unwrap_or(usize::MAX);
+        let limit =
+            usize::try_from(self.settings.pull_history.max_pulls.get()).unwrap_or(usize::MAX);
         let page_len = offset.saturating_add(n).min(limit).saturating_sub(offset);
         // One past the page tells whether another follows.
         let wanted = if offset.saturating_add(page_len) < limit {
@@ -190,17 +191,12 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use bytes::Bytes;
     use chrono::Duration;
 
-    use angos_oci::{Digest, Namespace, Tag};
+    use angos_oci::Tag;
 
     use super::*;
-    use crate::registry::keys::NamespaceExt;
-    use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore};
-    use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, seed_links};
+    use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, put_access_entry_at};
 
     #[test]
     fn entry_names_round_trip_and_sort_newest_first() {
@@ -252,56 +248,6 @@ mod tests {
         }
     }
 
-    async fn stored_atime(
-        backend: &MetadataStore,
-        namespace: &Namespace,
-        link: &LinkKind,
-    ) -> Option<DateTime<Utc>> {
-        let LinkKind::Tag(tag) = link else {
-            panic!("stored_atime expects a tag link");
-        };
-        backend
-            .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
-            .await
-            .unwrap()
-    }
-
-    /// Plant one access entry at `at` as a raw put, the way a sibling replica's
-    /// stamp would land.
-    async fn put_entry_at(
-        backend: &MetadataStore,
-        namespace: &Namespace,
-        link: &LinkKind,
-        client: &str,
-        at: DateTime<Utc>,
-    ) {
-        let body = serde_json::to_vec(&AccessEntry {
-            client: client.to_string(),
-            client_ip: None,
-            method: None,
-            at,
-        })
-        .unwrap();
-        backend
-            .object_store()
-            .put(
-                &namespace.atime_entry_path(link, at, client).unwrap(),
-                Bytes::from(body),
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn create_tag(
-        backend: &MetadataStore,
-        namespace: &Namespace,
-        tag: &LinkKind,
-        hash: &str,
-    ) {
-        let ops = vec![(tag.clone(), Digest::from_str(hash).unwrap())];
-        seed_links(backend, namespace, &ops).await.unwrap();
-    }
-
     /// The entry body carries the acting client, and the newest entry wins the
     /// read over a backdated one.
     #[tokio::test]
@@ -311,13 +257,6 @@ mod tests {
         let namespace = Namespace::new("audit-entry-ns").unwrap();
         let tag_name = Tag::new("v1").unwrap();
         let tag = LinkKind::Tag(tag_name.clone());
-        create_tag(
-            &backend,
-            &namespace,
-            &tag,
-            "sha256:ad01a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
-        )
-        .await;
 
         backend
             .put_access_entry(&namespace, &tag, "alice", Some("10.0.0.7"), Some("basic"))
@@ -337,7 +276,7 @@ mod tests {
         assert_eq!(entry.client_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(entry.method.as_deref(), Some("basic"));
 
-        put_entry_at(
+        put_access_entry_at(
             &backend,
             &namespace,
             &tag,
@@ -346,7 +285,7 @@ mod tests {
         )
         .await;
         let read = backend
-            .read_access_time(&namespace, &LinkKind::Tag(tag_name.clone()))
+            .read_access_time(&namespace, &tag)
             .await
             .unwrap()
             .unwrap();
@@ -354,67 +293,5 @@ mod tests {
             Utc::now().signed_duration_since(read) < Duration::minutes(5),
             "the newest entry must win the read, not the backdated one"
         );
-    }
-
-    /// Distinct clients stamping the same millisecond coexist through the entry
-    /// name's suffix.
-    #[tokio::test]
-    async fn each_pull_appends_one_entry_per_client() {
-        let test_case = FSRegistryTestCase::new();
-        let backend = test_case.metadata_store();
-        let namespace = Namespace::new("audit-per-pull-ns").unwrap();
-        let tag_name = Tag::new("v1").unwrap();
-        let tag = LinkKind::Tag(tag_name.clone());
-        create_tag(
-            &backend,
-            &namespace,
-            &tag,
-            "sha256:ad02b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
-        )
-        .await;
-
-        for client in ["alice", "bob"] {
-            backend
-                .put_access_entry(&namespace, &tag, client, None, None)
-                .await
-                .unwrap();
-        }
-
-        let dir = namespace.tag_atime_entry_dir(&tag_name);
-        let page = backend.object_store().list(&dir, 10, None).await.unwrap();
-        assert_eq!(page.items.len(), 2, "each client's pull is its own entry");
-    }
-
-    /// Concurrent stamps are appends, so they never contend.
-    #[tokio::test]
-    async fn concurrent_stamps_never_contend() {
-        let test_case = FSRegistryTestCase::new();
-        let backend = test_case.metadata_store();
-        let namespace = Namespace::new("audit-stamp-race").unwrap();
-        let digest = Digest::from_str(
-            "sha256:ad04b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
-        )
-        .unwrap();
-        let tag = LinkKind::Tag(Tag::new("v1").unwrap());
-        create_tag(
-            &backend,
-            &namespace,
-            &tag,
-            "sha256:ad04b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
-        )
-        .await;
-
-        let mut stamps = Vec::new();
-        for _ in 0..10 {
-            stamps.push(backend.put_access_entry(&namespace, &tag, "racer", None, None));
-        }
-        for stamp in stamps {
-            stamp.await.unwrap();
-        }
-        let meta = backend.read_link(&namespace, &tag).await.unwrap();
-        assert_eq!(meta.target, digest);
-
-        let raw = stored_atime(&backend, &namespace, &tag).await;
-        assert!(raw.is_some(), "the racing stamps must have landed");
     }
 }

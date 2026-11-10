@@ -1,8 +1,5 @@
-//! Access control policy evaluation for registry operations.
-//!
-//! Rules are CEL expressions compiled at configuration load time and evaluated
-//! against `identity`, `request` and `has_repository_policy()`, which
-//! `doc/reference/cel-expressions.md` documents.
+//! Access policies: CEL rules over `identity`, `request` and
+//! `has_repository_policy()`, as `doc/reference/cel-expressions.md` documents.
 
 use cel_interpreter::Context;
 use serde::Deserialize;
@@ -13,14 +10,11 @@ use crate::policy::{
     CelRule, Error, PolicyConfig, PolicyDecision, PolicyError, RuleOutcome, evaluate_rules,
 };
 
-/// Whether an access policy defaults to allowing or denying requests.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessMode {
-    /// Access is denied unless a rule explicitly grants it.
     #[default]
     Deny,
-    /// Access is granted unless a rule explicitly denies it.
     Allow,
 }
 
@@ -41,18 +35,13 @@ impl From<AccessMode> for PolicyDecision {
     }
 }
 
-/// Access control policy engine.
-///
-/// Evaluates CEL expressions to determine if a request should be allowed.
-/// Rules are pre-compiled at configuration time for better performance.
 pub struct AccessPolicy {
     default: AccessMode,
     rules: Vec<CelRule>,
 }
 
 impl AccessPolicy {
-    /// Rules are already compiled, so this constructor is infallible; a
-    /// missing `default` denies.
+    /// A missing `default` denies.
     pub fn new(config: PolicyConfig<AccessMode>) -> Self {
         Self {
             default: config.default.unwrap_or(AccessMode::Deny),
@@ -60,14 +49,10 @@ impl AccessPolicy {
         }
     }
 
-    /// Rules run in order and the first returning `true` flips the `default`
-    /// decision, which otherwise stands. A rule returning a non-boolean or
-    /// throwing stops evaluation as `Indeterminate`, which callers must treat as
-    /// deny: that is what makes both modes fail closed. A context that fails to
-    /// build is `Indeterminate` with no rule index, since no rule ran.
-    ///
-    /// `repository_policy` tells rules whether a `[repository]` declaring its
-    /// own access policy decides this request too.
+    /// The first rule returning `true` flips `default`. A rule that returns a
+    /// non-boolean or errors, or a context that fails to build, is
+    /// `Indeterminate`, which callers must treat as deny so both modes fail
+    /// closed.
     #[must_use]
     pub fn evaluate(
         &self,
@@ -104,7 +89,6 @@ impl AccessPolicy {
             }
             RuleOutcome::NoMatch => self.default.into(),
             RuleOutcome::Indeterminate { index, message } => {
-                // Fail-closed: a misconfigured or failing rule denies.
                 warn!("Access policy {rule_kind} rule {index} is indeterminate: {message}");
                 PolicyDecision::Indeterminate(PolicyError {
                     rule_index: Some(index),
@@ -134,121 +118,94 @@ mod tests {
 
     use super::*;
 
-    fn rule(s: &str) -> CelRule {
-        CelRule::compile(s).unwrap()
+    fn policy(default: AccessMode, rules: &[&str]) -> AccessPolicy {
+        AccessPolicy::new(PolicyConfig {
+            default: Some(default),
+            rules: rules.iter().map(|s| CelRule::compile(s).unwrap()).collect(),
+        })
     }
 
-    fn is_allow(d: &PolicyDecision) -> bool {
-        matches!(d, PolicyDecision::Allow)
-    }
-
-    fn is_deny(d: &PolicyDecision) -> bool {
-        matches!(d, PolicyDecision::Deny)
-    }
-
-    fn is_indeterminate(d: &PolicyDecision) -> bool {
-        matches!(d, PolicyDecision::Indeterminate(_))
-    }
-
-    #[test]
-    fn test_access_policy_deny_mode_no_rules() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(is_deny(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
+    fn decide(policy: &AccessPolicy, action: &Action, identity: &ClientIdentity) -> &'static str {
+        match policy.evaluate(action, identity, RepositoryPolicy::Undeclared) {
+            PolicyDecision::Allow => "allow",
+            PolicyDecision::Deny => "deny",
+            PolicyDecision::Indeterminate(_) => "indeterminate",
+        }
     }
 
     #[test]
-    fn test_access_policy_allow_mode_with_deny_rule() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule("identity.username == 'forbidden'")],
-        });
-
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity {
-            username: Some("forbidden".to_string()),
-            ..ClientIdentity::default()
-        };
-
-        assert!(is_deny(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
-
-        let identity = ClientIdentity {
-            username: Some("allowed".to_string()),
-            ..ClientIdentity::default()
-        };
-
-        assert!(is_allow(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
+    fn rules_flip_the_default_and_fail_closed() {
+        let cases: [(AccessMode, &[&str], &str); 9] = [
+            (AccessMode::Deny, &[], "deny"),
+            (AccessMode::Allow, &["false", "false"], "allow"),
+            (AccessMode::Deny, &["false", "false"], "deny"),
+            (AccessMode::Allow, &["true", "false"], "deny"),
+            (AccessMode::Deny, &["false", "true"], "allow"),
+            (AccessMode::Allow, &["42"], "indeterminate"),
+            // A non-boolean stops evaluation even when a later rule would allow.
+            (AccessMode::Deny, &["42", "true"], "indeterminate"),
+            (AccessMode::Allow, &["nonexistent_var"], "indeterminate"),
+            (AccessMode::Deny, &["nonexistent_var"], "indeterminate"),
+        ];
+        for (default, rules, expected) in cases {
+            let decision = decide(
+                &policy(default, rules),
+                &Action::ApiVersion,
+                &ClientIdentity::default(),
+            );
+            assert_eq!(decision, expected, "{default:?} with {rules:?}");
+        }
     }
 
     #[test]
-    fn test_access_policy_deny_mode_with_allow_rule() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("identity.username == 'admin'")],
-        });
-
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity {
-            username: Some("admin".to_string()),
-            ..ClientIdentity::default()
+    fn indeterminate_carries_the_failing_rule_index() {
+        let PolicyDecision::Indeterminate(err) =
+            policy(AccessMode::Allow, &["false", "nonexistent_var"]).evaluate(
+                &Action::ApiVersion,
+                &ClientIdentity::default(),
+                RepositoryPolicy::Undeclared,
+            )
+        else {
+            panic!("expected Indeterminate");
         };
-
-        assert!(is_allow(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
-
-        let identity = ClientIdentity {
-            username: Some("user".to_string()),
-            ..ClientIdentity::default()
-        };
-
-        assert!(is_deny(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
+        assert_eq!(err.rule_index, Some(2));
     }
 
-    /// A mount authorizes as the dedicated `mount-blob` action, independent of
-    /// the `start-upload` rules that govern ordinary uploads.
     #[test]
-    fn test_access_policy_gates_cross_repo_mount() {
-        let namespace = Namespace::new("team/app").unwrap();
+    fn default_is_deny_and_must_be_known() {
+        let config: PolicyConfig<AccessMode> = toml::from_str("").unwrap();
+        assert_eq!(
+            decide(
+                &AccessPolicy::new(config),
+                &Action::ApiVersion,
+                &ClientIdentity::default()
+            ),
+            "deny"
+        );
+        assert!(toml::from_str::<PolicyConfig<AccessMode>>("default = \"maybe\"").is_err());
+    }
+
+    /// A mount authorizes as `mount-blob`, independent of the `start-upload`
+    /// rules, and `request.from` exists only when `?from=` was given, so rules
+    /// need `has(request.from)`.
+    #[test]
+    fn cross_repo_mount_is_gated_separately() {
+        let target = Namespace::new("team/app").unwrap();
         let digest = Digest::try_from(
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         )
         .unwrap();
-
-        let normal_upload = Action::StartUpload {
-            namespace: namespace.clone(),
+        let mount = |from: Option<&str>| Action::MountBlob {
+            namespace: target.clone(),
+            digest: digest.clone(),
+            from: from.map(|from| Namespace::new(from).unwrap()),
+        };
+        let upload = Action::StartUpload {
+            namespace: target.clone(),
             digest: None,
             digest_algorithm: None,
         };
-        let mount = Action::MountBlob {
-            namespace,
-            digest,
-            from: Some(Namespace::new("team/base").unwrap()),
-        };
-        let anyone = ClientIdentity {
+        let alice = ClientIdentity {
             username: Some("alice".to_string()),
             ..ClientIdentity::default()
         };
@@ -258,334 +215,72 @@ mod tests {
             ..ClientIdentity::default()
         };
 
-        let replicator_only = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![
-                rule("identity.username != null && request.action == 'start-upload'"),
-                rule("identity.id == 'replicator' && request.action == 'mount-blob'"),
+        let replicator_only = policy(
+            AccessMode::Deny,
+            &[
+                "identity.username != null && request.action == 'start-upload'",
+                "identity.id == 'replicator' && request.action == 'mount-blob'",
             ],
-        });
-        assert!(is_allow(&replicator_only.evaluate(
-            &normal_upload,
-            &anyone,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_deny(&replicator_only.evaluate(
-            &mount,
-            &anyone,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_allow(&replicator_only.evaluate(
-            &mount,
-            &replicator,
-            RepositoryPolicy::Undeclared
-        )));
-
-        let deny_non_replicator = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule(
-                "request.action == 'mount-blob' && identity.id != 'replicator'",
-            )],
-        });
-        assert!(is_allow(&deny_non_replicator.evaluate(
-            &normal_upload,
-            &anyone,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_deny(&deny_non_replicator.evaluate(
-            &mount,
-            &anyone,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_allow(&deny_non_replicator.evaluate(
-            &mount,
-            &replicator,
-            RepositoryPolicy::Undeclared
-        )));
-    }
-
-    /// `request.from` is present only on a `from`-bearing mount, so rules need
-    /// `has(request.from)` to handle auto-discovery mounts.
-    #[test]
-    fn test_access_policy_gates_cross_repo_mount_by_source() {
-        let target = Namespace::new("team/app").unwrap();
-        let digest = Digest::try_from(
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        )
-        .unwrap();
-
-        let from_trusted = Action::MountBlob {
-            namespace: target.clone(),
-            digest: digest.clone(),
-            from: Some(Namespace::new("team/base").unwrap()),
-        };
-        let from_untrusted = Action::MountBlob {
-            namespace: target.clone(),
-            digest: digest.clone(),
-            from: Some(Namespace::new("other/evil").unwrap()),
-        };
-        let no_from = Action::MountBlob {
-            namespace: target,
-            digest,
-            from: None,
-        };
-        let client = ClientIdentity {
-            username: Some("alice".to_string()),
-            ..ClientIdentity::default()
-        };
-
-        // The `has()` guard keeps the rule from raising the fail-closed "no
-        // such key" error on a from-less mount.
-        let only_from_trusted = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule(
-                "request.action == 'mount-blob' && has(request.from) && request.from == 'team/base'",
-            )],
-        });
-        assert!(is_allow(&only_from_trusted.evaluate(
-            &from_trusted,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_deny(&only_from_trusted.evaluate(
-            &from_untrusted,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_deny(&only_from_trusted.evaluate(
-            &no_from,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-
-        let deny_untrusted_source = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule(
+        );
+        let deny_untrusted = policy(
+            AccessMode::Allow,
+            &[
                 "request.action == 'mount-blob' && has(request.from) && request.from == 'other/evil'",
-            )],
-        });
-        assert!(is_allow(&deny_untrusted_source.evaluate(
-            &from_trusted,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_deny(&deny_untrusted_source.evaluate(
-            &from_untrusted,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-        assert!(is_allow(&deny_untrusted_source.evaluate(
-            &no_from,
-            &client,
-            RepositoryPolicy::Undeclared
-        )));
-    }
-
-    #[test]
-    fn test_access_policy_default_toml_missing_is_deny() {
-        let config: PolicyConfig<AccessMode> = toml::from_str("").unwrap();
-        assert_eq!(config.default, None, "denies once built");
-        assert!(matches!(
-            AccessPolicy::new(config).default,
-            AccessMode::Deny
-        ));
-    }
-
-    #[test]
-    fn test_access_policy_default_toml_unknown_value_fails() {
-        let result: Result<PolicyConfig<AccessMode>, _> = toml::from_str("default = \"maybe\"");
-        assert!(result.is_err());
-    }
-
-    // Non-boolean and error rule behaviour
-
-    #[test]
-    fn non_boolean_rule_in_allow_mode_denies_fail_closed() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule("42")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
-            "non-boolean result must be Indeterminate (fail-closed)"
-        );
-    }
-
-    #[test]
-    fn non_boolean_rule_in_deny_mode_denies_fail_closed() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("42")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
-            "non-boolean result must be Indeterminate (fail-closed)"
-        );
-    }
-
-    #[test]
-    fn non_boolean_rule_in_deny_mode_short_circuits_subsequent_allow_rules() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("42"), rule("true")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
-            "non-boolean rule must short-circuit to Indeterminate, even when a later rule would allow"
-        );
-    }
-
-    #[test]
-    fn failed_rule_in_allow_mode_is_indeterminate_and_denies() {
-        // Allow mode: a runtime evaluation error in a DENY rule now produces
-        // Indeterminate instead of silently falling through to allow.
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule("nonexistent_var")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
-            "a failing DENY rule in Allow mode must be Indeterminate, not Allow"
-        );
-    }
-
-    #[test]
-    fn failed_rule_in_allow_mode_indeterminate_carries_rule_index() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule("false"), rule("nonexistent_var")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        let PolicyDecision::Indeterminate(err) =
-            policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)
-        else {
-            panic!("expected Indeterminate");
-        };
-        assert_eq!(err.rule_index, Some(2), "failing rule is the second rule");
-    }
-
-    #[test]
-    fn failed_rule_in_deny_mode_is_indeterminate() {
-        // Deny mode: an evaluation error in an ALLOW rule produces Indeterminate
-        // (which callers treat as deny, i.e. fail-closed).
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("nonexistent_var")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-
-        assert!(
-            is_indeterminate(&policy.evaluate(&action, &identity, RepositoryPolicy::Undeclared)),
-            "a failing ALLOW rule in Deny mode must be Indeterminate"
-        );
-    }
-
-    // Multi-rule ordering and short-circuit semantics
-
-    #[test]
-    fn multi_rule_allow_mode_first_match_denies_second_rule_unreached() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![
-                rule("true"),  // rule 1: always triggers → Deny
-                rule("false"), // rule 2: unreachable
             ],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
+        );
+        let only_trusted = policy(
+            AccessMode::Deny,
+            &["request.action == 'mount-blob' && has(request.from) && request.from == 'team/base'"],
+        );
 
-        assert!(is_deny(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
+        let cases = [
+            (&replicator_only, &upload, &alice, "allow"),
+            (&replicator_only, &mount(Some("team/base")), &alice, "deny"),
+            (
+                &replicator_only,
+                &mount(Some("team/base")),
+                &replicator,
+                "allow",
+            ),
+            (&deny_untrusted, &upload, &alice, "allow"),
+            (&deny_untrusted, &mount(Some("team/base")), &alice, "allow"),
+            (&deny_untrusted, &mount(Some("other/evil")), &alice, "deny"),
+            (&deny_untrusted, &mount(None), &alice, "allow"),
+            (&only_trusted, &mount(Some("team/base")), &alice, "allow"),
+            (&only_trusted, &mount(Some("other/evil")), &alice, "deny"),
+            (&only_trusted, &mount(None), &alice, "deny"),
+        ];
+        for (index, (policy, action, identity, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(decide(policy, action, identity), expected, "case {index}");
+        }
     }
 
-    #[test]
-    fn multi_rule_no_match_falls_through_to_default() {
-        let policy_allow = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Allow),
-            rules: vec![rule("false"), rule("false")],
-        });
-        let action = Action::ApiVersion;
-        let identity = ClientIdentity::default();
-        assert!(is_allow(&policy_allow.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
-
-        let policy_deny = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("false"), rule("false")],
-        });
-        assert!(is_deny(&policy_deny.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
-    }
-
-    /// `request.reference` is documented as a string, so a rule comparing it to
-    /// one has to match. A tagged-object serialization would make it a map and
-    /// every such policy would silently never fire.
+    /// `request.reference` is documented as a string; a tagged-object
+    /// serialization would make every such rule silently never fire.
     #[test]
     fn reference_is_a_string_in_the_policy_context() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("request.reference == 'latest'")],
-        });
         let action = Action::GetManifest {
             namespace: Namespace::new("team/app").unwrap(),
             reference: Reference::Tag(Tag::new("latest").unwrap()),
         };
-
-        assert!(is_allow(&policy.evaluate(
-            &action,
-            &ClientIdentity::default(),
-            RepositoryPolicy::Undeclared
-        )));
+        let policy = policy(AccessMode::Deny, &["request.reference == 'latest'"]);
+        assert_eq!(
+            decide(&policy, &action, &ClientIdentity::default()),
+            "allow"
+        );
     }
 
-    /// The global policy hands a namespace over to the repository that declares
-    /// its own rules, and keeps deciding for every namespace that has none.
     #[test]
-    fn has_repository_policy_defers_to_a_declaring_repository() {
-        let policy = AccessPolicy::new(PolicyConfig {
-            default: Some(AccessMode::Deny),
-            rules: vec![rule("has_repository_policy()")],
-        });
-        let action = Action::StartUpload {
-            namespace: Namespace::new("team/app").unwrap(),
-            digest: None,
-            digest_algorithm: None,
-        };
+    fn has_repository_policy_reflects_the_covering_repository() {
+        let policy = policy(AccessMode::Deny, &["has_repository_policy()"]);
         let identity = ClientIdentity::default();
-
-        assert!(is_allow(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Declared
-        )));
-        assert!(is_deny(&policy.evaluate(
-            &action,
-            &identity,
-            RepositoryPolicy::Undeclared
-        )));
+        assert!(matches!(
+            policy.evaluate(&Action::ApiVersion, &identity, RepositoryPolicy::Declared),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            policy.evaluate(&Action::ApiVersion, &identity, RepositoryPolicy::Undeclared),
+            PolicyDecision::Deny
+        ));
     }
 }

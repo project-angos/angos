@@ -5,12 +5,9 @@ use std::str::FromStr;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer};
 
-/// A proxy address or CIDR network allowed to set the forwarded-client
-/// headers (`X-Forwarded-For`, `X-Real-IP`).
-///
-/// Accepts a plain IP (`"10.0.0.1"`) or a CIDR network (`"10.0.0.0/8"`,
-/// `"fd00::/8"`). Invalid entries are rejected when the TOML configuration is
-/// parsed, so the registry fails fast instead of silently trusting nobody.
+/// A proxy IP (`"10.0.0.1"`) or CIDR network (`"fd00::/8"`) allowed to set
+/// `X-Forwarded-For`/`X-Real-IP`. Invalid entries fail the parse rather than
+/// silently trusting nobody.
 #[derive(Clone)]
 pub struct TrustedProxy {
     source: String,
@@ -21,8 +18,6 @@ pub struct TrustedProxy {
 impl FromStr for TrustedProxy {
     type Err = String;
 
-    /// Parses `source` as an IP address or CIDR network, failing with a
-    /// message describing the invalid address or prefix.
     fn from_str(source: &str) -> Result<Self, Self::Err> {
         let (address, prefix) = match source.split_once('/') {
             Some((address, prefix)) => (address, Some(prefix)),
@@ -51,7 +46,6 @@ impl FromStr for TrustedProxy {
 }
 
 impl TrustedProxy {
-    /// Returns `true` when `ip` is this address or belongs to this network.
     /// Families never cross-match: an IPv4 network contains no IPv6 address.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let (network, ip, width) = match (self.network, ip) {

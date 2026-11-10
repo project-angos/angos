@@ -7,18 +7,12 @@ use serde_json::Value;
 use crate::types::constants::IN_TOTO_PREDICATE_TYPE;
 use crate::types::{Descriptor, Digest, Error, MediaType};
 
-/// OCI image-spec manifest `schemaVersion`. Pinned on ingress by
-/// [`Manifest::from_pushed`], never on a read, so angos keeps reading what it
-/// once accepted.
-pub const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
+/// Pinned on push only, so angos keeps reading what it once accepted.
+const OCI_MANIFEST_SCHEMA_VERSION: i32 = 2;
 
-/// The descriptor payload of a manifest. The image spec makes the two shapes
-/// mutually exclusive: an image manifest carries a config and its layers, an
-/// index carries the child manifests it lists.
-///
-/// Flattened into the manifest object, so `Index` is chosen for a document
-/// carrying `manifests` and `Image` for every other one. Each variant emits
-/// only its own array, which is the one the spec requires of that shape.
+/// The descriptor payload of a manifest: the spec makes image (config and
+/// layers) and index (manifests) mutually exclusive. Flattened, so a document
+/// carrying `manifests` reads as `Index` and any other as `Image`.
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Content {
@@ -26,15 +20,13 @@ pub enum Content {
         manifests: Vec<Descriptor>,
     },
     Image {
-        /// Boxed: a descriptor is by far the largest thing either variant
-        /// carries, and inline it would make every `Content` the size of one.
+        /// Boxed, or every `Content` would be the size of a descriptor.
         #[serde(skip_serializing_if = "Option::is_none")]
         config: Option<Box<Descriptor>>,
         layers: Vec<Descriptor>,
     },
 }
 
-/// Every array either shape may carry, read before the shape is chosen.
 #[derive(Deserialize)]
 struct ContentFields {
     manifests: Option<Vec<Descriptor>>,
@@ -59,7 +51,6 @@ impl<'de> Deserialize<'de> for Content {
 }
 
 impl Content {
-    /// The config descriptor of an image manifest; an index carries none.
     #[must_use]
     pub fn config(&self) -> Option<&Descriptor> {
         match self {
@@ -95,9 +86,8 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Deserializes leniently, like `media_type` being optional: angos must
-    /// keep reading manifests it once accepted. Ingress checks the strict rules
-    /// through [`Self::from_pushed`].
+    /// Parses leniently, as angos must keep reading manifests it once
+    /// accepted; [`Self::from_pushed`] applies the ingress rules.
     ///
     /// # Errors
     ///
@@ -106,15 +96,10 @@ impl Manifest {
         Ok(serde_json::from_slice(s)?)
     }
 
-    /// Parses a manifest a client is pushing, applying the ingress rules
-    /// [`Self::from_slice`] stays lenient about: image and index content are
-    /// mutually exclusive in the spec (the hybrid would store a document
-    /// neither shape describes), `schemaVersion` is pinned, and the declared
-    /// `mediaType` must agree with the `Content-Type` it was sent under.
-    ///
-    /// The shapes are read off the raw object because the flattened [`Content`]
-    /// keeps only the one it selects, which is what lets an already-stored
-    /// hybrid stay readable.
+    /// Parses a pushed manifest: it carries one shape only, the pinned
+    /// `schemaVersion`, and a `mediaType` agreeing with its `Content-Type`
+    /// when both are present. The shapes are checked on the raw object because
+    /// [`Content`] keeps only one, which keeps a stored hybrid readable.
     ///
     /// # Errors
     ///
@@ -122,7 +107,13 @@ impl Manifest {
     /// the object breaks one of those rules.
     pub fn from_pushed(s: &[u8], content_type: Option<&MediaType>) -> Result<Self, Error> {
         let raw: Value = serde_json::from_slice(s)?;
-        if declares_both_shapes(&raw) {
+        let non_empty_array = |field: &str| {
+            raw.get(field)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+        };
+        let image = raw.get("config").is_some_and(|c| !c.is_null()) || non_empty_array("layers");
+        if image && non_empty_array("manifests") {
             return Err(Error::Manifest(
                 "a manifest carries either config/layers or manifests, never both".to_string(),
             ));
@@ -134,7 +125,9 @@ impl Manifest {
                 manifest.schema_version
             )));
         }
-        if !manifest.media_type_matches(content_type) {
+        if let (Some(declared), Some(sent)) = (manifest.media_type.as_ref(), content_type)
+            && declared != sent
+        {
             return Err(Error::Manifest(
                 "Expected manifest media type mismatch".to_string(),
             ));
@@ -142,62 +135,31 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Whether the declared `mediaType` agrees with the `Content-Type` the
-    /// manifest travelled under. Either side being absent is no disagreement:
-    /// the spec leaves the manifest's own field optional.
-    #[must_use]
-    pub fn media_type_matches(&self, content_type: Option<&MediaType>) -> bool {
-        match (self.media_type.as_ref(), content_type) {
-            (Some(declared), Some(sent)) => declared == sent,
-            _ => true,
-        }
-    }
-
-    /// Returns `true` if `artifact_type` equals either the manifest's top-level
-    /// `artifactType` field or, per the OCI Referrers API spec, the config's
-    /// `mediaType` fallback.
-    #[must_use]
-    pub fn has_artifact_type(&self, artifact_type: &MediaType) -> bool {
-        self.artifact_type.as_ref() == Some(artifact_type)
-            || self
-                .content
-                .config()
-                .is_some_and(|c| c.media_type == *artifact_type)
-    }
-
-    /// Returns whether this manifest's `artifact_type` (or config `mediaType`
-    /// fallback) matches the given filter. A `None` filter matches anything.
+    /// Whether the manifest's `artifactType`, or its config `mediaType` per the
+    /// Referrers API fallback, is `filter`. A `None` filter matches anything.
     #[must_use]
     pub fn artifact_type_matches(&self, filter: Option<&MediaType>) -> bool {
-        filter.is_none_or(|want| self.has_artifact_type(want))
+        filter.is_none_or(|want| {
+            self.artifact_type.as_ref() == Some(want)
+                || self.content.config().is_some_and(|c| c.media_type == *want)
+        })
     }
 
-    /// The media type describing this manifest: its own `mediaType`, else the
-    /// one its shape implies. Keyed on the children rather than the shape: a
-    /// document whose `manifests` array is present but empty has always been
-    /// served as an image manifest, and a stored one must keep the
-    /// `Content-Type` it has always had.
-    #[must_use]
-    pub fn described_media_type(&self) -> MediaType {
-        if let Some(media_type) = self.media_type.clone() {
-            return media_type;
-        }
-        match &self.content {
-            Content::Index { manifests } if !manifests.is_empty() => MediaType::oci_index(),
-            _ => MediaType::oci_manifest(),
-        }
-    }
-
-    /// Builds a `Descriptor` for this manifest, moving the (potentially large)
-    /// annotations map out of `self` rather than cloning it. A manifest with no
-    /// `mediaType` is described by the one its shape implies, so it is listed
-    /// rather than dropped. Filter-mismatch is a separate concern; callers that
-    /// need filtering call `artifact_type_matches` first.
+    /// A descriptor of this manifest, moving its annotations out rather than
+    /// cloning them.
     pub fn take_descriptor(&mut self, digest: Digest, size: u64) -> Descriptor {
-        let media_type = self.described_media_type();
-        // Per the OCI Referrers API a referrer's `artifactType` is the manifest's
-        // own field, falling back to the config `mediaType` for image manifests
-        // without one; an empty value would drop the entry from filtered lists.
+        // An absent `mediaType` is implied by the children, not the shape: a
+        // stored document with an empty `manifests` has always been served as
+        // an image manifest.
+        let media_type = self
+            .media_type
+            .clone()
+            .unwrap_or_else(|| match &self.content {
+                Content::Index { manifests } if !manifests.is_empty() => MediaType::oci_index(),
+                _ => MediaType::oci_manifest(),
+            });
+        // The Referrers API falls back to the config `mediaType`; an empty
+        // value would drop the entry from filtered lists.
         let artifact_type = self
             .artifact_type
             .clone()
@@ -212,8 +174,8 @@ impl Manifest {
         }
     }
 
-    /// An OCI image index listing `manifests`, typed as one so it serializes
-    /// under the media type a client negotiates the listing on.
+    /// An image index typed as one, so it serializes under the media type a
+    /// client negotiates the listing on.
     #[must_use]
     pub fn oci_index(manifests: Vec<Descriptor>) -> Self {
         Self {
@@ -221,6 +183,28 @@ impl Manifest {
             content: Content::Index { manifests },
             ..Self::default()
         }
+    }
+
+    /// The in-toto predicate type of the first layer carrying one.
+    #[must_use]
+    pub fn in_toto_predicate_type(&self) -> Option<&str> {
+        let Content::Image { layers, .. } = &self.content else {
+            return None;
+        };
+        layers
+            .iter()
+            .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE))
+            .map(String::as_str)
+    }
+
+    /// Not a referrer, an artifact, an index, or a buildx attestation (which
+    /// names no subject, but whose layers carry an in-toto predicate type).
+    #[must_use]
+    pub fn is_plain_image(&self) -> bool {
+        self.subject.is_none()
+            && self.artifact_type.is_none()
+            && matches!(self.content, Content::Image { .. })
+            && self.in_toto_predicate_type().is_none()
     }
 }
 
@@ -234,71 +218,6 @@ impl Default for Manifest {
             artifact_type: None,
             content: Content::default(),
         }
-    }
-}
-
-/// Construction shortcuts for fixtures: nothing in the serving paths builds a
-/// manifest, they only parse.
-#[cfg(feature = "test-util")]
-impl Manifest {
-    /// An image manifest carrying `config` and `layers`, every other field left
-    /// at its default.
-    #[must_use]
-    pub fn image(config: Option<Descriptor>, layers: Vec<Descriptor>) -> Self {
-        Self {
-            content: Content::Image {
-                config: config.map(Box::new),
-                layers,
-            },
-            ..Self::default()
-        }
-    }
-
-    /// An index listing `manifests`, every other field left at its default.
-    #[must_use]
-    pub fn index(manifests: Vec<Descriptor>) -> Self {
-        Self {
-            content: Content::Index { manifests },
-            ..Self::default()
-        }
-    }
-}
-
-/// Whether the raw manifest object carries both an image payload and an index
-/// one, which the image spec forbids.
-fn declares_both_shapes(raw: &Value) -> bool {
-    let non_empty_array = |field: &str| {
-        raw.get(field)
-            .and_then(Value::as_array)
-            .is_some_and(|entries| !entries.is_empty())
-    };
-    let image = raw.get("config").is_some_and(|c| !c.is_null()) || non_empty_array("layers");
-    image && non_empty_array("manifests")
-}
-
-impl Manifest {
-    /// The in-toto predicate type annotation from the first layer carrying
-    /// one; `None` for an index, or an image whose layers carry none.
-    #[must_use]
-    pub fn in_toto_predicate_type(&self) -> Option<&str> {
-        let Content::Image { layers, .. } = &self.content else {
-            return None;
-        };
-        layers
-            .iter()
-            .find_map(|layer| layer.annotations.get(IN_TOTO_PREDICATE_TYPE))
-            .map(String::as_str)
-    }
-
-    /// Whether this is a plain image manifest, not a referrer, an artifact, an
-    /// index, or a buildx attestation (which names no subject, but whose layers
-    /// carry an in-toto predicate type).
-    #[must_use]
-    pub fn is_plain_image(&self) -> bool {
-        self.subject.is_none()
-            && self.artifact_type.is_none()
-            && matches!(self.content, Content::Image { .. })
-            && self.in_toto_predicate_type().is_none()
     }
 }
 
@@ -327,16 +246,16 @@ mod tests {
         Manifest {
             media_type: Some(media_type(MEDIA_TYPE_MANIFEST)),
             artifact_type: Some(media_type(ARTIFACT_TYPE_INDEX)),
-            ..Manifest::image(
-                Some(Descriptor {
+            content: Content::Image {
+                config: Some(Box::new(Descriptor {
                     media_type: media_type(MEDIA_TYPE_CONFIG),
                     digest: valid_digest(),
                     size: 1234,
                     annotations: HashMap::new(),
                     artifact_type: None,
                     platform: None,
-                }),
-                vec![Descriptor {
+                })),
+                layers: vec![Descriptor {
                     media_type: media_type("application/vnd.oci.image.layer.v1.tar"),
                     digest: valid_digest(),
                     size: 5678,
@@ -344,7 +263,8 @@ mod tests {
                     artifact_type: None,
                     platform: None,
                 }],
-            )
+            },
+            ..Manifest::default()
         }
     }
 
@@ -386,13 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_artifact_type_none_artifact_type_none_config() {
-        let manifest = Manifest::default();
-        assert!(!manifest.has_artifact_type(&media_type("application/vnd.anything")));
-    }
-
-    // take_descriptor: the manifest's own media type describes it
-    #[test]
     fn test_take_descriptor_with_media_type_returns_descriptor() {
         let mut manifest = demo_manifest();
         let digest = valid_digest();
@@ -403,8 +316,6 @@ mod tests {
         assert_eq!(d.artifact_type.as_deref(), Some(ARTIFACT_TYPE_INDEX));
     }
 
-    // take_descriptor: an image manifest without its own artifactType advertises
-    // the config mediaType (OCI Referrers API fallback), not an empty value.
     #[test]
     fn test_take_descriptor_falls_back_to_config_media_type() {
         let mut manifest = demo_manifest();
@@ -413,8 +324,6 @@ mod tests {
         assert_eq!(d.artifact_type.as_deref(), Some(MEDIA_TYPE_CONFIG));
     }
 
-    /// A manifest carrying no `mediaType` is described by the type its shape
-    /// implies, so a referrer listing names it rather than dropping it.
     #[test]
     fn an_oci_index_serializes_as_the_referrers_document() {
         let index = Manifest::oci_index(vec![Descriptor {
@@ -433,6 +342,8 @@ mod tests {
         assert!(json.get("config").is_none() && json.get("layers").is_none());
     }
 
+    /// A manifest carrying no `mediaType` is described by the type its shape
+    /// implies, so a referrer listing names it rather than dropping it.
     #[test]
     fn test_take_descriptor_recovers_an_absent_media_type() {
         let image = Manifest {
@@ -451,19 +362,22 @@ mod tests {
             platform: None,
         };
         let index = Manifest {
-            media_type: None,
-            ..Manifest::index(vec![child])
+            content: Content::Index {
+                manifests: vec![child],
+            },
+            ..Manifest::default()
         }
         .take_descriptor(valid_digest(), 0);
         assert_eq!(index.media_type, MediaType::oci_index());
     }
 
-    /// The filter is optional and, when given, defers to
-    /// [`Manifest::has_artifact_type`]: an absent one lists everything, and a
-    /// present one matches the manifest's own type or its config fallback.
     #[test]
     fn artifact_type_matches_only_filters_when_asked() {
         let manifest = demo_manifest();
+        assert!(
+            !Manifest::default()
+                .artifact_type_matches(Some(&media_type("application/vnd.anything")))
+        );
 
         assert!(manifest.artifact_type_matches(None));
         assert!(manifest.artifact_type_matches(Some(&media_type(ARTIFACT_TYPE_INDEX))));
@@ -616,7 +530,7 @@ mod tests {
     /// `layers` array, and back to the same value.
     #[test]
     fn each_shape_round_trips_through_its_own_wire_form() {
-        let index = Manifest::index(vec![Descriptor {
+        let index = Manifest::oci_index(vec![Descriptor {
             media_type: media_type(MEDIA_TYPE_MANIFEST),
             digest: valid_digest(),
             size: 7,

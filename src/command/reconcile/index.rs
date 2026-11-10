@@ -1,11 +1,9 @@
-//! `angos reconcile index`: enqueues an index job for every tar layer of an
-//! image its repository's index policy applies to that has no listing yet,
-//! or for every such layer with `--force`, and reclaims the listings of every
-//! other layer. The running server or a worker drains the jobs. Any image indexes
-//! itself the first time its filesystem is opened, so this is for having the
-//! listings ready ahead of that, for walking layers again after a change to
-//! what a listing holds, and for dropping what on-demand opens left behind
-//! in repositories that do not index.
+//! `angos reconcile index`: enqueues an index job for every unlisted tar layer
+//! (every layer with `--force`) of the images an index policy applies to, and
+//! reclaims every other layer's listing; the server or a worker drains the jobs.
+//! Images index on first open anyway, so this prepares listings ahead of time,
+//! re-walks layers after a listing format change, and drops listings left in
+//! repositories that do not index.
 
 use std::collections::HashSet;
 use std::pin::pin;
@@ -18,7 +16,7 @@ use tracing::info;
 
 use angos_oci::{Digest, Namespace};
 
-use crate::command::bootstrap::{self, MaintenanceContext};
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::{Action, JobAction};
 use crate::command::maintenance::check::{self, NamespaceChecker};
@@ -117,7 +115,7 @@ impl NamespaceChecker for IndexChecker {
 /// Reclaims the listing of every layer outside `kept`: one an image indexed
 /// on demand comes back the next time the image is opened.
 async fn reclaim_listings(
-    metadata_store: &Arc<MetadataStore>,
+    metadata_store: &MetadataStore,
     kept: &HashSet<Digest>,
     sink: &dyn ActionSink,
 ) -> Result<(), Error> {
@@ -181,7 +179,7 @@ pub async fn reclaim_unused_listings(
 }
 
 pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error> {
-    let MaintenanceContext {
+    let StoreContext {
         blob_store,
         metadata_store,
         repositories,
@@ -199,6 +197,7 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             blob_store,
             metadata_store.clone(),
             run_job_store(&metadata_store, "reconcile"),
+            None,
         ))
     })?;
     check_and_reclaim(checker, &metadata_store, sink.as_ref()).await?;

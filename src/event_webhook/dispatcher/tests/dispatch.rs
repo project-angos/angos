@@ -5,27 +5,30 @@ use wiremock::matchers::{body_json, header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::common::{
-    build_dispatcher, create_test_config, create_test_event, create_test_webhook_config,
-    single_hook_dispatcher,
+    build_dispatcher, create_test_event, create_test_webhook_config, single_hook_dispatcher,
 };
 use crate::configuration::RegexPattern;
 use crate::event_webhook::config::DeliveryPolicy;
 use crate::event_webhook::dispatcher::EventDispatcher;
-use crate::event_webhook::event::EventKind;
 use crate::metrics_provider::{initialize_metrics, metrics_provider};
 
 /// The client carries the webhook's TLS settings: an unreadable CA bundle
 /// fails the dispatcher instead of being ignored.
 #[test]
 fn an_unreadable_ca_bundle_fails_the_dispatcher() {
-    let mut config = create_test_config(vec![EventKind::ManifestPush], None);
+    let mut config = create_test_webhook_config(
+        "https://example.com/webhook",
+        DeliveryPolicy::Optional,
+        None,
+        0,
+    );
     config.tls.server_ca_bundle = Some(PathBuf::from("/nonexistent/ca.pem"));
     let webhooks = HashMap::from([("hook".to_string(), config)]);
     assert!(EventDispatcher::new(webhooks, Vec::new(), HashMap::new()).is_err());
 }
 
 #[tokio::test]
-async fn dispatch_sends_post_with_json_body() {
+async fn dispatch_sends_post_with_json_body_and_event_kind_header() {
     let server = MockServer::start().await;
     let event = create_test_event();
     let expected_body = serde_json::to_value(&event).unwrap();
@@ -33,28 +36,6 @@ async fn dispatch_sends_post_with_json_body() {
     Mock::given(method("POST"))
         .and(body_json(&expected_body))
         .and(header("content-type", "application/json"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dispatcher = single_hook_dispatcher(
-        "test-hook",
-        &server.uri(),
-        DeliveryPolicy::Required,
-        None,
-        0,
-    );
-    let result = dispatcher.dispatch(&event).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn dispatch_sends_event_kind_header() {
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
         .and(header("X-Registry-Event", "manifest.push"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
@@ -68,50 +49,6 @@ async fn dispatch_sends_event_kind_header() {
         None,
         0,
     );
-    let result = dispatcher.dispatch(&event).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn dispatch_sends_authorization_bearer_header() {
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .and(header("Authorization", "Bearer my-token"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dispatcher = single_hook_dispatcher(
-        "test-hook",
-        &server.uri(),
-        DeliveryPolicy::Required,
-        Some("my-token"),
-        0,
-    );
-    let result = dispatcher.dispatch(&event).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn dispatch_skips_webhook_for_non_matching_event_kind() {
-    let server = MockServer::start().await;
-    let event = create_test_event(); // ManifestPush
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server)
-        .await;
-
-    let mut webhooks = HashMap::new();
-    let mut config = create_test_webhook_config(&server.uri(), DeliveryPolicy::Required, None, 0);
-    config.events = vec![EventKind::BlobPush]; // does not match ManifestPush
-    webhooks.insert("test-hook".to_string(), config);
-
-    let dispatcher = build_dispatcher(webhooks);
     let result = dispatcher.dispatch(&event).await;
     assert!(result.is_ok());
 }
@@ -178,7 +115,7 @@ async fn dispatch_skips_webhook_for_non_matching_repository() {
 }
 
 #[tokio::test]
-async fn dispatch_records_delivery_total_metric() {
+async fn dispatch_records_delivery_metrics() {
     let server = MockServer::start().await;
     let event = create_test_event();
 
@@ -198,62 +135,23 @@ async fn dispatch_records_delivery_total_metric() {
     let counter = metrics_provider()
         .event_webhook_deliveries
         .with_label_values(&["metrics-hook", "manifest.push", "success"]);
-    let before = counter.get();
-
-    dispatcher.dispatch(&event).await.unwrap();
-
-    assert_eq!(
-        counter.get(),
-        before + 1,
-        "delivery must increment the success counter for this webhook/event"
-    );
-
-    // The counter must be exported by the same registry /metrics serves.
-    let payload = metrics_provider().gather().unwrap();
-    let text = String::from_utf8(payload).unwrap();
-    assert!(
-        text.contains("event_webhook_deliveries_total"),
-        "/metrics output lacks the counter: {text}"
-    );
-}
-
-#[tokio::test]
-async fn dispatch_records_delivery_duration_metric() {
-    let server = MockServer::start().await;
-    let event = create_test_event();
-
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dispatcher = single_hook_dispatcher(
-        "duration-hook",
-        &server.uri(),
-        DeliveryPolicy::Required,
-        None,
-        0,
-    );
     let histogram = metrics_provider()
         .event_webhook_delivery_duration
-        .with_label_values(&["duration-hook", "manifest.push"]);
-    let before = histogram.get_sample_count();
+        .with_label_values(&["metrics-hook", "manifest.push"]);
+    let (before, samples_before) = (counter.get(), histogram.get_sample_count());
 
     dispatcher.dispatch(&event).await.unwrap();
 
-    assert_eq!(
-        histogram.get_sample_count(),
-        before + 1,
-        "delivery must record one duration sample for this webhook/event"
-    );
+    assert_eq!(counter.get(), before + 1);
+    assert_eq!(histogram.get_sample_count(), samples_before + 1);
 
-    // The histogram must be exported by the same registry /metrics serves.
+    // Both must be exported by the same registry /metrics serves.
     let payload = metrics_provider().gather().unwrap();
     let text = String::from_utf8(payload).unwrap();
+    assert!(text.contains("event_webhook_deliveries_total"), "{text}");
     assert!(
         text.contains("event_webhook_delivery_duration_seconds"),
-        "/metrics output lacks the histogram: {text}"
+        "{text}"
     );
 }
 

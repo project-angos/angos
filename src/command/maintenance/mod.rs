@@ -9,7 +9,7 @@ mod error;
 pub mod executor;
 pub mod tags;
 #[cfg(test)]
-mod test_helper;
+pub mod test_helper;
 pub mod walk;
 
 pub use error::Error;

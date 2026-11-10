@@ -398,7 +398,7 @@ impl SecretScanner {
     fn scan(&mut self, line: &[u8]) {
         // A PEM block's base64 opens the line after its `BEGIN` line.
         if let Some(opened) = self.key_opened.take()
-            && line.iter().take_while(|&&byte| is_base64(byte)).count() >= 16
+            && opens_base64(line)
         {
             self.found.push(Secret {
                 kind: SecretKind::PrivateKey,
@@ -417,10 +417,7 @@ impl SecretScanner {
             let rest = &line[at + KEY_MARKER.len()..];
             if rest.is_empty() {
                 self.key_opened = Some(self.number);
-            } else if rest
-                .strip_prefix(b"\\n")
-                .is_some_and(|body| body.iter().take_while(|&&byte| is_base64(byte)).count() >= 16)
-            {
+            } else if rest.strip_prefix(b"\\n").is_some_and(opens_base64) {
                 kinds.push(SecretKind::PrivateKey);
             }
         }
@@ -485,14 +482,7 @@ fn is_key_id(byte: u8) -> bool {
 fn kubeconfig_key(line: &[u8]) -> bool {
     line.trim_ascii_start()
         .strip_prefix(b"client-key-data:")
-        .is_some_and(|value| {
-            value
-                .trim_ascii_start()
-                .iter()
-                .take_while(|&&byte| is_base64(byte))
-                .count()
-                >= 16
-        })
+        .is_some_and(|value| opens_base64(value.trim_ascii_start()))
 }
 
 /// A kubeconfig user's bearer `token`, set to a value rather than a placeholder.
@@ -524,6 +514,11 @@ fn aws_secret(line: &[u8]) -> bool {
 
 fn is_base64(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+}
+
+/// Whether `bytes` open with a run of base64 long enough to be key material.
+fn opens_base64(bytes: &[u8]) -> bool {
+    bytes.iter().take_while(|&&byte| is_base64(byte)).count() >= 16
 }
 
 /// Whether an `"auth"` of a Docker `config.json` is set to a value on `line`.
@@ -757,15 +752,12 @@ impl<R: Read> Read for Capped<'_, R> {
     }
 }
 
-/// Hands one chunk of checkpoints on to be stored.
-type ChunkSink<'a> = &'a mut dyn FnMut(Vec<Checkpoint>) -> io::Result<()>;
-
 /// The tar stream behind a layer: inflated, its checkpoints handed on a chunk
 /// at a time, or the bytes as they are.
 enum Source<'a, R: Read> {
     Gzip {
         inflater: Box<Inflater<BufReader<R>>>,
-        sink: ChunkSink<'a>,
+        sink: &'a mut dyn FnMut(Vec<Checkpoint>) -> io::Result<()>,
     },
     Plain {
         reader: BufReader<R>,

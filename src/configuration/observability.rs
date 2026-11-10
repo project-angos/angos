@@ -12,11 +12,7 @@ pub struct TracingConfig {
     pub sampling_rate: SamplingRate,
 }
 
-/// A validated sampling rate in the closed interval `[0.0, 1.0]`.
-///
-/// Rejects NaN, infinite values, negatives, and values greater than 1.0 at
-/// deserialisation time so that invalid configuration is caught before it
-/// reaches the OpenTelemetry sampler.
+/// A sampling rate in `[0.0, 1.0]`; NaN and infinities are rejected too.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(try_from = "f64")]
 pub struct SamplingRate(f64);

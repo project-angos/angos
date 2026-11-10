@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
-use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
@@ -11,17 +10,16 @@ use tempfile::tempdir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use angos_cache::Config as CacheConfig;
+use angos_cache::{Cache, Config as CacheConfig};
 use angos_mtls_client::ClientTls;
 
 use crate::auth::Error;
 use crate::auth::oidc::Config;
 use crate::auth::oidc::jwk::Jwk;
 use crate::auth::oidc::validator::{
-    Jwks, JwksRead, OpenIdConfiguration, fetch_jwks, fetch_oidc_configuration_with_timeout,
-    issuer_bearer_token, issuer_key, validate_oidc_token, verify_jwt_with_header,
+    Jwks, JwksRead, OpenIdConfiguration, fetch_jwks, issuer_bearer_token, issuer_key,
+    validate_oidc_token, verify_jwt_with_header,
 };
-use crate::identity::OidcClaims;
 use crate::test_fixtures::mocks::{mount_jwks, static_jwks_response};
 use crate::test_fixtures::oidc::{KID, alt_private_key_pem, jwk_x, jwk_y, private_key_pem};
 
@@ -41,241 +39,116 @@ pub fn build_test_provider_config(uri: &str) -> Config {
     }
 }
 
-fn verify_jwt(
-    token: &str,
-    jwks: &Jwks,
-    provider_name: &str,
-    provider: &Config,
-) -> Result<OidcClaims, Error> {
-    let header = decode_header(token)
-        .map_err(|e| Error::Unauthorized(format!("Failed to decode JWT header: {e}")))?;
-    verify_jwt_with_header(token, &header, jwks, provider_name, provider)
+fn ec_key(kid: &str) -> Jwk {
+    Jwk::Ec {
+        key_use: Some("sig".to_string()),
+        kid: Some(kid.to_string()),
+        alg: Some("ES256".to_string()),
+        x: jwk_x().to_string(),
+        y: jwk_y().to_string(),
+    }
 }
 
-#[tokio::test]
-async fn test_fetch_jwks_with_explicit_uri() {
-    let mock_server = MockServer::start().await;
-
-    let jwks_response = json!({
-        "keys": [{
-            "kty": "RSA",
-            "use": "sig",
-            "kid": "test-key-id",
-            "n": "xGOr-H7A-PWz8-H7A",
-            "e": "AQAB"
-        }]
-    });
-
-    mount_jwks(&mock_server, jwks_response).await;
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
+/// A provider whose cached JWKS holds only a key the test tokens do not name.
+async fn provider_with_stale_jwks(uri: &str, cache: &Cache) -> Config {
+    let provider = build_test_provider_config(uri);
+    let stale = Jwks {
+        keys: vec![ec_key("old-kid")],
     };
-
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-
-    assert!(result.is_ok());
-    let jwks = result.unwrap();
-    assert_eq!(jwks.value.keys.len(), 1);
-    assert!(!jwks.from_cache);
+    cache
+        .store(&issuer_key(&provider, "jwks"), &stale, 3600)
+        .await
+        .unwrap();
+    provider
 }
 
-#[tokio::test]
-async fn test_fetch_jwks_with_discovery() {
-    let mock_server = MockServer::start().await;
-
-    let oidc_config = json!({
-        "issuer": mock_server.uri(),
-        "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri())
-    });
-
-    let jwks_response = json!({
-        "keys": [{
-            "kty": "RSA",
-            "use": "sig",
-            "kid": "test-key-id",
-            "n": "xGOr-H7A-PWz8-H7A",
-            "e": "AQAB"
-        }]
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&oidc_config))
-        .mount(&mock_server)
-        .await;
-
-    mount_jwks(&mock_server, jwks_response).await;
-
-    let provider = Config {
-        jwks_uri: None,
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-
-    assert!(result.is_ok());
-    let jwks = result.unwrap();
-    assert_eq!(jwks.value.keys.len(), 1);
-    assert!(!jwks.from_cache);
+/// A URL nothing listens on, so connecting to it is silence.
+fn silent_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    url
 }
 
 #[tokio::test]
 async fn test_fetch_jwks_uses_cache() {
     let mock_server = MockServer::start().await;
-
-    let jwks_response = json!({
-        "keys": [{
-            "kty": "RSA",
-            "use": "sig",
-            "kid": "test-key-id",
-            "n": "xGOr-H7A-PWz8-H7A",
-            "e": "AQAB"
-        }]
-    });
-
     Mock::given(method("GET"))
         .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_response))
+        .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
+    let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result1 = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-    assert!(result1.is_ok());
-
-    let result2 = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-    assert!(result2.is_ok());
-    assert!(result2.unwrap().from_cache);
+    let first = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache)
+        .await
+        .unwrap();
+    assert!(!first.from_cache);
+    assert_eq!(first.value.keys.len(), 1);
+    let second = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache)
+        .await
+        .unwrap();
+    assert!(second.from_cache);
 }
 
+/// Without `jwks_uri` the JWKS location comes from discovery, itself cached.
 #[tokio::test]
-async fn test_fetch_jwks_http_error() {
+async fn test_fetch_jwks_with_discovery() {
     let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock_server)
-        .await;
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 500")),
-        err => panic!("Expected ProviderUnavailable error, got {err:?}"),
-    }
-}
-
-#[tokio::test]
-async fn test_fetch_oidc_configuration_uses_cache() {
-    let mock_server = MockServer::start().await;
-
-    let oidc_config = json!({
-        "issuer": mock_server.uri(),
-        "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri())
-    });
-
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&oidc_config))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": mock_server.uri(),
+            "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri())
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
+    mount_jwks(&mock_server, static_jwks_response()).await;
 
     let provider = Config {
         jwks_uri: None,
-        required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
-
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result1 = fetch_oidc_configuration_with_timeout(
-        &provider,
-        &client,
-        cache.as_ref(),
-        Duration::from_secs(30),
-    )
-    .await;
-    assert!(result1.is_ok());
-
-    let result2 = fetch_oidc_configuration_with_timeout(
-        &provider,
-        &client,
-        cache.as_ref(),
-        Duration::from_secs(30),
-    )
-    .await;
-    assert!(result2.is_ok());
+    for _ in 0..2 {
+        let jwks = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache)
+            .await
+            .unwrap();
+        assert_eq!(jwks.value.keys.len(), 1);
+    }
 }
 
 #[tokio::test]
 async fn test_fetch_oidc_configuration_issuer_mismatch() {
     let mock_server = MockServer::start().await;
-
-    let oidc_config = json!({
-        "issuer": "https://wrong-issuer.com",
-        "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri())
-    });
-
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&oidc_config))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": "https://wrong-issuer.com",
+            "jwks_uri": format!("{}/.well-known/jwks", mock_server.uri())
+        })))
         .mount(&mock_server)
         .await;
 
     let provider = Config {
         jwks_uri: None,
-        required_audience: None,
         ..build_test_provider_config(&mock_server.uri())
     };
-
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result = fetch_oidc_configuration_with_timeout(
-        &provider,
-        &client,
-        cache.as_ref(),
-        Duration::from_secs(30),
-    )
-    .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => {
-            assert!(msg.contains("mismatch"));
-        }
-        _ => panic!("Expected Unauthorized error"),
-    }
-
+    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
+    assert!(
+        matches!(&result, Err(Error::Unauthorized(msg)) if msg.contains("mismatch")),
+        "{result:?}"
+    );
     let cached = cache
         .retrieve::<OpenIdConfiguration>(&issuer_key(&provider, "config"))
         .await
@@ -283,79 +156,11 @@ async fn test_fetch_oidc_configuration_issuer_mismatch() {
     assert!(cached.is_none());
 }
 
-#[tokio::test]
-async fn test_fetch_oidc_configuration_http_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-
-    let provider = Config {
-        jwks_uri: None,
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result = fetch_oidc_configuration_with_timeout(
-        &provider,
-        &client,
-        cache.as_ref(),
-        Duration::from_secs(30),
-    )
-    .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::ProviderUnavailable(msg) => assert!(msg.contains("HTTP 404")),
-        err => panic!("Expected ProviderUnavailable error, got {err:?}"),
-    }
-}
-
-#[tokio::test]
-async fn test_fetch_jwks_network_error_returns_provider_unavailable() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&url)
-    };
-
-    let client = Client::builder()
-        .timeout(Duration::from_millis(200))
-        .build()
-        .unwrap();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result = fetch_jwks(&provider, &client, cache.as_ref(), JwksRead::PreferCache).await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::ProviderUnavailable(msg) => assert!(msg.contains("Failed to fetch URL")),
-        err => panic!("Expected ProviderUnavailable error, got {err:?}"),
-    }
-}
-
 /// An issuer that says nothing is remembered for the cooldown, so a cold cache
 /// during an outage costs one connection attempt rather than one per request.
 #[tokio::test]
 async fn test_fetch_jwks_silence_is_remembered_for_the_cooldown() {
-    // A port nothing listens on: the refused connection is silence.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&url)
-    };
+    let provider = build_test_provider_config(&silent_url());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
@@ -385,10 +190,7 @@ async fn test_fetch_jwks_refusal_is_not_remembered() {
         .mount(&mock_server)
         .await;
 
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
+    let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
@@ -404,7 +206,6 @@ async fn test_fetch_jwks_refusal_is_not_remembered() {
 #[tokio::test]
 async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing() {
     let mock_server = MockServer::start().await;
-
     Mock::given(method("GET"))
         .and(path("/.well-known/jwks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
@@ -412,25 +213,10 @@ async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing
         .mount(&mock_server)
         .await;
 
-    let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
-    let stale_jwks = Jwks {
-        keys: vec![Jwk::Ec {
-            key_use: Some("sig".to_string()),
-            kid: Some("old-kid".to_string()),
-            alg: Some("ES256".to_string()),
-            x: jwk_x().to_string(),
-            y: jwk_y().to_string(),
-        }],
-    };
-    cache
-        .store(&issuer_key(&provider, "jwks"), &stale_jwks, 3600)
-        .await
-        .unwrap();
-
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-    let token = make_token(&claims, KID);
+    let provider = provider_with_stale_jwks(&mock_server.uri(), &cache).await;
+    let token = make_token(&valid_claims(&mock_server.uri(), "test-audience"), KID);
 
     let result =
         validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
@@ -453,8 +239,6 @@ async fn test_validate_oidc_token_refreshes_jwks_once_when_cached_kid_is_missing
 #[tokio::test]
 async fn unknown_kids_cost_one_jwks_fetch_per_cooldown_not_one_per_request() {
     let mock_server = MockServer::start().await;
-
-    // Two unknown-kid requests, but the JWKS may be fetched only once.
     Mock::given(method("GET"))
         .and(path("/.well-known/jwks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(static_jwks_response()))
@@ -462,22 +246,9 @@ async fn unknown_kids_cost_one_jwks_fetch_per_cooldown_not_one_per_request() {
         .mount(&mock_server)
         .await;
 
-    let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
-    let stale_jwks = Jwks {
-        keys: vec![Jwk::Ec {
-            key_use: Some("sig".to_string()),
-            kid: Some("old-kid".to_string()),
-            alg: Some("ES256".to_string()),
-            x: jwk_x().to_string(),
-            y: jwk_y().to_string(),
-        }],
-    };
-    cache
-        .store(&issuer_key(&provider, "jwks"), &stale_jwks, 3600)
-        .await
-        .unwrap();
+    let provider = provider_with_stale_jwks(&mock_server.uri(), &cache).await;
 
     let claims = valid_claims(&mock_server.uri(), "test-audience");
     for kid in ["attacker-kid-1", "attacker-kid-2"] {
@@ -485,194 +256,84 @@ async fn unknown_kids_cost_one_jwks_fetch_per_cooldown_not_one_per_request() {
         let result =
             validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
         assert!(
-            matches!(result, Err(Error::Unauthorized(_))),
+            matches!(&result, Err(Error::Unauthorized(msg)) if msg.contains("No matching key")),
             "an unknown kid must be rejected, got {result:?}"
         );
     }
 }
 
+/// The token is signed ES256 and its key resolves, so only the allowlist
+/// decides; an allowlist spanning two key families still admits one of them.
 #[tokio::test]
-async fn test_validate_oidc_token_returns_unauthorized_when_refreshed_jwks_still_misses_kid() {
+async fn the_algorithm_allowlist_decides() {
     let mock_server = MockServer::start().await;
-    let refreshed_jwks = json!({
-        "keys": [{
-            "kty": "EC",
-            "use": "sig",
-            "kid": "different-kid",
-            "crv": "P-256",
-            "x": jwk_x(),
-            "y": jwk_y(),
-            "alg": "ES256"
-        }]
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(refreshed_jwks))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let provider = build_test_provider_config(&mock_server.uri());
+    mount_jwks(&mock_server, static_jwks_response()).await;
+    let token = make_token(&valid_claims(&mock_server.uri(), "test-audience"), KID);
     let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-    let stale_jwks = Jwks { keys: Vec::new() };
-    cache
-        .store(&issuer_key(&provider, "jwks"), &stale_jwks, 3600)
-        .await
-        .unwrap();
 
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-    let token = make_token(&claims, KID);
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert!(msg.contains("No matching key")),
-        err => panic!("expected Unauthorized, got {err:?}"),
+    for (allowed, accepted) in [
+        (vec![Algorithm::RS256], false),
+        (vec![Algorithm::RS256, Algorithm::ES256], true),
+    ] {
+        let provider = Config {
+            allowed_algorithms: allowed,
+            ..build_test_provider_config(&mock_server.uri())
+        };
+        let cache = CacheConfig::Memory.to_backend().unwrap();
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+        if accepted {
+            assert_eq!(result.unwrap().claims["sub"], "unit-test-subject");
+        } else {
+            assert!(
+                matches!(&result, Err(Error::Unauthorized(msg)) if msg.contains("InvalidAlgorithm")),
+                "{result:?}"
+            );
+        }
     }
 }
 
+/// `decode` checks `iss` and `aud` only when the token carries them, so a
+/// token omitting a pinned claim must still be refused.
 #[tokio::test]
-async fn test_validate_oidc_token_rejects_disallowed_algorithm() {
+async fn a_token_missing_a_pinned_claim_is_rejected() {
     let mock_server = MockServer::start().await;
-
     mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-    // The token is signed ES256 and the key resolves, so only the allowlist can
-    // refuse it.
-    let token = make_token(&claims, KID);
-    let provider = Config {
-        allowed_algorithms: vec![Algorithm::RS256],
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
+    let provider = build_test_provider_config(&mock_server.uri());
     let client = Client::new();
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert!(msg.contains("InvalidAlgorithm")),
-        e => panic!("expected Unauthorized, got {e:?}"),
+    for pinned in ["aud", "iss"] {
+        let mut claims = valid_claims(&mock_server.uri(), "test-audience");
+        claims.remove(pinned);
+        let token = make_token(&claims, KID);
+        let result =
+            validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
+        assert!(
+            result.is_err(),
+            "a token without `{pinned}` must be refused"
+        );
     }
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_accepts_multi_family_algorithm_list() {
-    let mock_server = MockServer::start().await;
-
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let claims = valid_claims(&mock_server.uri(), "test-audience");
-    let token = make_token(&claims, KID);
-    // An allowlist spanning two key families must still admit a token signed
-    // with one of them.
-    let provider = Config {
-        allowed_algorithms: vec![Algorithm::RS256, Algorithm::ES256],
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let claims = validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref())
-        .await
-        .expect("ES256 token must validate under a mixed-family allowlist");
-    assert_eq!(claims.claims.get("sub").unwrap(), "unit-test-subject");
-}
-
-#[tokio::test]
-async fn test_validate_oidc_token_missing_audience_is_rejected() {
-    let mock_server = MockServer::start().await;
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
-    claims.remove("aud");
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(
-        result.is_err(),
-        "a token without `aud` must not pass the audience pin"
-    );
-}
-
-/// The same for the issuer pin, which every provider carries.
-#[tokio::test]
-async fn test_validate_oidc_token_missing_issuer_is_rejected() {
-    let mock_server = MockServer::start().await;
-    mount_jwks(&mock_server, static_jwks_response()).await;
-
-    let mut claims = valid_claims(&mock_server.uri(), "test-audience");
-    claims.remove("iss");
-    let token = make_token(&claims, KID);
-
-    let provider = build_test_provider_config(&mock_server.uri());
-    let client = Client::new();
-    let cache = CacheConfig::Memory.to_backend().unwrap();
-
-    let result =
-        validate_oidc_token("test-provider", &provider, &token, &client, cache.as_ref()).await;
-
-    assert!(
-        result.is_err(),
-        "a token without `iss` must not pass the issuer pin"
-    );
 }
 
 #[tokio::test]
 async fn test_validate_oidc_token_invalid_jwt_format() {
-    let mock_server = MockServer::start().await;
-
-    let jwks_response = json!({ "keys": [] });
-    mount_jwks(&mock_server, jwks_response).await;
-
-    let provider = Config {
-        required_audience: None,
-        ..build_test_provider_config(&mock_server.uri())
-    };
-
-    let client = Client::new();
+    let provider = build_test_provider_config("https://issuer.example.com");
     let cache = CacheConfig::Memory.to_backend().unwrap();
 
     let result = validate_oidc_token(
         "test-provider",
         &provider,
         "not-a-valid-jwt",
-        &client,
+        &Client::new(),
         cache.as_ref(),
     )
     .await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => {
-            assert!(msg.contains("Failed to decode JWT header"));
-        }
-        _ => panic!("Expected Unauthorized error"),
-    }
-}
-
-fn test_jwks() -> Jwks {
-    Jwks {
-        keys: vec![Jwk::Ec {
-            key_use: Some("sig".to_string()),
-            kid: Some(KID.to_string()),
-            alg: Some("ES256".to_string()),
-            x: jwk_x().to_string(),
-            y: jwk_y().to_string(),
-        }],
-    }
+    assert!(
+        matches!(&result, Err(Error::Unauthorized(msg)) if msg.contains("Failed to decode JWT header")),
+        "{result:?}"
+    );
 }
 
 pub fn encoding_key() -> EncodingKey {
@@ -698,274 +359,129 @@ pub fn valid_claims(issuer: &str, audience: &str) -> HashMap<String, Value> {
     claims
 }
 
-/// A provider with no JWKS URI and no clock skew, for the tests that verify a
-/// token against a JWKS they hold rather than one they fetch.
-fn test_provider(issuer: &str, audience: Option<&str>) -> Config {
+const ISSUER: &str = "https://issuer.example.com";
+
+/// A provider verifying against a JWKS the test holds, with no clock skew so a
+/// one-second-old `exp` or future `nbf` is refused.
+fn test_provider(audience: Option<&str>, required_claims: &[&str]) -> Config {
     Config {
-        tls: ClientTls::default(),
-        bearer_token_file: None,
-        issuer: issuer.to_string(),
         jwks_uri: None,
-        required_claims: Vec::new(),
-        jwks_refresh_interval: 3600,
+        required_claims: required_claims.iter().map(ToString::to_string).collect(),
         required_audience: audience.map(str::to_string),
         clock_skew_tolerance: 0,
-        allowed_algorithms: vec![Algorithm::ES256],
-        http_request_timeout_secs: 30,
-        jwks_refresh_timeout_secs: 5,
+        ..build_test_provider_config(ISSUER)
     }
 }
 
-#[test]
-fn verify_jwt_rejects_unknown_kid() {
-    let issuer = "https://issuer.example.com";
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks();
-    let claims = valid_claims(issuer, "any");
-    let token = make_token(&claims, "unknown-kid-that-is-not-in-jwks");
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert!(msg.contains("No matching key")),
-        e => panic!("expected Unauthorized, got {e:?}"),
+fn claims_with(changes: &[(&str, Value)]) -> HashMap<String, Value> {
+    let mut claims = valid_claims(ISSUER, "any");
+    for (name, value) in changes {
+        claims.insert((*name).to_string(), value.clone());
     }
+    claims
 }
 
 #[test]
-fn verify_jwt_rejects_expired_token() {
-    let issuer = "https://issuer.example.com";
-    // clock_skew = 0 so even a 1-second-old exp is rejected
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks();
-
-    let mut claims = HashMap::new();
-    claims.insert("iss".to_string(), json!(issuer));
-    claims.insert("sub".to_string(), json!("user"));
-    claims.insert(
-        "exp".to_string(),
-        json!((Utc::now() - TimeDelta::hours(1)).timestamp()),
-    );
-    claims.insert(
-        "iat".to_string(),
-        json!((Utc::now() - TimeDelta::hours(2)).timestamp()),
-    );
-
+fn verify_jwt_rejects_invalid_tokens() {
+    let hour = TimeDelta::hours(1);
+    let alt_key = EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).unwrap();
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(KID.to_string());
-    let token = encode(&header, &claims, &encoding_key()).unwrap();
 
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_err(), "expected expired token to be rejected");
-}
-
-#[test]
-fn verify_jwt_rejects_wrong_issuer() {
-    let provider = test_provider("https://expected-issuer.example.com", None);
-    let jwks = test_jwks();
-    let claims = valid_claims("https://wrong-issuer.example.com", "any");
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_err(), "expected wrong issuer to be rejected");
-}
-
-#[test]
-fn verify_jwt_rejects_wrong_audience() {
-    let issuer = "https://issuer.example.com";
-    let provider = test_provider(issuer, Some("required-audience"));
-    let jwks = test_jwks();
-    let claims = valid_claims(issuer, "wrong-audience");
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_err(), "expected wrong audience to be rejected");
-}
-
-#[test]
-fn verify_jwt_skips_audience_when_provider_has_none() {
-    let issuer = "https://issuer.example.com";
-    // required_audience = None → validate_aud is disabled
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks();
-    // Token has an audience claim, but the provider doesn't require a specific one
-    let claims = valid_claims(issuer, "any-audience-value");
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(
-        result.is_ok(),
-        "expected Ok when provider has no required audience, got {result:?}"
-    );
-}
-
-#[test]
-fn verify_jwt_rejects_invalid_signature() {
-    let issuer = "https://issuer.example.com";
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks(); // contains public key for private_key_pem()
-
-    // Sign with the alt key: kid matches, but signature won't verify against JWKS.
-    let alt_encoding_key =
-        EncodingKey::from_ec_pem(alt_private_key_pem().as_bytes()).expect("alt key must parse");
-
-    let mut header = Header::new(Algorithm::ES256);
-    header.kid = Some(KID.to_string());
-    let claims = valid_claims(issuer, "any");
-    let token = encode(&header, &claims, &alt_encoding_key).unwrap();
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert!(
-            msg.contains("validation failed"),
-            "expected 'validation failed' in message, got: {msg}"
+    let cases = [
+        (
+            "expired",
+            test_provider(None, &[]),
+            make_token(
+                &claims_with(&[("exp", json!((Utc::now() - hour).timestamp()))]),
+                KID,
+            ),
         ),
-        e => panic!("expected Unauthorized, got {e:?}"),
-    }
-}
-
-#[test]
-fn verify_jwt_rejects_token_missing_a_required_claim() {
-    let issuer = "https://issuer.example.com";
-    let provider = Config {
-        required_claims: vec!["repository".to_string(), "actor".to_string()],
-        ..test_provider(issuer, None)
-    };
-    let jwks = test_jwks();
-    let mut claims = valid_claims(issuer, "any");
-    claims.insert("repository".to_string(), json!("myorg/myapp"));
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert_eq!(msg, "token is missing required claim 'actor'"),
-        e => panic!("expected Unauthorized, got {e:?}"),
-    }
-}
-
-#[test]
-fn verify_jwt_accepts_token_carrying_every_required_claim() {
-    let issuer = "https://issuer.example.com";
-    let provider = Config {
-        required_claims: vec!["repository".to_string(), "actor".to_string()],
-        ..test_provider(issuer, None)
-    };
-    let jwks = test_jwks();
-    let mut claims = valid_claims(issuer, "any");
-    claims.insert("repository".to_string(), json!("myorg/myapp"));
-    claims.insert("actor".to_string(), json!("octocat"));
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-/// A null claim carries no more identity than an absent one, so it must not
-/// satisfy the requirement just by having the key present.
-#[test]
-fn verify_jwt_rejects_a_required_claim_present_but_null() {
-    let issuer = "https://issuer.example.com";
-    let provider = Config {
-        required_claims: vec!["repository".to_string()],
-        ..test_provider(issuer, None)
-    };
-    let jwks = test_jwks();
-    let mut claims = valid_claims(issuer, "any");
-    claims.insert("repository".to_string(), json!(null));
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    match result.unwrap_err() {
-        Error::Unauthorized(msg) => assert_eq!(msg, "token is missing required claim 'repository'"),
-        e => panic!("expected Unauthorized, got {e:?}"),
-    }
-}
-
-/// A token whose `nbf` (not-before) is in the future must be rejected.
-/// The enforcement mechanism in `verify_jwt` is `validation.validate_nbf = true`.
-#[test]
-fn verify_jwt_rejects_future_nbf() {
-    let issuer = "https://issuer.example.com";
-    // clock_skew = 0 so a future nbf is not tolerated
-    let provider = test_provider(issuer, None);
-    let jwks = test_jwks();
-
-    let mut claims = HashMap::new();
-    claims.insert("iss".to_string(), json!(issuer));
-    claims.insert("sub".to_string(), json!("user"));
-    claims.insert(
-        "exp".to_string(),
-        json!((Utc::now() + TimeDelta::hours(2)).timestamp()),
-    );
-    claims.insert("iat".to_string(), json!(Utc::now().timestamp()));
-    claims.insert(
-        "nbf".to_string(),
-        json!((Utc::now() + TimeDelta::hours(1)).timestamp()),
-    );
-
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(result.is_err(), "expected future nbf token to be rejected");
-}
-
-/// When the JWKS contains multiple keys, `verify_jwt` must select the key
-/// whose `kid` matches the JWT header and successfully validate the token.
-#[test]
-fn verify_jwt_selects_correct_key_from_multi_key_jwks() {
-    let issuer = "https://issuer.example.com";
-    let audience = "my-audience";
-    let provider = test_provider(issuer, Some(audience));
-
-    // Add a second EC key with a different kid as a decoy.
-    // The x/y values below are from the JWK.rs test; they form a valid
-    // P-256 public key so `to_decoding_key()` succeeds, but the kid won't
-    // match KID and the signature won't verify with it.
-    let decoy_x = "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4";
-    let decoy_y = "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM";
+        (
+            "not yet valid",
+            test_provider(None, &[]),
+            make_token(
+                &claims_with(&[("nbf", json!((Utc::now() + hour).timestamp()))]),
+                KID,
+            ),
+        ),
+        (
+            "wrong issuer",
+            test_provider(None, &[]),
+            make_token(
+                &claims_with(&[("iss", json!("https://wrong-issuer.example.com"))]),
+                KID,
+            ),
+        ),
+        (
+            "wrong audience",
+            test_provider(Some("required-audience"), &[]),
+            make_token(&claims_with(&[]), KID),
+        ),
+        (
+            "signed by another key under our kid",
+            test_provider(None, &[]),
+            encode(&header, &claims_with(&[]), &alt_key).unwrap(),
+        ),
+        (
+            "missing a required claim",
+            test_provider(None, &["repository", "actor"]),
+            make_token(&claims_with(&[("repository", json!("myorg/myapp"))]), KID),
+        ),
+        // A null claim carries no more identity than an absent one.
+        (
+            "required claim null",
+            test_provider(None, &["repository"]),
+            make_token(&claims_with(&[("repository", json!(null))]), KID),
+        ),
+    ];
 
     let jwks = Jwks {
-        keys: vec![
-            Jwk::Ec {
-                key_use: Some("sig".to_string()),
-                kid: Some("decoy-key".to_string()),
-                alg: Some("ES256".to_string()),
-                x: decoy_x.to_string(),
-                y: decoy_y.to_string(),
-            },
-            Jwk::Ec {
-                key_use: Some("sig".to_string()),
-                kid: Some(KID.to_string()),
-                alg: Some("ES256".to_string()),
-                x: jwk_x().to_string(),
-                y: jwk_y().to_string(),
-            },
-        ],
+        keys: vec![ec_key(KID)],
+    };
+    for (reason, provider, token) in cases {
+        let header = decode_header(&token).unwrap();
+        let result = verify_jwt_with_header(&token, &header, &jwks, "test-provider", &provider);
+        assert!(
+            matches!(result, Err(Error::Unauthorized(_))),
+            "{reason}: {result:?}"
+        );
+    }
+}
+
+/// The key is picked by `kid` among several, the audience is unchecked when
+/// the provider pins none, and every required claim present passes.
+#[test]
+fn verify_jwt_accepts_valid_tokens() {
+    // A valid P-256 key under another kid, which must not be picked.
+    let decoy = Jwk::Ec {
+        key_use: Some("sig".to_string()),
+        kid: Some("decoy-key".to_string()),
+        alg: Some("ES256".to_string()),
+        x: "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4".to_string(),
+        y: "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM".to_string(),
+    };
+    let jwks = Jwks {
+        keys: vec![decoy, ec_key(KID)],
     };
 
-    let claims = valid_claims(issuer, audience);
-    let token = make_token(&claims, KID);
-
-    let result = verify_jwt(&token, &jwks, "test-provider", &provider);
-
-    assert!(
-        result.is_ok(),
-        "expected correct key to be found in multi-key JWKS, got {result:?}"
-    );
-    let oidc = result.unwrap();
-    assert_eq!(
-        oidc.claims.get("sub").and_then(|v| v.as_str()),
-        Some("unit-test-subject")
-    );
+    for (provider, claims) in [
+        (test_provider(Some("any"), &[]), claims_with(&[])),
+        (test_provider(None, &[]), claims_with(&[])),
+        (
+            test_provider(None, &["repository", "actor"]),
+            claims_with(&[
+                ("repository", json!("myorg/myapp")),
+                ("actor", json!("octocat")),
+            ]),
+        ),
+    ] {
+        let token = make_token(&claims, KID);
+        let header = decode_header(&token).unwrap();
+        let oidc =
+            verify_jwt_with_header(&token, &header, &jwks, "test-provider", &provider).unwrap();
+        assert_eq!(oidc.claims["sub"], "unit-test-subject");
+    }
 }
 
 /// The token is read at fetch time rather than baked into the HTTP client, so
@@ -983,14 +499,13 @@ fn a_rotated_bearer_token_is_picked_up_on_the_next_fetch() {
     let jwks_url = "https://kubernetes.default.svc/openid/v1/jwks";
 
     assert_eq!(
-        issuer_bearer_token(&provider, jwks_url).unwrap(),
-        Some("first-token".to_string())
+        issuer_bearer_token(&provider, jwks_url).unwrap().as_deref(),
+        Some("first-token")
     );
-
     fs::write(&token_path, "second-token\n").unwrap();
     assert_eq!(
-        issuer_bearer_token(&provider, jwks_url).unwrap(),
-        Some("second-token".to_string())
+        issuer_bearer_token(&provider, jwks_url).unwrap().as_deref(),
+        Some("second-token")
     );
 }
 

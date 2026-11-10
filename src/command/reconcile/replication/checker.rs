@@ -40,18 +40,6 @@ impl ReplicationChecker {
         }
     }
 
-    /// Re-checks a prune candidate against live state, since the local tag
-    /// walk is stale by the time the downstream listing returns. A read error
-    /// counts as present, so uncertainty never deletes.
-    async fn tag_absent_locally(&self, namespace: &Namespace, tag: &Tag) -> bool {
-        matches!(
-            self.metadata_store
-                .read_link(namespace, &LinkKind::Tag(tag.clone()))
-                .await,
-            Err(RegistryError::NotFound)
-        )
-    }
-
     /// A push for every diverging or downstream-missing tag, and for a
     /// `prune = true` downstream a delete for every downstream-only tag.
     async fn reconcile_downstream(
@@ -61,7 +49,18 @@ impl ReplicationChecker {
         local_tags: &[(Tag, Digest)],
         sink: &dyn ActionSink,
     ) {
-        reconcile_push_step(downstream, namespace, local_tags, sink).await;
+        // `Err` is unreachable for a routed namespace; warn-and-skip is defensive.
+        let remote = match downstream.remote(namespace) {
+            Ok(remote) => remote,
+            Err(e) => {
+                warn!(
+                    "Invalid downstream namespace on '{}' for '{namespace}'; skipping: {e}",
+                    downstream.name
+                );
+                return;
+            }
+        };
+        reconcile_push_step(downstream, &remote, namespace, local_tags, sink).await;
 
         // Prune is opt-in and one-way-mirror-only: the stamped `source_ts` LWW
         // only saves a future-dated downstream tag, so absence-driven deletion
@@ -70,17 +69,6 @@ impl ReplicationChecker {
             return;
         }
 
-        // `Err` is unreachable for a routed namespace; warn-and-skip is defensive.
-        let remote = match downstream.remote(namespace) {
-            Ok(remote) => remote,
-            Err(e) => {
-                warn!(
-                    "Invalid downstream namespace on '{}' for '{namespace}'; skipping cleanup: {e}",
-                    downstream.name
-                );
-                return;
-            }
-        };
         let downstream_tags = match downstream
             .registry_client
             .list_tags(ListTagsRequest {
@@ -105,9 +93,14 @@ impl ReplicationChecker {
             if local_set.contains(tag.as_ref()) {
                 continue;
             }
-            // A tag pushed locally after the walk is absent here
-            // yet present downstream, so re-read live state before reaping it.
-            if !self.tag_absent_locally(namespace, &tag).await {
+            // A tag pushed locally after the walk is absent from it yet live,
+            // so re-read it; a read error counts as present, so uncertainty
+            // never deletes.
+            let live = self
+                .metadata_store
+                .read_link(namespace, &LinkKind::Tag(tag.clone()))
+                .await;
+            if !matches!(live, Err(RegistryError::NotFound)) {
                 continue;
             }
             if let Err(e) = sink
@@ -133,6 +126,7 @@ impl ReplicationChecker {
 /// one. An unresolved tag is skipped here but still counts as local for prune.
 async fn reconcile_push_step(
     downstream: &ReplicationDownstream,
+    remote: &Namespace,
     namespace: &Namespace,
     local_tags: &[(Tag, Digest)],
     sink: &dyn ActionSink,
@@ -143,29 +137,15 @@ async fn reconcile_push_step(
         Skipped,
     }
 
-    // `Err` is unreachable for a routed namespace; warn-and-skip is defensive.
-    let remote = match downstream.remote(namespace) {
-        Ok(remote) => remote,
-        Err(e) => {
-            warn!(
-                "Invalid downstream namespace on '{}' for '{namespace}'; skipping push: {e}",
-                downstream.name
-            );
-            return;
-        }
-    };
-    let remote = &remote;
-
     let probes: Vec<Probe> = stream::iter(local_tags.to_vec())
         .map(|(tag, local)| async move {
-            let reference = Reference::Tag(tag.clone());
             // Only a 404 means absence; any other HEAD failure skips the tag
             // rather than enqueuing a spurious push.
             match downstream
                 .registry_client
                 .head_manifest(HeadManifestRequest {
                     namespace: remote.clone(),
-                    reference: reference.clone(),
+                    reference: Reference::Tag(tag.clone()),
                     accepted_types: manifest_accept_types(),
                 })
                 .await
@@ -193,7 +173,7 @@ async fn reconcile_push_step(
                 }
             }
         })
-        .buffer_unordered(downstream.max_concurrent_pushes.max(1))
+        .buffer_unordered(downstream.max_concurrent_pushes.get())
         .collect()
         .await;
 
@@ -289,7 +269,6 @@ mod tests {
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
     use angos_oci::{Digest, Namespace, Tag};
-    use angos_oci_client::RegistryClient;
     use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
     use angos_storage::{Error as StorageError, ObjectStore};
 
@@ -301,13 +280,15 @@ mod tests {
     use crate::jobs::Queue;
     use crate::jobs::runner::execute_one;
     use crate::jobs::store::{ClaimMode, JobStore};
+    use crate::metrics_provider::metrics_provider;
     use crate::registry::Repository;
+    use crate::registry::blob_store::BlobStore;
     use crate::registry::keys::NamespaceExt;
-    use crate::registry::metadata_store::LinkKind;
+    use crate::registry::metadata_store::{LinkKind, MetadataStore};
     use crate::registry::repository_resolver::RepositoryResolver;
     use crate::registry::test_utils::{
         FsTestStack, downstream_client, fs_test_stack, metadata_store_over, put_blob_direct,
-        repository_with_replication, seed_links, seed_manifest,
+        repository_with_replication, seed_links, seed_manifest, test_downstream,
     };
     use crate::replication::{ReplicationDownstream, ReplicationJobHandler, ReplicationMode};
 
@@ -319,553 +300,310 @@ mod tests {
         Namespace::new(NAMESPACE).unwrap()
     }
 
-    fn repository(client: Arc<RegistryClient>, mode: ReplicationMode, prune: bool) -> Repository {
-        repository_with_replication(
-            REPO,
-            vec![ReplicationDownstream {
-                mode,
-                prune,
-                ..ReplicationDownstream::new(DOWNSTREAM.to_string(), client, 4)
-            }],
-        )
-    }
-
-    /// A path-prefixed downstream: content `nginx/app` maps to remote
-    /// `mirror/app`.
-    fn prefixed_repository(
-        client: Arc<RegistryClient>,
+    /// A repository replicating to the mock at `uri`; `prefixed` maps content
+    /// `nginx/app` to remote `mirror/app`.
+    fn resolver(
+        uri: &str,
         mode: ReplicationMode,
         prune: bool,
-    ) -> Repository {
-        repository_with_replication(
-            REPO,
-            vec![ReplicationDownstream {
-                local_namespace: Some(Namespace::new("nginx").unwrap()),
-                target_namespace: Some(Namespace::new("mirror").unwrap()),
-                mode,
-                prune,
-                ..ReplicationDownstream::new(DOWNSTREAM.to_string(), client, 4)
-            }],
-        )
-    }
-
-    fn resolver_for(repo: Repository) -> Arc<RepositoryResolver> {
-        let mut repositories = HashMap::new();
-        repositories.insert(REPO.to_string(), repo);
+        prefixed: bool,
+    ) -> Arc<RepositoryResolver> {
+        let mut downstream = ReplicationDownstream {
+            mode,
+            prune,
+            ..test_downstream(DOWNSTREAM.to_string(), downstream_client(uri))
+        };
+        if prefixed {
+            downstream.local_namespace = Some(Namespace::new("nginx").unwrap());
+            downstream.target_namespace = Some(Namespace::new("mirror").unwrap());
+        }
+        let repositories: HashMap<String, Repository> = HashMap::from([(
+            REPO.to_string(),
+            repository_with_replication(REPO, vec![downstream]),
+        )]);
         Arc::new(RepositoryResolver::new(Arc::new(repositories)).unwrap())
     }
 
-    #[tokio::test]
-    async fn enqueues_push_for_tag_missing_on_downstream() {
-        let FsTestStack {
-            dir: _dir,
+    fn checker(
+        metadata_store: &Arc<MetadataStore>,
+        server: &MockServer,
+        prune: bool,
+    ) -> ReplicationChecker {
+        ReplicationChecker::new(
+            metadata_store.clone(),
+            resolver(&server.uri(), ReplicationMode::EventReconcile, prune, false),
+        )
+    }
 
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
+    async fn seed_tag(stack: &FsTestStack, namespace: &Namespace, tag: &str) -> Digest {
+        let manifest =
+            put_blob_direct(&stack.blob_store, format!("manifest-{tag}").as_bytes()).await;
         seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
+            &stack.metadata_store,
+            namespace,
+            &[(LinkKind::Tag(Tag::new(tag).unwrap()), manifest.clone())],
         )
         .await
         .unwrap();
+        manifest
+    }
 
+    /// The downstream answers a manifest HEAD with `digest`, or 404 without one.
+    async fn mount_head(server: &MockServer, remote: &str, tag: &str, digest: Option<&Digest>) {
+        let response = match digest {
+            Some(digest) => ResponseTemplate::new(200)
+                .insert_header(DOCKER_CONTENT_DIGEST, digest.to_string().as_str())
+                .insert_header("Content-Length", "15"),
+            None => ResponseTemplate::new(404),
+        };
         Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
+            .and(path(format!("/v2/{remote}/manifests/{tag}")))
+            .respond_with(response)
+            .mount(server)
             .await;
+    }
 
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
+    fn tag_list(remote: &str, tags: &[&str]) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{remote}/tags/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": tags })))
+    }
 
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
+    async fn actions(checker: &ReplicationChecker, namespace: &Namespace) -> Vec<Action> {
+        let sink = Mutex::new(Vec::new());
+        checker.check(namespace, &sink).await.unwrap();
+        sink.into_inner().unwrap()
+    }
 
-        assert_eq!(sink.lock().unwrap().len(), 1);
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::EnqueueReplicationPush { downstream, tag, digest, .. })
-                if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
-        ));
+    fn job_store(metadata_store: &Arc<MetadataStore>) -> Arc<JobStore> {
+        Arc::new(JobStore::new(
+            metadata_store,
+            "scrub-test",
+            ClaimMode::Atomic,
+        ))
+    }
+
+    /// Enqueues through a real executor, as `angos reconcile` does.
+    async fn check_into(
+        checker: &ReplicationChecker,
+        namespace: &Namespace,
+        blob_store: &Arc<BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
+        job_store: &Arc<JobStore>,
+    ) -> u64 {
+        let executor = Executor::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            job_store.clone(),
+            None,
+        );
+        checker.check(namespace, &executor).await.unwrap();
+        job_store
+            .count_pending(Queue::Replication, 0)
+            .await
+            .unwrap()
+    }
+
+    async fn drain(job_store: &JobStore, handler: &ReplicationJobHandler) -> u64 {
+        let mut drained = 0;
+        while let Some(claimed) = job_store
+            .claim_one(Queue::Replication)
+            .await
+            .unwrap()
+            .claimed
+        {
+            execute_one(job_store, handler, claimed).await;
+            drained += 1;
+        }
+        drained
+    }
+
+    fn is_push(action: &Action, tag: &str, digest: &Digest) -> bool {
+        matches!(
+            action,
+            Action::Job(JobAction::EnqueueReplicationPush { downstream, tag: t, digest: d, .. })
+                if downstream == DOWNSTREAM && t == tag && d == digest
+        )
+    }
+
+    /// Event-only downstreams are left to the event path; the other modes get
+    /// a push for a tag missing downstream.
+    #[tokio::test]
+    async fn the_mode_decides_whether_a_missing_tag_is_pushed() {
+        let stack = fs_test_stack();
+        let manifest = seed_tag(&stack, &namespace(), "v1").await;
+        let server = MockServer::start().await;
+        mount_head(&server, NAMESPACE, "v1", None).await;
+
+        for (mode, pushed) in [
+            (ReplicationMode::EventReconcile, true),
+            (ReplicationMode::ReconcileOnly, true),
+            (ReplicationMode::EventOnly, false),
+        ] {
+            let checker = ReplicationChecker::new(
+                stack.metadata_store.clone(),
+                resolver(&server.uri(), mode, false, false),
+            );
+            let actions = actions(&checker, &namespace()).await;
+            if pushed {
+                assert!(
+                    actions.len() == 1 && is_push(&actions[0], "v1", &manifest),
+                    "{mode:?}: {} action(s)",
+                    actions.len()
+                );
+            } else {
+                assert!(actions.is_empty(), "{mode:?}: {} action(s)", actions.len());
+            }
+        }
+    }
+
+    /// A converged tag is left alone, a diverging one pushed.
+    #[tokio::test]
+    async fn the_downstream_digest_decides_the_push() {
+        let stack = fs_test_stack();
+        let converged = seed_tag(&stack, &namespace(), "converged").await;
+        let diverged = seed_tag(&stack, &namespace(), "diverged").await;
+        let server = MockServer::start().await;
+        mount_head(&server, NAMESPACE, "converged", Some(&converged)).await;
+        let stale =
+            Digest::sha256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
+        mount_head(&server, NAMESPACE, "diverged", Some(&stale)).await;
+
+        let actions = actions(
+            &checker(&stack.metadata_store, &server, false),
+            &namespace(),
+        )
+        .await;
+        assert!(
+            actions.len() == 1 && is_push(&actions[0], "diverged", &diverged),
+            "{} action(s)",
+            actions.len()
+        );
     }
 
     #[tokio::test]
     async fn enqueues_push_for_prefixed_downstream_at_mapped_path() {
-        // The probe must hit `mirror/app`, not the local `nginx/app`; the
-        // `.expect(1)` asserts it on `MockServer` drop.
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
+        let stack = fs_test_stack();
         let content = Namespace::new("nginx/app").unwrap();
-        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
-        seed_links(
-            &metadata_store,
-            &content,
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
+        let manifest = seed_tag(&stack, &content, "v1").await;
+        let server = MockServer::start().await;
+        // The probe must hit `mirror/app`, not the local `nginx/app`.
+        mount_head(&server, "mirror/app", "v1", None).await;
 
-        Mock::given(method("HEAD"))
-            .and(path("/v2/mirror/app/manifests/v1"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(prefixed_repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&content, &sink).await.unwrap();
-
-        assert_eq!(sink.lock().unwrap().len(), 1);
+        let checker = ReplicationChecker::new(
+            stack.metadata_store.clone(),
+            resolver(&server.uri(), ReplicationMode::EventReconcile, false, true),
+        );
+        let actions = actions(&checker, &content).await;
+        assert!(
+            actions.len() == 1 && is_push(&actions[0], "v1", &manifest),
+            "{} action(s)",
+            actions.len()
+        );
         assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::EnqueueReplicationPush { downstream, namespace, tag, digest })
-                if downstream == DOWNSTREAM
-                    && namespace == "nginx/app"
-                    && tag == "v1"
-                    && *digest == manifest
+            &actions[0],
+            Action::Job(JobAction::EnqueueReplicationPush { namespace, .. }) if namespace == "nginx/app"
         ));
-
-        // Drop explicitly so the mapped-path `.expect(1)` is verified here.
-        drop(mock_server);
     }
 
     #[tokio::test]
     async fn prunes_prefixed_downstream_at_mapped_path() {
-        // The list and delete must hit `mirror/app`, not `nginx/app`; the
-        // `.expect(1)` on each asserts it.
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            blob_store,
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
+        let stack = fs_test_stack();
         let content = Namespace::new("nginx/app").unwrap();
         // `v1` converges; `stray` is downstream-only and must be pruned.
-        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
-        seed_links(
-            &metadata_store,
-            &content,
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/mirror/app/manifests/v1"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest.to_string().as_str())
-                    .insert_header("Content-Length", "15"),
-            )
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v2/mirror/app/tags/list"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["v1", "stray"] })),
-            )
+        let manifest = seed_tag(&stack, &content, "v1").await;
+        let server = MockServer::start().await;
+        mount_head(&server, "mirror/app", "v1", Some(&manifest)).await;
+        tag_list("mirror/app", &["v1", "stray"])
             .expect(1)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
         Mock::given(method("DELETE"))
             .and(path("/v2/mirror/app/manifests/stray"))
             .respond_with(ResponseTemplate::new(202))
             .expect(1)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
 
-        let resolver = resolver_for(prefixed_repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        ));
-        let job_store = Arc::new(JobStore::new(
-            &metadata_store,
-            "scrub-test",
-            ClaimMode::Atomic,
-        ));
+        let resolver = resolver(&server.uri(), ReplicationMode::EventReconcile, true, true);
+        let checker = ReplicationChecker::new(stack.metadata_store.clone(), resolver.clone());
+        let job_store = job_store(&stack.metadata_store);
 
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
-
-        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-            job_store.clone(),
-        ));
-        checker.check(&content, executor.as_mut()).await.unwrap();
+        let pending = check_into(
+            &checker,
+            &content,
+            &stack.blob_store,
+            &stack.metadata_store,
+            &job_store,
+        )
+        .await;
         assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            1,
+            pending, 1,
             "the downstream-only tag must enqueue exactly one delete job"
         );
-
         let handler = ReplicationJobHandler::new(
-            resolver.clone(),
-            blob_store.clone(),
-            metadata_store.clone(),
+            resolver,
+            stack.blob_store.clone(),
+            stack.metadata_store.clone(),
         );
-
-        let mut drained: u64 = 0;
-        loop {
-            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
-            let Some(claimed) = outcome.claimed else {
-                break;
-            };
-            execute_one(&job_store, &handler, claimed).await;
-            drained += 1;
-        }
-        assert_eq!(drained, 1, "exactly one delete job is drained");
+        assert_eq!(drain(&job_store, &handler).await, 1);
 
         // Drop explicitly so the `.expect(1)` counts are verified here.
-        drop(mock_server);
+        drop(server);
     }
 
     #[tokio::test]
     async fn transient_head_failure_skips_tag_without_enqueuing() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"manifest-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest)],
-        )
-        .await
-        .unwrap();
-
+        let stack = fs_test_stack();
+        seed_tag(&stack, &namespace(), "v1").await;
+        let server = MockServer::start().await;
         Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
             .respond_with(ResponseTemplate::new(500))
-            .mount(&mock_server)
+            .mount(&server)
             .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
 
         // Metrics are process-global and shared across tests: assert a delta.
-        let skipped_before = crate::metrics_provider::metrics_provider()
-            .replication_reconcile_total
-            .with_label_values(&["skipped"])
-            .get();
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "a transient downstream HEAD failure must not enqueue a push, got {} action(s)",
-            sink.lock().unwrap().len()
-        );
-        let skipped_after = crate::metrics_provider::metrics_provider()
-            .replication_reconcile_total
-            .with_label_values(&["skipped"])
-            .get();
-        assert_eq!(
-            skipped_after - skipped_before,
-            1,
-            "a skipped tag must record replication_reconcile_total{{outcome=\"skipped\"}} \
-             so a persistently failing downstream (e.g. bad credentials) is visible"
-        );
-    }
-
-    /// An `ActionSink` that fails the first `fail_first` applies.
-    struct FlakySink {
-        attempted: Mutex<Vec<Action>>,
-        fail_first: usize,
-    }
-
-    #[async_trait]
-    impl ActionSink for FlakySink {
-        async fn apply(&self, action: Action) -> Result<(), Error> {
-            let mut attempted = self.attempted.lock().unwrap();
-            attempted.push(action);
-            if attempted.len() <= self.fail_first {
-                return Err(Error::Initialization("simulated enqueue failure".into()));
-            }
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn enqueue_failure_does_not_abort_remaining_tags() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        for tag in ["v1", "v2"] {
-            let body = format!("manifest-{tag}");
-            let manifest = put_blob_direct(&blob_store, body.as_bytes()).await;
-            seed_links(
-                &metadata_store,
-                &namespace(),
-                &[(LinkKind::Tag(Tag::new(tag).unwrap()), manifest)],
-            )
-            .await
-            .unwrap();
-        }
-
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink = FlakySink {
-            attempted: Mutex::new(Vec::new()),
-            fail_first: 1,
+        let skipped = || {
+            metrics_provider()
+                .replication_reconcile_total
+                .with_label_values(&["skipped"])
+                .get()
         };
-        checker.check(&namespace(), &sink).await.unwrap();
+        let skipped_before = skipped();
 
-        let attempted = sink.attempted.lock().unwrap();
-        let attempted: Vec<&str> = attempted
-            .iter()
-            .filter_map(|a| match a {
-                Action::Job(JobAction::EnqueueReplicationPush { tag, .. }) => Some(tag.as_ref()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            attempted.contains(&"v1") && attempted.contains(&"v2"),
-            "both diverging tags must be attempted despite the first enqueue failing (got {attempted:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn prune_enqueue_failure_does_not_abort_remaining_deletes() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        // No local tags: both downstream tags are prune-eligible.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["stray1", "stray2"] })),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink = FlakySink {
-            attempted: Mutex::new(Vec::new()),
-            fail_first: 1,
-        };
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        let deleted = sink.attempted.lock().unwrap();
-        let deleted: Vec<&str> = deleted
-            .iter()
-            .filter_map(|a| match a {
-                Action::Job(JobAction::EnqueueReplicationDelete { tag, .. }) => Some(tag.as_ref()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            deleted.contains(&"stray1") && deleted.contains(&"stray2"),
-            "both downstream-only tags must be attempted despite the first delete enqueue failing (got {deleted:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn no_action_when_downstream_digest_matches() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
-        seed_links(
-            &metadata_store,
+        let actions = actions(
+            &checker(&stack.metadata_store, &server, false),
             &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
         )
-        .await
-        .unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest.to_string().as_str())
-                    .insert_header("Content-Length", "15"),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "converged tag must not enqueue a push"
-        );
-    }
-
-    #[tokio::test]
-    async fn enqueues_push_when_downstream_digest_diverges() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"new-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        let stale =
-            Digest::sha256("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-                .unwrap();
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, stale.to_string().as_str())
-                    .insert_header("Content-Length", "9"),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
+        .await;
+        assert!(actions.is_empty(), "{} action(s)", actions.len());
         assert_eq!(
-            sink.lock().unwrap().len(),
+            skipped() - skipped_before,
             1,
-            "diverging tag must enqueue a push"
+            "a skipped tag must be counted so a persistently failing downstream is visible"
         );
     }
 
+    /// The probe phase fans out, so no tag may be dropped by the concurrency.
     #[tokio::test]
     async fn enqueues_pushes_for_every_diverging_tag() {
-        // The probe phase fans out, so no tag may be dropped by the concurrency.
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"new-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[
-                (LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone()),
-                (LinkKind::Tag(Tag::new("v2").unwrap()), manifest.clone()),
-                (LinkKind::Tag(Tag::new("v3").unwrap()), manifest.clone()),
-            ],
-        )
-        .await
-        .unwrap();
-
+        let stack = fs_test_stack();
         for tag in ["v1", "v2", "v3"] {
-            Mock::given(method("HEAD"))
-                .and(path(format!("/v2/{NAMESPACE}/manifests/{tag}")))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&mock_server)
-                .await;
+            seed_tag(&stack, &namespace(), tag).await;
         }
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
 
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        let sink = sink.into_inner().unwrap();
-        let mut tags: Vec<&str> = sink
+        let actions = actions(
+            &checker(&stack.metadata_store, &server, false),
+            &namespace(),
+        )
+        .await;
+        let mut tags: Vec<&str> = actions
             .iter()
             .filter_map(|action| match action {
                 Action::Job(JobAction::EnqueueReplicationPush { tag, .. }) => Some(tag.as_ref()),
@@ -873,67 +611,73 @@ mod tests {
             })
             .collect();
         tags.sort_unstable();
-        assert_eq!(
-            tags,
-            vec!["v1", "v2", "v3"],
-            "every diverging tag must enqueue a push"
-        );
+        assert_eq!(tags, ["v1", "v2", "v3"]);
+    }
+
+    /// An `ActionSink` that fails its first apply.
+    #[derive(Default)]
+    struct FlakySink {
+        attempted: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ActionSink for FlakySink {
+        async fn apply(&self, action: Action) -> Result<(), Error> {
+            let mut attempted = self.attempted.lock().unwrap();
+            if let Action::Job(
+                JobAction::EnqueueReplicationPush { tag, .. }
+                | JobAction::EnqueueReplicationDelete { tag, .. },
+            ) = action
+            {
+                attempted.push(tag.to_string());
+            }
+            if attempted.len() == 1 {
+                return Err(Error::Initialization("simulated enqueue failure".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// One failed enqueue skips neither the remaining pushes nor the remaining
+    /// deletes.
+    #[tokio::test]
+    async fn an_enqueue_failure_does_not_abort_the_pass() {
+        let stack = fs_test_stack();
+        for tag in ["v1", "v2"] {
+            seed_tag(&stack, &namespace(), tag).await;
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        tag_list(NAMESPACE, &["v1", "v2", "stray1", "stray2"])
+            .mount(&server)
+            .await;
+
+        let sink = FlakySink::default();
+        checker(&stack.metadata_store, &server, true)
+            .check(&namespace(), &sink)
+            .await
+            .unwrap();
+
+        let mut attempted = sink.attempted.into_inner().unwrap();
+        attempted.sort_unstable();
+        assert_eq!(attempted, ["stray1", "stray2", "v1", "v2"]);
     }
 
     #[tokio::test]
     async fn enqueues_delete_for_downstream_only_tag() {
-        let FsTestStack {
-            dir: _dir,
+        let stack = fs_test_stack();
+        let manifest = seed_tag(&stack, &namespace(), "v1").await;
+        let server = MockServer::start().await;
+        mount_head(&server, NAMESPACE, "v1", Some(&manifest)).await;
+        tag_list(NAMESPACE, &["v1", "stray"]).mount(&server).await;
 
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest.to_string().as_str())
-                    .insert_header("Content-Length", "15"),
-            )
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["v1", "stray"] })),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "only the downstream-only tag should produce an action"
-        );
+        let actions = actions(&checker(&stack.metadata_store, &server, true), &namespace()).await;
+        assert_eq!(actions.len(), 1);
         assert!(matches!(
-            &sink.lock().unwrap()[0],
+            &actions[0],
             Action::Job(JobAction::EnqueueReplicationDelete { downstream, namespace, tag })
                 if downstream == DOWNSTREAM && namespace == NAMESPACE && tag == "stray"
         ));
@@ -941,61 +685,26 @@ mod tests {
 
     #[tokio::test]
     async fn prune_rechecks_live_state_and_spares_a_tag_pushed_after_the_walk() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
+        let stack = fs_test_stack();
         // `fresh` was pushed locally after the reconcile walk read the tags.
-        let manifest = put_blob_direct(&blob_store, b"fresh-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("fresh").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        // The downstream carries the fresh tag plus a genuinely-gone one.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["fresh", "stray"] })),
-            )
-            .mount(&mock_server)
+        seed_tag(&stack, &namespace(), "fresh").await;
+        let server = MockServer::start().await;
+        tag_list(NAMESPACE, &["fresh", "stray"])
+            .mount(&server)
             .await;
 
-        let repo = repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        );
-        let downstream = &repo.replication[0];
-        let checker = ReplicationChecker::new(
-            metadata_store.clone(),
-            resolver_for(repository(
-                downstream_client(&mock_server.uri()),
-                ReplicationMode::EventReconcile,
-                true,
-            )),
-        );
+        let resolver = resolver(&server.uri(), ReplicationMode::EventReconcile, true, false);
+        let downstream = &resolver.resolve(&namespace()).unwrap().replication[0];
+        let checker = ReplicationChecker::new(stack.metadata_store.clone(), resolver.clone());
 
         // The empty list stands in for a walk that ran before `fresh` existed.
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
+        let sink = Mutex::new(Vec::new());
         checker
             .reconcile_downstream(downstream, &namespace(), &[], &sink)
             .await;
 
-        let actions = sink.lock().unwrap();
-        assert_eq!(
-            actions.len(),
-            1,
-            "the live re-check must spare 'fresh' and delete only 'stray'"
-        );
+        let actions = sink.into_inner().unwrap();
+        assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
             Action::Job(JobAction::EnqueueReplicationDelete { tag, .. }) if tag == "stray"
@@ -1004,58 +713,23 @@ mod tests {
 
     #[tokio::test]
     async fn no_delete_when_prune_disabled() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"converged-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest.to_string().as_str())
-                    .insert_header("Content-Length", "15"),
-            )
-            .mount(&mock_server)
-            .await;
+        let stack = fs_test_stack();
+        let manifest = seed_tag(&stack, &namespace(), "v1").await;
+        let server = MockServer::start().await;
+        mount_head(&server, NAMESPACE, "v1", Some(&manifest)).await;
         // `.expect(0)` fails if the checker enumerates downstream tags at all.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["v1", "stray"] })),
-            )
+        tag_list(NAMESPACE, &["v1", "stray"])
             .expect(0)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
 
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "prune disabled: a downstream-only tag must not be deleted"
-        );
-        drop(mock_server);
+        let actions = actions(
+            &checker(&stack.metadata_store, &server, false),
+            &namespace(),
+        )
+        .await;
+        assert!(actions.is_empty(), "{} action(s)", actions.len());
+        drop(server);
     }
 
     /// Fails every listing of one tag's entry directory, so resolving that tag
@@ -1078,130 +752,28 @@ mod tests {
 
     #[tokio::test]
     async fn unreadable_local_tag_is_skipped_but_never_pruned() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let tag = Tag::new("broken").unwrap();
+        let stack = fs_test_stack();
         let hooked: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
-            metadata_store.object_store().clone(),
+            stack.metadata_store.object_store().clone(),
             FailTagResolution {
-                dir: namespace().tag_entry_dir(&tag),
+                dir: namespace().tag_entry_dir(&Tag::new("broken").unwrap()),
             },
         ));
         let metadata_store = metadata_store_over(hooked);
-
+        let server = MockServer::start().await;
         // No HEAD mock: the push loop must never probe an unreadable tag.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": ["broken"] })))
+        tag_list(NAMESPACE, &["broken"])
             .expect(1)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
 
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
+        let actions = actions(&checker(&metadata_store, &server, true), &namespace()).await;
         assert!(
-            sink.lock().unwrap().is_empty(),
-            "an unreadable local tag must be skipped for push AND protected from prune, got {} action(s)",
-            sink.lock().unwrap().len()
+            actions.is_empty(),
+            "skipped for push and protected from prune: {} action(s)",
+            actions.len()
         );
-        drop(mock_server);
-    }
-
-    #[tokio::test]
-    async fn skips_event_only_downstream() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-
-        let manifest = put_blob_direct(&blob_store, b"event-only-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        // Unreachable URL: an event-only downstream must never be contacted.
-        let resolver = resolver_for(repository(
-            downstream_client("http://127.0.0.1:1"),
-            ReplicationMode::EventOnly,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert!(
-            sink.lock().unwrap().is_empty(),
-            "event-only downstream must be skipped"
-        );
-    }
-
-    #[tokio::test]
-    async fn enqueues_push_for_reconcile_only_downstream() {
-        let FsTestStack {
-            dir: _dir,
-
-            metadata_store,
-            blob_store,
-            ..
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let manifest = put_blob_direct(&blob_store, b"reconcile-only-bytes").await;
-        seed_links(
-            &metadata_store,
-            &namespace(),
-            &[(LinkKind::Tag(Tag::new("v1").unwrap()), manifest.clone())],
-        )
-        .await
-        .unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::ReconcileOnly,
-            false,
-        ));
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver);
-
-        let sink: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &sink).await.unwrap();
-
-        assert_eq!(
-            sink.lock().unwrap().len(),
-            1,
-            "reconcile-only downstream must reconcile a missing tag"
-        );
-        assert!(matches!(
-            &sink.lock().unwrap()[0],
-            Action::Job(JobAction::EnqueueReplicationPush { downstream, tag, digest, .. })
-                if downstream == DOWNSTREAM && tag == "v1" && *digest == manifest
-        ));
+        drop(server);
     }
 
     /// Mounts a downstream missing tag `v1` and both blobs, expecting the full
@@ -1256,204 +828,47 @@ mod tests {
     /// coalescing of a duplicate enqueue.
     #[tokio::test]
     async fn scrub_replicate_enqueues_then_drains_and_converges() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            blob_store,
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
+        let stack = fs_test_stack();
+        let server = MockServer::start().await;
         let (manifest_digest, config_digest, layer_digest) =
-            seed_manifest(&blob_store, &metadata_store, &namespace()).await;
+            seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace()).await;
+        mount_out_of_sync_downstream(&server, &manifest_digest, &config_digest, &layer_digest)
+            .await;
 
-        mount_out_of_sync_downstream(
-            &mock_server,
-            &manifest_digest,
-            &config_digest,
-            &layer_digest,
-        )
-        .await;
+        let resolver = resolver(&server.uri(), ReplicationMode::EventReconcile, false, false);
+        let checker = ReplicationChecker::new(stack.metadata_store.clone(), resolver.clone());
+        let job_store = job_store(&stack.metadata_store);
 
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            false,
-        ));
-
-        let job_store = Arc::new(JobStore::new(
-            &metadata_store,
-            "scrub-test",
-            ClaimMode::Atomic,
-        ));
-
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
-
-        let captured: Mutex<Vec<Action>> = Mutex::new(Vec::new());
-        checker.check(&namespace(), &captured).await.unwrap();
-        let captured = captured.into_inner().unwrap();
-        assert_eq!(captured.len(), 1, "out-of-sync tag must emit one action");
-        assert!(matches!(
-            &captured[0],
-            Action::Job(JobAction::EnqueueReplicationPush { downstream, namespace, tag, digest })
-                if downstream == DOWNSTREAM
-                    && namespace == NAMESPACE
-                    && tag == "v1"
-                    && *digest == manifest_digest
-        ));
-
-        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-            job_store.clone(),
-        ));
-        checker
-            .check(&namespace(), executor.as_mut())
-            .await
-            .unwrap();
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            1,
-            "the divergent tag must enqueue exactly one replication job"
-        );
-
-        checker
-            .check(&namespace(), executor.as_mut())
-            .await
-            .unwrap();
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            1,
-            "a second reconcile pass must coalesce on lock_key (no new job)"
-        );
+        for pass in 0..2 {
+            let pending = check_into(
+                &checker,
+                &namespace(),
+                &stack.blob_store,
+                &stack.metadata_store,
+                &job_store,
+            )
+            .await;
+            assert_eq!(
+                pending, 1,
+                "pass {pass}: a second pass coalesces on lock_key"
+            );
+        }
 
         let handler = ReplicationJobHandler::new(
-            resolver.clone(),
-            blob_store.clone(),
-            metadata_store.clone(),
+            resolver,
+            stack.blob_store.clone(),
+            stack.metadata_store.clone(),
         );
-
-        let mut drained: u64 = 0;
-        loop {
-            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
-            let Some(claimed) = outcome.claimed else {
-                break;
-            };
-            execute_one(&job_store, &handler, claimed).await;
-            drained += 1;
-        }
-        assert_eq!(drained, 1, "exactly one coalesced job is drained");
+        assert_eq!(drain(&job_store, &handler).await, 1);
         assert_eq!(
             job_store
                 .count_pending(Queue::Replication, 0)
                 .await
                 .unwrap(),
-            0,
-            "the queue must be empty after the drain"
+            0
         );
 
         // Drop explicitly so a `.expect(...)` mismatch surfaces here.
-        drop(mock_server);
-    }
-
-    /// Full delete chain: a downstream-only tag is enqueued and the drain
-    /// issues exactly one downstream DELETE.
-    #[tokio::test]
-    async fn scrub_replicate_deletes_downstream_only_tag() {
-        let FsTestStack {
-            dir: _dir,
-            metadata_store,
-            blob_store,
-        } = fs_test_stack();
-        let mock_server = MockServer::start().await;
-
-        let (manifest_digest, _config_digest, _layer_digest) =
-            seed_manifest(&blob_store, &metadata_store, &namespace()).await;
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str())
-                    .insert_header("Content-Length", "15"),
-            )
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{NAMESPACE}/tags/list")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "tags": ["v1", "stray"] })),
-            )
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/stray")))
-            .respond_with(ResponseTemplate::new(202))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let resolver = resolver_for(repository(
-            downstream_client(&mock_server.uri()),
-            ReplicationMode::EventReconcile,
-            true,
-        ));
-        let job_store = Arc::new(JobStore::new(
-            &metadata_store,
-            "scrub-test",
-            ClaimMode::Atomic,
-        ));
-
-        let checker = ReplicationChecker::new(metadata_store.clone(), resolver.clone());
-
-        let mut executor: Box<dyn ActionSink> = Box::new(Executor::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-            job_store.clone(),
-        ));
-        checker
-            .check(&namespace(), executor.as_mut())
-            .await
-            .unwrap();
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            1,
-            "the downstream-only tag must enqueue exactly one delete job"
-        );
-
-        let handler = ReplicationJobHandler::new(
-            resolver.clone(),
-            blob_store.clone(),
-            metadata_store.clone(),
-        );
-
-        let mut drained: u64 = 0;
-        loop {
-            let outcome = job_store.claim_one(Queue::Replication).await.unwrap();
-            let Some(claimed) = outcome.claimed else {
-                break;
-            };
-            execute_one(&job_store, &handler, claimed).await;
-            drained += 1;
-        }
-        assert_eq!(drained, 1, "exactly one delete job is drained");
-        assert_eq!(
-            job_store
-                .count_pending(Queue::Replication, 0)
-                .await
-                .unwrap(),
-            0,
-            "the queue must be empty after the drain"
-        );
-
-        // Drop explicitly so the `.expect(1)` on the DELETE is verified here.
-        drop(mock_server);
+        drop(server);
     }
 }

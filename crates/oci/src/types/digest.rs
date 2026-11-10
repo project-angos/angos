@@ -26,8 +26,6 @@ impl Algorithm {
         }
     }
 
-    /// Length of the lowercase-hex encoding of this algorithm's hash
-    /// (64 for sha256, 128 for sha512).
     #[must_use]
     pub fn hex_len(self) -> usize {
         match self {
@@ -60,8 +58,6 @@ impl TryFrom<String> for Algorithm {
 impl FromStr for Algorithm {
     type Err = Error;
 
-    /// Parse an algorithm name; the single point that rejects unsupported
-    /// algorithms.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "sha256" => Ok(Algorithm::Sha256),
@@ -79,9 +75,7 @@ impl Display for Algorithm {
     }
 }
 
-/// A validated OCI content digest: an [`Algorithm`] plus its lowercase-hex hash.
-/// The private `hash` field forces construction through the validating
-/// constructors below.
+/// An [`Algorithm`] plus its lowercase-hex hash.
 #[derive(Debug, Clone, Ord, Eq, Hash, PartialEq, PartialOrd, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Digest {
@@ -105,8 +99,7 @@ impl Digest {
         &self.hash[0..2]
     }
 
-    /// Build a digest from a bare hash (no `algorithm:` prefix), validating it
-    /// is exactly `algorithm.hex_len()` lowercase hex characters.
+    /// Builds a digest from a bare hash.
     ///
     /// # Errors
     ///
@@ -128,22 +121,13 @@ impl Digest {
         })
     }
 
-    /// Build a sha256 digest from a bare hash.
+    /// Builds a sha256 digest from a bare hash.
     ///
     /// # Errors
     ///
     /// Returns an error when `hash` is not 64 lowercase hex characters.
     pub fn sha256(hash: &str) -> Result<Self, Error> {
         Self::with_algorithm(Algorithm::Sha256, hash)
-    }
-
-    /// Build a sha512 digest from a bare hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `hash` is not 128 lowercase hex characters.
-    pub fn sha512(hash: &str) -> Result<Self, Error> {
-        Self::with_algorithm(Algorithm::Sha512, hash)
     }
 
     /// Build a digest from a hasher's finalized raw bytes. Infallible: a
@@ -155,7 +139,6 @@ impl Digest {
         }
     }
 
-    /// The digest of `bytes` under `algorithm`, computed in one shot.
     pub fn from_bytes(algorithm: Algorithm, bytes: impl AsRef<[u8]>) -> Self {
         match algorithm {
             Algorithm::Sha256 => Self::from_finalized(algorithm, Sha256::digest(bytes)),
@@ -163,8 +146,6 @@ impl Digest {
         }
     }
 
-    /// The sha256 digest of `bytes` (the canonical algorithm), computed in one
-    /// shot.
     pub fn sha256_of_bytes(bytes: impl AsRef<[u8]>) -> Self {
         Self::from_bytes(Algorithm::Sha256, bytes)
     }
@@ -277,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_sha512_display_round_trip() {
-        let digest = Digest::sha512(VALID_HASH_512).unwrap();
+        let digest = Digest::with_algorithm(Algorithm::Sha512, VALID_HASH_512).unwrap();
         assert_eq!(digest.to_string(), format!("sha512:{VALID_HASH_512}"));
         assert_eq!(Digest::from_str(&digest.to_string()).unwrap(), digest);
     }
@@ -294,6 +275,9 @@ mod tests {
     fn test_from_bytes_sha512_matches_known_empty() {
         let digest = Digest::from_bytes(Algorithm::Sha512, b"");
         let expected = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
-        assert_eq!(digest, Digest::sha512(expected).unwrap());
+        assert_eq!(
+            digest,
+            Digest::with_algorithm(Algorithm::Sha512, expected).unwrap()
+        );
     }
 }

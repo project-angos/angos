@@ -64,15 +64,11 @@ impl Scanner {
         Ok(output.stdout)
     }
 
-    /// Pulls the vulnerability database of a scanner that [`owns_database`].
-    ///
-    /// [`owns_database`]: Scanner::owns_database
+    /// Only a scanner that [`owns_database`](Scanner::owns_database) has one to pull.
     pub async fn update_database(self) -> Result<(), Error> {
-        if self.owns_database() {
-            let mut command = Command::new(self.as_str());
-            command.args(["db", "update"]);
-            self.run(command).await?;
-        }
+        let mut command = Command::new(self.as_str());
+        command.args(["db", "update"]);
+        self.run(command).await?;
         Ok(())
     }
 

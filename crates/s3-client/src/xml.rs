@@ -1,27 +1,23 @@
 //! The S3 XML bodies angos reads and writes, as serde shapes.
 
-use chrono::{DateTime, Utc};
 use quick_xml::de::from_reader;
 use quick_xml::escape::escape;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::ops::UploadedPart;
+use crate::ops::{MultipartUpload, MultipartUploadListing, UploadedPart};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct S3ErrorBody {
     pub code: Option<String>,
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ListObjectsV2Output {
     pub contents: Vec<String>,
     pub common_prefixes: Vec<String>,
-    /// Where the next page starts, `Some` exactly when the listing is
-    /// truncated. A caller that stops on `None` therefore cannot mistake a
-    /// truncated page for a complete one.
     pub next_continuation_token: Option<String>,
 }
 
@@ -49,13 +45,13 @@ struct Prefixed {
     prefix: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchDeleteError {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 pub struct DeleteObjectsOutput {
     #[serde(default, rename = "Error")]
     pub errors: Vec<BatchDeleteError>,
@@ -63,52 +59,30 @@ pub struct DeleteObjectsOutput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct InitiateMultipartUploadResult {
-    upload_id: String,
+pub struct InitiateMultipartUploadResult {
+    pub upload_id: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct CopyPartResult {
-    e_tag: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct MultipartUploadOutput {
-    pub key: String,
-    pub upload_id: String,
-    #[serde(rename = "Initiated")]
-    pub initiated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListMultipartUploadsOutput {
-    pub uploads: Vec<MultipartUploadOutput>,
-    /// Where the next page starts, `Some` exactly when the listing is
-    /// truncated. `next_upload_id_marker` only refines it, so it is `None`
-    /// whenever this is.
-    pub next_key_marker: Option<String>,
-    pub next_upload_id_marker: Option<String>,
+pub struct CopyPartResult {
+    pub e_tag: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ListMultipartUploadsResult {
     #[serde(default, rename = "Upload")]
-    uploads: Vec<MultipartUploadOutput>,
+    uploads: Vec<MultipartUpload>,
     #[serde(default)]
     is_truncated: bool,
     next_key_marker: Option<String>,
     next_upload_id_marker: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ListPartsOutput {
     pub parts: Vec<UploadedPart>,
-    /// Where the next page starts, `Some` exactly when the listing is
-    /// truncated, so the paging loop terminates on `None` rather than
-    /// re-requesting the first page forever.
     pub next_part_number_marker: Option<u32>,
 }
 
@@ -122,7 +96,7 @@ struct ListPartsResult {
     next_part_number_marker: Option<u32>,
 }
 
-fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+pub fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
     from_reader(body).map_err(|e| e.to_string())
 }
 
@@ -140,10 +114,6 @@ fn resume_marker<T>(
     }
 }
 
-pub fn parse_error(body: &[u8]) -> S3ErrorBody {
-    parse(body).unwrap_or_default()
-}
-
 pub fn parse_list_objects_v2(body: &[u8]) -> Result<ListObjectsV2Output, String> {
     let page: ListBucketResult = parse(body)?;
     Ok(ListObjectsV2Output {
@@ -157,21 +127,9 @@ pub fn parse_list_objects_v2(body: &[u8]) -> Result<ListObjectsV2Output, String>
     })
 }
 
-pub fn parse_delete_objects(body: &[u8]) -> Result<DeleteObjectsOutput, String> {
-    parse(body)
-}
-
-pub fn parse_create_multipart_upload(body: &[u8]) -> Result<String, String> {
-    parse(body).map(|result: InitiateMultipartUploadResult| result.upload_id)
-}
-
-pub fn parse_upload_part_copy(body: &[u8]) -> Result<String, String> {
-    parse(body).map(|result: CopyPartResult| result.e_tag)
-}
-
-pub fn parse_list_multipart_uploads(body: &[u8]) -> Result<ListMultipartUploadsOutput, String> {
+pub fn parse_list_multipart_uploads(body: &[u8]) -> Result<MultipartUploadListing, String> {
     let page: ListMultipartUploadsResult = parse(body)?;
-    Ok(ListMultipartUploadsOutput {
+    Ok(MultipartUploadListing {
         uploads: page.uploads,
         next_key_marker: resume_marker(page.is_truncated, page.next_key_marker, "multipart")?,
         next_upload_id_marker: page.next_upload_id_marker.filter(|_| page.is_truncated),
@@ -294,14 +252,15 @@ mod tests {
 
     #[test]
     fn parse_error_only_treats_top_level_error_as_s3_error() {
-        let top_level =
-            parse_error(b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>");
+        let top_level: S3ErrorBody =
+            parse(b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>").unwrap();
         assert_eq!(top_level.code.as_deref(), Some("AccessDenied"));
         assert_eq!(top_level.message.as_deref(), Some("denied"));
 
-        let nested = parse_error(
+        let nested: S3ErrorBody = parse(
             b"<DeleteResult><Error><Code>AccessDenied</Code><Message>denied</Message></Error></DeleteResult>",
-        );
+        )
+        .unwrap_or_default();
         assert_eq!(nested.code, None);
         assert_eq!(nested.message, None);
     }

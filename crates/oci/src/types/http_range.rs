@@ -1,21 +1,15 @@
-//! Byte ranges on the wire: the window a client asks for in a `Range` header,
-//! and the window a `206` reports in `Content-Range`. Parsing and formatting
-//! both live here so the registry, the request layer, and the upstream client
-//! read and write one grammar.
+//! Byte ranges on the wire: `Range` requests and `Content-Range` answers.
 
 use std::fmt::{self, Display, Formatter};
-use std::num::ParseIntError;
 use std::str::FromStr;
 
 use http::header::{HeaderValue, InvalidHeaderValue};
 
 static BYTES_RANGE_PREFIX: &str = "bytes=";
 static BYTES_CONTENT_PREFIX: &str = "bytes ";
-/// The `Content-Range` complete length of a body whose total size is unknown.
 static UNKNOWN_TOTAL_LENGTH: &str = "*";
 
-/// Why a range could not be read or served. Every variant is a `416` to the
-/// client, so callers map it onto their own not-satisfiable error.
+/// Every variant is a `416` to the client.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -28,50 +22,18 @@ fn malformed(value: &str) -> Error {
     Error::Malformed(format!("Invalid Range header format: '{value}'"))
 }
 
-/// An unsigned decimal of ASCII digits only: `u64::from_str` also takes a
-/// leading `+`, which no range grammar allows.
-struct Decimal(u64);
-
-impl FromStr for Decimal {
-    /// `None` when the value is not all digits, the overflow otherwise.
-    type Err = Option<ParseIntError>;
-
-    fn from_str(number: &str) -> Result<Self, Self::Err> {
-        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(None);
-        }
-        number.parse().map(Decimal).map_err(Some)
+/// Reads the `part` of header `value` that `number` spells, as ASCII digits
+/// only: `u64::from_str` also takes a leading `+`. An overflow names its part.
+fn read_decimal(number: &str, part: &str, value: &str) -> Result<u64, Error> {
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(malformed(value));
     }
+    number.parse().map_err(|error| {
+        Error::Malformed(format!("Error parsing '{part}' in Range header: {error}"))
+    })
 }
 
-impl Decimal {
-    /// Reads the `part` of header `value` that `number` spells. A value that is
-    /// not digits is malformed as a whole; an overflow names its part.
-    fn read(number: &str, part: &str, value: &str) -> Result<u64, Error> {
-        match number.parse() {
-            Ok(Decimal(number)) => Ok(number),
-            Err(None) => Err(malformed(value)),
-            Err(Some(error)) => Err(Error::Malformed(format!(
-                "Error parsing '{part}' in Range header: {error}"
-            ))),
-        }
-    }
-}
-
-/// Splits the `bytes=` unit off a `Range` value. Checked rather than
-/// positional: the prefix length can land inside a multi-byte character, which
-/// `split_at` panics on.
-fn strip_bytes_prefix(value: &str) -> Option<&str> {
-    let (prefix, range_value) = value.split_at_checked(BYTES_RANGE_PREFIX.len())?;
-
-    prefix
-        .eq_ignore_ascii_case(BYTES_RANGE_PREFIX)
-        .then_some(range_value)
-}
-
-/// An explicit byte window: where it starts, and where it ends when an end is
-/// named. The `Range` header's `start-end` form and a `Content-Range` are the
-/// same window, so both parse to this.
+/// An explicit byte window, as a `Range` or a `Content-Range` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteWindow {
     pub start: u64,
@@ -79,10 +41,7 @@ pub struct ByteWindow {
 }
 
 impl ByteWindow {
-    /// The inclusive bounds of the window a chunk declares, which end-5 spells
-    /// `<start>-<end>` and pins to `^[0-9]+-[0-9]+$`. Both ends are required,
-    /// so the open-ended form only a `Range` may use is malformed here, as is
-    /// the `bytes=` unit that belongs to `Range` alone.
+    /// The window a chunk declares, which end-5 pins to `^[0-9]+-[0-9]+$`.
     ///
     /// # Errors
     ///
@@ -95,9 +54,7 @@ impl ByteWindow {
         }
     }
 
-    /// Parses a `start-end` value where `end` is optional (`100-200`, `0-`),
-    /// which is the explicit form of a `Range`. A `Content-Range` requires both
-    /// ends and goes through [`Self::chunk_bounds`].
+    /// Parses `start-end` with an optional end (`100-200`, `0-`).
     ///
     /// # Errors
     ///
@@ -106,12 +63,12 @@ impl ByteWindow {
     pub fn parse(value: &str) -> Result<Self, Error> {
         let (start, end) = value.split_once('-').ok_or_else(|| malformed(value))?;
 
-        let start = Decimal::read(start, "start", value)?;
+        let start = read_decimal(start, "start", value)?;
         if end.is_empty() {
             return Ok(ByteWindow { start, end: None });
         }
 
-        let end = Decimal::read(end, "end", value)?;
+        let end = read_decimal(end, "end", value)?;
         if start > end {
             return Err(Error::Malformed(format!(
                 "Invalid Range header: start ({start}) > end ({end})"
@@ -124,29 +81,17 @@ impl ByteWindow {
         })
     }
 
-    /// Whether `received` bytes is what this window declared. Only a `Range`
-    /// window names no end, and it declares nothing to disagree with.
+    /// Whether `received` bytes is what this window declared; an open window
+    /// declares nothing.
     #[must_use]
     pub fn covers(self, received: u64) -> bool {
-        // Compared without the `+ 1` a window ending at `u64::MAX` would
-        // overflow: it declares one byte more than a `u64` can count, so
-        // nothing covers it.
+        // No `+ 1`: a window ending at `u64::MAX` would overflow it.
         self.end
             .is_none_or(|end| received.checked_sub(1) == Some(end.saturating_sub(self.start)))
     }
-
-    /// Whether this window resumes at `committed`: a gap or a rewind is an
-    /// out-of-order chunk, not a digest mismatch.
-    #[must_use]
-    pub fn starts_at(self, committed: u64) -> bool {
-        self.start == committed
-    }
 }
 
-/// A single byte range as a client asks for it: an explicit window, or a suffix
-/// length anchored to the end of the body. A suffix is its own variant because
-/// its number is a length rather than a position, and cannot be resolved to a
-/// window without knowing how long the body is.
+/// A requested range; a suffix is a length, resolvable only against the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestRange {
     FromTo(ByteWindow),
@@ -154,15 +99,23 @@ pub enum RequestRange {
 }
 
 impl RequestRange {
-    /// Parses a `Range` header value. `None` is a multi-range request, which is
-    /// answered with the whole body rather than refused.
+    /// `None` is a multi-range request, answered with the whole body.
     ///
     /// # Errors
     ///
     /// [`Error::Malformed`] for a value without the `bytes=` unit, with a
     /// non-numeric bound, or with an end before its start.
     pub fn parse(value: &str) -> Result<Option<Self>, Error> {
-        let Some(range_value) = strip_bytes_prefix(value) else {
+        // Checked: the prefix length can land inside a multi-byte character.
+        let Some(range_value) =
+            value
+                .split_at_checked(BYTES_RANGE_PREFIX.len())
+                .and_then(|(prefix, rest)| {
+                    prefix
+                        .eq_ignore_ascii_case(BYTES_RANGE_PREFIX)
+                        .then_some(rest)
+                })
+        else {
             return Err(malformed(value));
         };
 
@@ -171,7 +124,7 @@ impl RequestRange {
         }
 
         if let Some(suffix) = range_value.strip_prefix('-') {
-            let suffix = Decimal::read(suffix, "suffix", value)?;
+            let suffix = read_decimal(suffix, "suffix", value)?;
             return Ok(Some(RequestRange::Suffix(suffix)));
         }
 
@@ -180,9 +133,8 @@ impl RequestRange {
             .map(Some)
     }
 
-    /// Resolves the requested window against a known body length, clamping an
-    /// end past the last byte and a suffix longer than the body. `None` means
-    /// the range is to be ignored, as an empty body has no window to serve.
+    /// Resolves against the body length, clamping to it. `None` ignores the
+    /// range, as an empty body has no window.
     ///
     /// # Errors
     ///
@@ -248,8 +200,7 @@ impl TryFrom<RequestRange> for HeaderValue {
     }
 }
 
-/// The window a `206` serves. `total_length` is absent when the complete length
-/// is unknown, which `Content-Range` spells `*`.
+/// The window a `206` serves; an unknown total is spelled `*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResponseRange {
     pub start: u64,
@@ -258,7 +209,6 @@ pub struct ResponseRange {
 }
 
 impl ResponseRange {
-    /// The number of bytes served, `end` being inclusive.
     #[must_use]
     pub fn length(self) -> u64 {
         self.end - self.start + 1
@@ -276,16 +226,16 @@ impl FromStr for ResponseRange {
         let total_length = if total_length == UNKNOWN_TOTAL_LENGTH {
             None
         } else {
-            Some(Decimal::read(total_length, "complete length", value)?)
+            Some(read_decimal(total_length, "complete length", value)?)
         };
 
         // A served window always names its last byte, like a chunk's.
-        let (start, end) = match ByteWindow::parse(window)? {
-            ByteWindow {
-                start,
-                end: Some(end),
-            } => (start, end),
-            ByteWindow { end: None, .. } => return Err(malformed(window)),
+        let ByteWindow {
+            start,
+            end: Some(end),
+        } = ByteWindow::parse(window)?
+        else {
+            return Err(malformed(window));
         };
 
         Ok(ResponseRange {
@@ -358,9 +308,6 @@ mod tests {
         ));
     }
 
-    /// The unit is stripped by byte offset, which lands inside a multi-byte
-    /// character here. A header value never carries one, but this is a `pub`
-    /// parser, and refusing beats panicking.
     #[test]
     fn parse_refuses_a_value_that_is_not_ascii() {
         for value in ["bytes€", "byte€=0-5", "€"] {
@@ -371,10 +318,6 @@ mod tests {
         }
     }
 
-    /// end-5 pins a chunk's `Content-Range` to `^[0-9]+-[0-9]+$`: both ends are
-    /// required, the `bytes=` unit is the `Range` header's, and neither the
-    /// open-ended form nor a prefixed one is that grammar. `parse` stays
-    /// permissive because a `Range` may spell `5-`.
     #[test]
     fn chunk_bounds_pin_the_grammar_end_5_defines() {
         assert_eq!(
@@ -400,9 +343,6 @@ mod tests {
         );
     }
 
-    /// A window ending at the maximum offset declares one byte more than a
-    /// `u64` can count, so no length covers it. The header is client-supplied,
-    /// and computing the length by adding one would overflow.
     #[test]
     fn a_window_ending_at_the_maximum_offset_is_covered_by_nothing() {
         let window = ByteWindow {
@@ -414,8 +354,6 @@ mod tests {
         assert!(!window.covers(u64::MAX));
     }
 
-    /// A chunk that names its last byte declares how many bytes it carries. The
-    /// open-ended window only a `Range` can produce declares nothing.
     #[test]
     fn chunk_range_covers_only_the_length_it_declared() {
         let window = ByteWindow {
@@ -432,18 +370,6 @@ mod tests {
         };
         assert!(open.covers(0));
         assert!(open.covers(4096));
-    }
-
-    /// A chunk resumes a session only at the offset the session stands at.
-    #[test]
-    fn chunk_range_starts_only_where_the_session_stands() {
-        let window = ByteWindow {
-            start: 10,
-            end: Some(19),
-        };
-        assert!(window.starts_at(10));
-        assert!(!window.starts_at(9));
-        assert!(!window.starts_at(11));
     }
 
     #[test]
@@ -506,21 +432,17 @@ mod tests {
             })
         );
         assert_eq!(
-            RequestRange::Suffix(99).resolve(10).unwrap(),
+            RequestRange::Suffix(4).resolve(10).unwrap(),
             Some(ResponseRange {
-                start: 0,
+                start: 6,
                 end: 9,
                 total_length: Some(10)
             })
         );
-    }
-
-    #[test]
-    fn resolve_reads_a_suffix_from_the_end() {
         assert_eq!(
-            RequestRange::Suffix(4).resolve(10).unwrap(),
+            RequestRange::Suffix(99).resolve(10).unwrap(),
             Some(ResponseRange {
-                start: 6,
+                start: 0,
                 end: 9,
                 total_length: Some(10)
             })
@@ -589,15 +511,12 @@ mod tests {
         assert_eq!(range.to_string(), "bytes 5-10/*");
     }
 
-    /// An upstream `Content-Range` that names no last byte cannot describe a served
-    /// window, so it must not be forwarded as one.
     #[test]
     fn response_range_rejects_an_open_ended_window() {
         assert!("bytes 5-/100".parse::<ResponseRange>().is_err());
         assert!("5-10/100".parse::<ResponseRange>().is_err());
     }
 
-    /// `u64::from_str` takes a leading `+`; no range grammar does.
     #[test]
     fn numbers_are_ascii_digits_only() {
         assert!(RequestRange::parse("bytes=+5-10").is_err());

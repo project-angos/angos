@@ -73,20 +73,28 @@ fn log_denial_uses_audit_identity_without_oidc_claims() {
     tracing::subscriber::with_default(subscriber, || log_denial("test reason", &identity));
 
     let logs = log_capture.contents();
-    assert!(logs.contains("test reason"), "logs were: {logs}");
-    assert!(logs.contains("mtls"), "logs were: {logs}");
-    assert!(logs.contains("client-123"), "logs were: {logs}");
-    assert!(logs.contains("ci-bot"), "logs were: {logs}");
-    assert!(logs.contains("192.0.2.10"), "logs were: {logs}");
-    assert!(logs.contains("BuildOrg"), "logs were: {logs}");
-    assert!(logs.contains("build-cert"), "logs were: {logs}");
-    assert!(logs.contains("github-actions"), "logs were: {logs}");
-    assert!(!logs.contains("person@example.com"), "logs were: {logs}");
-    assert!(!logs.contains("repo:private/repo"), "logs were: {logs}");
-    assert!(!logs.contains("internal-secret"), "logs were: {logs}");
-    assert!(!logs.contains("custom_claim"), "logs were: {logs}");
-    assert!(!logs.contains("email"), "logs were: {logs}");
-    assert!(!logs.contains("sub"), "logs were: {logs}");
+    for audited in [
+        "test reason",
+        "mtls",
+        "client-123",
+        "ci-bot",
+        "192.0.2.10",
+        "BuildOrg",
+        "build-cert",
+        "github-actions",
+    ] {
+        assert!(logs.contains(audited), "{audited} missing from: {logs}");
+    }
+    for claim in [
+        "person@example.com",
+        "repo:private/repo",
+        "internal-secret",
+        "custom_claim",
+        "email",
+        "sub",
+    ] {
+        assert!(!logs.contains(claim), "{claim} leaked into: {logs}");
+    }
 }
 
 /// `has_repository_policy()` lets a global rule hand a request over to the
@@ -113,33 +121,29 @@ async fn has_repository_policy_hands_the_decision_to_the_repository() {
         username: Some(name.to_string()),
         ..ClientIdentity::new(None)
     };
-    let pull = |namespace: &str| Action::GetManifest {
-        namespace: Namespace::new(namespace).unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
     let authorize = async |action, identity| {
         authorizer
             .authorize_request(&action, &identity, &parts, &registry)
             .await
     };
 
-    authorize(pull("guarded/app"), identity("alice"))
+    authorize(get_manifest("guarded/app"), identity("alice"))
         .await
         .expect("the repository policy decides once the global rule defers to it");
 
     for (action, identity, reason) in [
         (
-            pull("guarded/app"),
+            get_manifest("guarded/app"),
             identity("bob"),
             "the repository policy still denies whoever its own rules exclude",
         ),
         (
-            pull("unguarded/app"),
+            get_manifest("unguarded/app"),
             identity("alice"),
             "a repository declaring no policy has nothing to defer to",
         ),
         (
-            pull("undeclared/app"),
+            get_manifest("undeclared/app"),
             identity("alice"),
             "a namespace no repository declares has nothing to defer to",
         ),
@@ -192,19 +196,15 @@ async fn catalog_filtering_honours_the_repository_policy() {
     );
 }
 
-fn create_pull_through_config() -> Configuration {
-    load_config(
-        r#"
-            [global.access_policy]
-            default = "allow"
+const PULL_THROUGH: &str = r#"
+    [global.access_policy]
+    default = "allow"
 
-            [repository."docker-io"]
+    [repository."docker-io"]
 
-            [[repository."docker-io".upstream]]
-            url = "https://registry-1.docker.io"
-        "#,
-    )
-}
+    [[repository."docker-io".upstream]]
+    url = "https://registry-1.docker.io"
+"#;
 
 async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
     let blob_backend = Arc::new(config.blob_store.build_backend().unwrap());
@@ -225,10 +225,7 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
         .unwrap();
         repositories_map.insert(name.clone(), repo);
     }
-    let resolver = Arc::new(
-        RepositoryResolver::new(Arc::new(repositories_map))
-            .expect("test repositories must not have overlapping prefixes"),
-    );
+    let resolver = Arc::new(RepositoryResolver::new(Arc::new(repositories_map)).unwrap());
 
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
@@ -242,98 +239,80 @@ async fn create_pull_through_registry(config: &Configuration) -> Arc<Registry> {
     Registry::new(blob_backend, metadata_store, resolver, registry_config)
 }
 
-/// Builds the authorizer and registry pair every `authorize_request` test needs.
 async fn authorizer_and_registry(config: &Configuration) -> (Authorizer, Arc<Registry>) {
     let authorizer = Authorizer::new(config).unwrap();
     let registry = create_pull_through_registry(config).await;
     (authorizer, registry)
 }
 
-#[tokio::test]
-async fn test_pull_through_repo_allows_delete_manifest() {
-    let config = create_pull_through_config();
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let namespace = Namespace::new("docker-io/library/nginx").unwrap();
-    let reference = Reference::from_str("latest").unwrap();
-    let route = Action::DeleteManifest {
-        namespace,
-        reference,
-    };
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&route, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "DeleteManifest should be allowed on pull-through cache repositories, got: {result:?}"
-    );
+/// Authorizes `action` for an anonymous client under `config`.
+async fn authorize(config: &Configuration, action: &Action) -> Result<(), AuthError> {
+    let (authorizer, registry) = authorizer_and_registry(config).await;
+    authorizer
+        .authorize_request(
+            action,
+            &ClientIdentity::new(None),
+            &parts_with_uri("/v2/"),
+            &registry,
+        )
+        .await
 }
 
-#[tokio::test]
-async fn test_pull_through_repo_allows_delete_blob() {
-    let config = create_pull_through_config();
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
+fn get_manifest(namespace: &str) -> Action {
+    Action::GetManifest {
+        namespace: Namespace::new(namespace).unwrap(),
+        reference: Reference::Tag(Tag::new("latest").unwrap()),
+    }
+}
 
+fn start_upload(namespace: &str) -> Action {
+    Action::StartUpload {
+        namespace: Namespace::new(namespace).unwrap(),
+        digest: None,
+        digest_algorithm: None,
+    }
+}
+
+/// A pull-through cache refuses pushes but still allows deletes.
+#[tokio::test]
+async fn pull_through_repo_blocks_only_pushes() {
+    let config = load_config(PULL_THROUGH);
     let namespace = Namespace::new("docker-io/library/nginx").unwrap();
     let digest =
         Digest::from_str("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .unwrap();
-    let route = Action::DeleteBlob { namespace, digest };
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
 
-    let result = authorizer
-        .authorize_request(&route, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "DeleteBlob should be allowed on pull-through cache repositories, got: {result:?}"
-    );
+    for (action, allowed) in [
+        (
+            Action::DeleteManifest {
+                namespace: namespace.clone(),
+                reference: Reference::from_str("latest").unwrap(),
+            },
+            true,
+        ),
+        (
+            Action::DeleteBlob {
+                namespace: namespace.clone(),
+                digest,
+            },
+            true,
+        ),
+        (
+            Action::PutManifest {
+                namespace,
+                target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
+            },
+            false,
+        ),
+        (start_upload("docker-io/library/nginx"), false),
+    ] {
+        let result = authorize(&config, &action).await;
+        assert_eq!(result.is_ok(), allowed, "{action:?}: {result:?}");
+    }
 }
 
-#[tokio::test]
-async fn test_pull_through_repo_blocks_push_operations() {
-    let config = create_pull_through_config();
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let namespace = Namespace::new("docker-io/library/nginx").unwrap();
-    let put_manifest_route = Action::PutManifest {
-        namespace: namespace.clone(),
-        target: ManifestPutTarget::Tag(Tag::new("latest").unwrap()),
-    };
-    let result = authorizer
-        .authorize_request(&put_manifest_route, &identity, &parts, &registry)
-        .await;
-    assert!(
-        result.is_err(),
-        "PutManifest should be blocked on pull-through cache repositories"
-    );
-
-    let start_upload_route = Action::StartUpload {
-        namespace,
-        digest: None,
-        digest_algorithm: None,
-    };
-    let result = authorizer
-        .authorize_request(&start_upload_route, &identity, &parts, &registry)
-        .await;
-    assert!(
-        result.is_err(),
-        "StartUpload should be blocked on pull-through cache repositories"
-    );
-}
-
-// A pull-through push is rejected before the webhook is consulted: the cache
-// never accepts writes, so the paid webhook round-trip is skipped. The mock's
-// `expect(0)` fails on drop if the webhook is ever called.
+/// The paid webhook round-trip is skipped for a pull-through push; the mock's
+/// `expect(0)` fails on drop if the webhook is called.
 #[tokio::test]
 async fn pull_through_push_rejected_before_calling_webhook() {
     let mock_server = MockServer::start().await;
@@ -360,255 +339,95 @@ async fn pull_through_push_rejected_before_calling_webhook() {
         "#,
         url = mock_server.uri()
     ));
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
 
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-    let push = Action::StartUpload {
-        namespace: Namespace::new("docker-io/library/nginx").unwrap(),
-        digest: None,
-        digest_algorithm: None,
-    };
-
-    let result = authorizer
-        .authorize_request(&push, &identity, &parts, &registry)
-        .await;
+    let result = authorize(&config, &start_upload("docker-io/library/nginx")).await;
     assert!(
         matches!(result, Err(AuthError::Unauthorized(_))),
-        "pull-through push must be denied, got: {result:?}"
+        "got: {result:?}"
     );
 }
 
-// Global deny policy rejects every request regardless of action.
-//
-// The `[global.access_policy]` block with `default = "deny"` and no allow-rules
-// causes `AccessPolicy::evaluate` to return `PolicyDecision::Deny` for all identities.
-// `authorize_request` must short-circuit before consulting any webhook or repository.
+/// An explicit repository `default = "deny"` denies everything (only an absent
+/// table means no repository policy), an indeterminate global rule denies, and
+/// a namespace no repository covers gets the global decision.
 #[tokio::test]
-async fn global_deny_policy_rejects_all_requests() {
-    let config = load_config(
-        r#"
-            [global.access_policy]
-            default = "deny"
-        "#,
-    );
+async fn access_policies_decide_requests() {
+    let cases = [
+        (
+            "[global.access_policy]\ndefault = \"deny\"",
+            Action::ApiVersion,
+            false,
+        ),
+        (
+            "[global.access_policy]\ndefault = \"allow\"\nrules = [\"nonexistent_var\"]",
+            Action::ApiVersion,
+            false,
+        ),
+        (
+            "[global.access_policy]\ndefault = \"allow\"\n[repository.myrepo.access_policy]\ndefault = \"deny\"",
+            get_manifest("myrepo/app"),
+            false,
+        ),
+        (
+            "[global.access_policy]\ndefault = \"allow\"",
+            get_manifest("no-such-repo/image"),
+            true,
+        ),
+    ];
 
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        matches!(result, Err(AuthError::Unauthorized(_))),
-        "global deny policy must reject ApiVersion, got: {result:?}"
-    );
+    for (toml, action, allowed) in cases {
+        let result = authorize(&load_config(toml), &action).await;
+        if allowed {
+            assert!(result.is_ok(), "{toml}: {result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(AuthError::Unauthorized(_))),
+                "{toml}: {result:?}"
+            );
+        }
+    }
 }
 
-// An explicit repository policy of `default = "deny"` with no rules must deny
-// every namespaced request; only an absent policy table means "no repository
-// policy", never a deny-all sentinel.
+/// The global webhook gates requests without a namespace and namespaces no
+/// `[repository]` declares, which have no repository webhook of their own.
 #[tokio::test]
-async fn repository_deny_all_policy_rejects_namespaced_request() {
-    let config = load_config(
-        r#"
-            [global.access_policy]
-            default = "allow"
+async fn global_webhook_decides_requests_outside_any_repository() {
+    for (status, action, allowed) in [
+        (200, Action::ApiVersion, true),
+        (403, Action::ApiVersion, false),
+        (403, get_manifest("no-such-repo/image"), false),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
+        let config = load_config(&format!(
+            r#"
+                authorization_webhook = "gatekeeper"
 
-            [repository.myrepo.access_policy]
-            default = "deny"
-        "#,
-    );
+                [global.access_policy]
+                default = "allow"
 
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let route = Action::GetManifest {
-        namespace: Namespace::new("myrepo/app").unwrap(),
-        reference: Reference::from_str("latest").unwrap(),
-    };
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&route, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        matches!(result, Err(AuthError::Unauthorized(_))),
-        "an explicit deny-all repository policy must deny, got: {result:?}"
-    );
-}
-
-// Global allow policy + global webhook returning 200 → request allowed.
-//
-// `Action::ApiVersion` carries no namespace, so `authorize_request` takes the
-// non-namespace branch and calls the global webhook directly.  A 200 response
-// means the webhook grants access.
-#[tokio::test]
-async fn global_webhook_path_allow_when_webhook_returns_200() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-            authorization_webhook = "gatekeeper"
-
-            [global.access_policy]
-            default = "allow"
-
-            [auth.webhook.gatekeeper]
-            url = "{url}"
-            timeout_ms = 1000
+                [auth.webhook.gatekeeper]
+                url = "{url}"
+                timeout_ms = 1000
             "#,
-        url = mock_server.uri()
-    ));
+            url = mock_server.uri()
+        ));
 
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "global webhook returning 200 must allow the request, got: {result:?}"
-    );
+        let result = authorize(&config, &action).await;
+        if allowed {
+            assert!(result.is_ok(), "{status}: {result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(AuthError::Unauthorized(_))),
+                "{status}: {result:?}"
+            );
+        }
+    }
 }
 
-// Global allow policy + global webhook returning 403 → request denied.
-#[tokio::test]
-async fn global_webhook_path_deny_when_webhook_returns_403() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-            authorization_webhook = "gatekeeper"
-
-            [global.access_policy]
-            default = "allow"
-
-            [auth.webhook.gatekeeper]
-            url = "{url}"
-            timeout_ms = 1000
-            "#,
-        url = mock_server.uri()
-    ));
-
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        matches!(result, Err(AuthError::Unauthorized(_))),
-        "global webhook returning 403 must deny the request, got: {result:?}"
-    );
-}
-
-// A namespace no `[repository]` declares has no repository webhook, so the
-// global one gates it rather than being skipped for the very namespaces no
-// repository policy covers.
-#[tokio::test]
-async fn global_webhook_gates_a_namespace_no_repository_declares() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&mock_server)
-        .await;
-
-    let config = load_config(&format!(
-        r#"
-            authorization_webhook = "gatekeeper"
-
-            [global.access_policy]
-            default = "allow"
-
-            [auth.webhook.gatekeeper]
-            url = "{url}"
-            timeout_ms = 1000
-            "#,
-        url = mock_server.uri()
-    ));
-
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-    let action = Action::GetManifest {
-        namespace: Namespace::new("no-such-repo/image").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-
-    let result = authorizer
-        .authorize_request(
-            &action,
-            &ClientIdentity::new(None),
-            &parts_with_uri("/v2/"),
-            &registry,
-        )
-        .await;
-
-    assert!(
-        matches!(result, Err(AuthError::Unauthorized(_))),
-        "the global webhook must decide a namespace no repository declares, got: {result:?}"
-    );
-}
-
-// A namespace that maps to no configured repository is passed through
-// without error or panic under an allow policy.
-//
-// `authorize_request` skips the repository layer when
-// `repository_for_namespace` returns `Err`, so the default policy is
-// applied implicitly (allow here).
-#[tokio::test]
-async fn authorize_request_unknown_namespace_is_allowed_under_allow_policy() {
-    let config = load_config(
-        r#"
-            [global.access_policy]
-            default = "allow"
-        "#,
-    );
-
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let action = Action::GetManifest {
-        namespace: Namespace::new("no-such-repo/image").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-
-    let result = authorizer
-        .authorize_request(&action, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "a namespace that matches no repository must not panic or deny under an allow policy, got: {result:?}"
-    );
-}
-
-// Webhook unreachable → fail-closed.
-//
-// When the webhook endpoint is unreachable, `WebhookAuthorizer::authorize`
-// returns `Err(Error::Unauthorized(...))`.  `authorize_namespace_request`
-// propagates that error so the authorizer returns `Err`, not `Ok(false)`.
-// This distinguishes a transport failure from an explicit deny on dashboards.
 #[tokio::test]
 async fn webhook_unreachable_fails_closed() {
     let config = load_config(
@@ -626,52 +445,8 @@ async fn webhook_unreachable_fails_closed() {
         "#,
     );
 
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let action = Action::GetManifest {
-        namespace: Namespace::new("myrepo/app").unwrap(),
-        reference: Reference::Tag(Tag::new("latest").unwrap()),
-    };
-
-    let result = authorizer
-        .authorize_request(&action, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        result.is_err(),
-        "an unreachable webhook must produce Err (fail-closed), not Ok; got: {result:?}"
-    );
-}
-
-// A global allow-mode policy whose DENY rule throws at runtime must deny the
-// request.  Previously the evaluation error was swallowed and the default
-// allow was returned.
-#[tokio::test]
-async fn indeterminate_global_policy_denies_request() {
-    let config = load_config(
-        r#"
-            [global.access_policy]
-            default = "allow"
-            rules = ["nonexistent_var"]
-        "#,
-    );
-
-    let (authorizer, registry) = authorizer_and_registry(&config).await;
-
-    let identity = ClientIdentity::new(None);
-    let parts = parts_with_uri("/v2/");
-
-    let result = authorizer
-        .authorize_request(&Action::ApiVersion, &identity, &parts, &registry)
-        .await;
-
-    assert!(
-        matches!(result, Err(AuthError::Unauthorized(_))),
-        "an indeterminate global policy must deny the request, got: {result:?}"
-    );
+    let result = authorize(&config, &get_manifest("myrepo/app")).await;
+    assert!(result.is_err(), "got: {result:?}");
 }
 
 #[tokio::test]
@@ -682,7 +457,7 @@ async fn authorize_mount_source_requires_read_on_the_source() {
         let content = b"mount authorization blob";
 
         let digest = put_blob_direct(&test_case.blob_store(), content).await;
-        registry
+        test_case
             .metadata_store()
             .grant(source, &digest)
             .await

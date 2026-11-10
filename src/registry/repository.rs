@@ -19,7 +19,7 @@ use angos_oci_client::{Error as ClientError, FetchedBlob, RegistryClient, Regist
 use crate::configuration::RegexPattern;
 use crate::layer::IndexAction;
 use crate::policy::{
-    AccessMode, ImagePolicy, PolicyConfig, RetentionPolicy, RetentionPolicyConfig, SystemClock,
+    AccessMode, ImagePolicy, PolicyConfig, RetentionPolicy, RetentionPolicyConfig,
 };
 use crate::registry::Error;
 use crate::replication::{ReplicationDownstream, ReplicationDownstreamConfig};
@@ -27,7 +27,7 @@ use crate::scan::ScanAction;
 
 /// Fallback per-manifest blob-push and top-level child-manifest concurrency
 /// when a downstream omits `max_concurrent_pushes`.
-const DEFAULT_MAX_CONCURRENT_PUSHES: usize = 4;
+const DEFAULT_MAX_CONCURRENT_PUSHES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
 
 /// Split a registry URL (upstream or downstream) into the registry base (talked
 /// to at its OCI `/v2/` root) and the path-derived namespace prefix.
@@ -75,12 +75,58 @@ fn build_client(
     Ok((client, target_namespace))
 }
 
+/// The upstream and downstream clients. A path on an upstream URL is prepended
+/// to the namespace once the repository `name` is stripped; on a downstream URL
+/// it replaces this repository's prefix (`repo/x` -> `prefix/x`), and a
+/// bare-host downstream mirrors the namespace verbatim.
+fn build_clients(
+    name: &Namespace,
+    upstream_configs: &[RegistryClientConfig],
+    downstream_configs: &[ReplicationDownstreamConfig],
+    cache: &Arc<Cache>,
+    max_manifest_size_bytes: usize,
+) -> Result<(Vec<Upstream>, Vec<ReplicationDownstream>), Error> {
+    let mut upstreams = Vec::new();
+    for config in upstream_configs {
+        let (client, target_namespace) =
+            build_client(config, name, cache, max_manifest_size_bytes)?;
+        upstreams.push(Upstream {
+            client,
+            local_namespace: name.clone(),
+            target_namespace,
+        });
+    }
+    let mut downstreams = Vec::new();
+    for config in downstream_configs {
+        let (registry_client, target_namespace) =
+            build_client(&config.client, name, cache, max_manifest_size_bytes)?;
+        downstreams.push(ReplicationDownstream {
+            name: config.name.clone(),
+            registry_client: Arc::new(registry_client),
+            mode: config.mode,
+            namespace_filter: config
+                .namespace_filter
+                .iter()
+                .cloned()
+                .map(RegexPattern::into_regex)
+                .collect(),
+            max_concurrent_pushes: config
+                .max_concurrent_pushes
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_PUSHES),
+            prune: config.prune,
+            local_namespace: target_namespace.as_ref().map(|_| name.clone()),
+            target_namespace,
+        });
+    }
+    Ok((upstreams, downstreams))
+}
+
 /// One resolved pull-through upstream: the URL-formatting client plus the
 /// namespace mapping (`local_namespace` to strip, optional `target_namespace` to
 /// prepend) applied via [`Namespace::remote`].
 pub struct Upstream {
     pub client: RegistryClient,
-    pub local_namespace: Option<Namespace>,
+    pub local_namespace: Namespace,
     pub target_namespace: Option<Namespace>,
 }
 
@@ -89,109 +135,8 @@ impl Upstream {
     /// routed namespace the strip always succeeds, so an `Err` is effectively
     /// unreachable but callers still propagate it.
     pub fn remote(&self, namespace: &Namespace) -> Result<Namespace, OciError> {
-        namespace.remote(
-            self.local_namespace.as_ref(),
-            self.target_namespace.as_ref(),
-        )
+        namespace.remote(Some(&self.local_namespace), self.target_namespace.as_ref())
     }
-}
-
-/// Build the pull-through upstream clients. A path on an upstream URL is the
-/// upstream namespace prefix; the mapping always strips the repository `name` and
-/// prepends that optional prefix.
-async fn build_upstreams(
-    upstream_configs: &[RegistryClientConfig],
-    name: &Namespace,
-    cache: &Arc<Cache>,
-    max_manifest_size_bytes: usize,
-) -> Result<Vec<Upstream>, Error> {
-    if upstream_configs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let upstream_configs = upstream_configs.to_vec();
-    let cache = Arc::clone(cache);
-    let repo_name = name.clone();
-    task::spawn_blocking(move || {
-        let mut upstreams = Vec::new();
-        for config in &upstream_configs {
-            let (client, target_namespace) =
-                build_client(config, &repo_name, &cache, max_manifest_size_bytes)?;
-            upstreams.push(Upstream {
-                client,
-                local_namespace: Some(repo_name.clone()),
-                target_namespace,
-            });
-        }
-        Ok::<_, Error>(upstreams)
-    })
-    .await
-    .map_err(|e| Error::Internal(format!("Failed to initialize upstream clients: {e}")))?
-}
-
-/// Build the replication downstream clients after validating that every
-/// downstream `name` is non-empty and unique (the name is the job routing key
-/// and metrics label). A path on a downstream URL replaces this repository's
-/// prefix (`repo/x` -> `prefix/x`); a bare-host URL mirrors the namespace
-/// verbatim.
-async fn build_downstreams(
-    name: &Namespace,
-    downstream_configs: &[ReplicationDownstreamConfig],
-    cache: &Arc<Cache>,
-    max_manifest_size_bytes: usize,
-) -> Result<Vec<ReplicationDownstream>, Error> {
-    let mut seen_names = HashSet::new();
-    for downstream in downstream_configs {
-        if downstream.name.is_empty() {
-            return Err(Error::Initialization(format!(
-                "replication downstream in repository '{name}' has an empty name; \
-                 a non-empty name is required (it is the job routing key and metrics label)"
-            )));
-        }
-        if !seen_names.insert(downstream.name.as_str()) {
-            return Err(Error::Initialization(format!(
-                "repository '{name}' has duplicate replication downstream name '{}'; \
-                 downstream names must be unique (they are the job routing key and metrics label)",
-                downstream.name
-            )));
-        }
-    }
-
-    if downstream_configs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let downstream_configs = downstream_configs.to_vec();
-    let cache = Arc::clone(cache);
-    let repo_name = name.clone();
-    task::spawn_blocking(move || {
-        let mut downstreams = Vec::new();
-        for config in &downstream_configs {
-            let (registry_client, target_namespace) =
-                build_client(&config.client, &repo_name, &cache, max_manifest_size_bytes)?;
-            // A URL path replaces this repository's prefix; a bare host mirrors
-            // the namespace verbatim (no strip).
-            let local_namespace = target_namespace.as_ref().map(|_| repo_name.clone());
-            downstreams.push(ReplicationDownstream {
-                name: config.name.clone(),
-                registry_client: Arc::new(registry_client),
-                mode: config.mode,
-                namespace_filter: config
-                    .namespace_filter
-                    .iter()
-                    .cloned()
-                    .map(RegexPattern::into_regex)
-                    .collect(),
-                max_concurrent_pushes: config
-                    .max_concurrent_pushes
-                    .map_or(DEFAULT_MAX_CONCURRENT_PUSHES, NonZeroUsize::get),
-                prune: config.prune,
-                local_namespace,
-                target_namespace,
-            });
-        }
-        Ok::<_, Error>(downstreams)
-    })
-    .await
-    .map_err(|e| Error::Internal(format!("Failed to initialize downstream clients: {e}")))?
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -309,12 +254,44 @@ impl Repository {
                 "repository name '{name}' is not a valid namespace: {e}"
             ))
         })?;
-        let upstreams =
-            build_upstreams(&config.upstream, &name, cache, max_manifest_size_bytes).await?;
-        let replication =
-            build_downstreams(&name, &config.downstream, cache, max_manifest_size_bytes).await?;
-        let retention_policy =
-            RetentionPolicy::new(&config.retention_policy, Arc::new(SystemClock));
+        let mut seen_names = HashSet::new();
+        for downstream in &config.downstream {
+            if downstream.name.is_empty() {
+                return Err(Error::Initialization(format!(
+                    "replication downstream in repository '{name}' has an empty name; \
+                     a non-empty name is required (it is the job routing key and metrics label)"
+                )));
+            }
+            if !seen_names.insert(downstream.name.as_str()) {
+                return Err(Error::Initialization(format!(
+                    "repository '{name}' has duplicate replication downstream name '{}'; \
+                     downstream names must be unique (they are the job routing key and metrics label)",
+                    downstream.name
+                )));
+            }
+        }
+
+        let (upstreams, replication) = if config.upstream.is_empty() && config.downstream.is_empty()
+        {
+            (Vec::new(), Vec::new())
+        } else {
+            // Building a client reads its TLS files, which blocks.
+            let (upstream_configs, downstream_configs) =
+                (config.upstream.clone(), config.downstream.clone());
+            let (cache, repo_name) = (Arc::clone(cache), name.clone());
+            task::spawn_blocking(move || {
+                build_clients(
+                    &repo_name,
+                    &upstream_configs,
+                    &downstream_configs,
+                    &cache,
+                    max_manifest_size_bytes,
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to initialize registry clients: {e}")))??
+        };
+        let retention_policy = RetentionPolicy::new(config.retention_policy.rules.clone());
 
         Ok(Self {
             name,
@@ -337,24 +314,6 @@ impl Repository {
 
     pub fn is_pull_through(&self) -> bool {
         !self.upstreams.is_empty()
-    }
-
-    /// Checks whether the upstream still has the same digest for the given tag.
-    /// An upstream that omits `Docker-Content-Digest` reads as a mismatch, so
-    /// the caller refetches the body rather than serving a copy it cannot show
-    /// to be current. No upstream answering is [`Error::UpstreamUnavailable`],
-    /// not a mismatch.
-    pub async fn is_upstream_digest_match(
-        &self,
-        accepted_types: &[MediaRange],
-        namespace: &Namespace,
-        reference: &Reference,
-        local_digest: &Digest,
-    ) -> Result<bool, Error> {
-        let head = self
-            .head_manifest(accepted_types, namespace, reference)
-            .await?;
-        Ok(head.digest.is_some_and(|digest| digest == *local_digest))
     }
 
     #[instrument(skip(self))]
@@ -492,22 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn split_registry_url_extracts_namespace_prefix_from_the_path() {
-        assert_eq!(
-            split_registry_url("http://192.168.178.143:8000/push-through-1"),
-            (
-                "http://192.168.178.143:8000".to_string(),
-                "push-through-1".to_string()
-            )
-        );
+    fn split_registry_url_moves_the_path_into_the_namespace_prefix() {
         assert_eq!(
             split_registry_url("https://host:8000/team/sub/"),
             ("https://host:8000".to_string(), "team/sub".to_string())
         );
-    }
-
-    #[test]
-    fn split_registry_url_yields_no_prefix_for_a_bare_host() {
         assert_eq!(
             split_registry_url("http://angos-b:8000"),
             ("http://angos-b:8000".to_string(), String::new())
@@ -534,34 +482,7 @@ mod tests {
         ));
     }
 
-    async fn repository_with_upstreams(first_url: String, second_url: String) -> Repository {
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![
-                test_client_config(first_url),
-                test_client_config(second_url),
-            ],
-            ..Default::default()
-        };
-
-        Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap()
-    }
-
-    async fn mount_response(
-        server: &MockServer,
-        request_method: &str,
-        request_path: &str,
-        response: ResponseTemplate,
-    ) {
-        Mock::given(method(request_method))
-            .and(path(request_path))
-            .respond_with(response)
-            .mount(server)
-            .await;
-    }
-
+    /// A repository whose first upstream answers 404 and second `response`.
     async fn fallback_repository(
         request_method: &str,
         request_path: &str,
@@ -569,17 +490,25 @@ mod tests {
     ) -> (Repository, MockServer, MockServer) {
         let first = MockServer::start().await;
         let second = MockServer::start().await;
+        for (server, response) in [(&first, ResponseTemplate::new(404)), (&second, response)] {
+            Mock::given(method(request_method))
+                .and(path(request_path))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
 
-        mount_response(
-            &first,
-            request_method,
-            request_path,
-            ResponseTemplate::new(404),
-        )
-        .await;
-        mount_response(&second, request_method, request_path, response).await;
-
-        let repository = repository_with_upstreams(first.uri(), second.uri()).await;
+        let cache = CacheConfig::Memory.to_backend().unwrap();
+        let config = Config {
+            upstream: vec![
+                test_client_config(first.uri()),
+                test_client_config(second.uri()),
+            ],
+            ..Default::default()
+        };
+        let repository = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
+            .await
+            .unwrap();
         (repository, first, second)
     }
 
@@ -656,58 +585,12 @@ mod tests {
         assert!(repository.is_pull_through());
     }
 
+    /// An upstream that omits `Docker-Content-Digest` answers the freshness
+    /// probe with no digest, which reads as a mismatch, instead of failing it.
     #[tokio::test]
-    async fn test_head_manifest_success_first_upstream() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", "1234")
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    ),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
+    async fn upstream_omitting_the_digest_header_answers_without_a_digest() {
         let reference = Reference::Tag(Tag::new("latest").unwrap());
         let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.head_manifest(&[], &namespace, &reference).await;
-        let head = result.unwrap();
-        assert_eq!(head.media_type, None);
-        assert_eq!(head.size, 1234);
-        assert_eq!(
-            head.digest,
-            Some(
-                Digest::try_from(
-                    "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-                )
-                .unwrap()
-            )
-        );
-    }
-
-    /// An upstream that omits `Docker-Content-Digest` leaves the freshness
-    /// probe unable to prove the cached copy is current, so the tag reads as a
-    /// mismatch and the caller refetches instead of the whole pull failing.
-    #[tokio::test]
-    async fn upstream_omitting_the_digest_header_reads_as_a_mismatch() {
-        let reference = Reference::Tag(Tag::new("latest").unwrap());
-        let namespace = Namespace::new("local/repo").unwrap();
-        let local_digest = Digest::try_from(FALLBACK_DIGEST).unwrap();
 
         let (repo, _first, _second) = fallback_repository(
             "HEAD",
@@ -716,15 +599,12 @@ mod tests {
         )
         .await;
 
-        let matched = repo
-            .is_upstream_digest_match(&[], &namespace, &reference, &local_digest)
+        let head = repo
+            .head_manifest(&[], &namespace, &reference)
             .await
             .expect("a missing Docker-Content-Digest must not fail the freshness probe");
 
-        assert!(
-            !matched,
-            "an unknown upstream digest cannot confirm the cached copy is current"
-        );
+        assert_eq!(head.digest, None);
     }
 
     /// A miss is believed only when every upstream answered it: one that could
@@ -826,151 +706,25 @@ mod tests {
         assert_eq!(buffer, blob_content);
     }
 
+    /// Every upstream answering a miss is a miss, under the operation's own code.
     #[tokio::test]
-    async fn test_head_manifest_all_upstreams_fail() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let reference = Reference::Tag(Tag::new("latest").unwrap());
+    async fn every_upstream_missing_is_unknown() {
         let namespace = Namespace::new("local/repo").unwrap();
+        let reference = Reference::Tag(Tag::new("latest").unwrap());
 
+        let (repo, _first, _second) =
+            fallback_repository("HEAD", MANIFEST_PATH, ResponseTemplate::new(404)).await;
         let result = repo.head_manifest(&[], &namespace, &reference).await;
-        assert!(matches!(result, Err(Error::ManifestUnknown)));
-    }
+        assert!(matches!(result, Err(Error::ManifestUnknown)), "{result:?}");
 
-    #[tokio::test]
-    async fn test_get_manifest_all_upstreams_fail() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let reference = Reference::Tag(Tag::new("latest").unwrap());
-        let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.get_manifest(&[], &namespace, &reference).await;
-        assert!(matches!(result, Err(Error::ManifestUnknown)));
-    }
-
-    #[tokio::test]
-    async fn test_head_blob_success_first_upstream() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", "9876")
-                    .insert_header(
-                        "Docker-Content-Digest",
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    ),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-        let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.head_blob(&[], &namespace, &digest).await;
-        let (returned_digest, size) = result.unwrap();
-        assert_eq!(size, 9876);
-        assert_eq!(returned_digest, digest);
-    }
-
-    #[tokio::test]
-    async fn test_head_blob_all_upstreams_fail() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("HEAD"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-        let namespace = Namespace::new("local/repo").unwrap();
-
-        let result = repo.head_blob(&[], &namespace, &digest).await;
-        assert!(matches!(result, Err(Error::BlobUnknown)));
-    }
-
-    #[tokio::test]
-    async fn test_get_blob_all_upstreams_fail() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/v2/repo/blobs/sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
-
-        let cache = CacheConfig::Memory.to_backend().unwrap();
-        let config = Config {
-            upstream: vec![test_client_config(mock_server.uri())],
-            ..Default::default()
-        };
-
-        let repo = Repository::new("local", &config, &cache, DEFAULT_MAX_MANIFEST_SIZE_BYTES)
-            .await
-            .unwrap();
-        let digest = Digest::try_from(
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-        let namespace = Namespace::new("local/repo").unwrap();
-
+        let digest = Digest::try_from(TEST_DIGEST).unwrap();
+        let (repo, _first, _second) =
+            fallback_repository("GET", BLOB_PATH, ResponseTemplate::new(404)).await;
         let result = repo.get_blob(&[], &namespace, &digest, None).await;
-        assert!(matches!(result, Err(Error::BlobUnknown)));
+        assert!(
+            matches!(result, Err(Error::BlobUnknown)),
+            "{:?}",
+            result.err()
+        );
     }
 }

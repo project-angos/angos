@@ -1,21 +1,12 @@
 use serde::Deserialize;
 
-use crate::registry::blob_store::{BlobStoreConfig, FsBackendConfig, S3BackendConfig};
+use crate::registry::blob_store::{FsBackendConfig, S3BackendConfig};
 
-// Unknown keys in any sub-table are ignored (serde's default), so a config
-// carrying knobs angos does not read still loads.
-
-/// Storage configuration shared by the metadata store and the job store, both
-/// of which run over the one `ObjectStore` the CLI bootstrap builds from it.
-///
-/// The operator-facing TOML key is `[metadata_store]`, with `.fs` or `.s3`
-/// sub-tables taking the same keys as the blob store's; the default `Inherit`
-/// resolves to the blob-store configuration.
+/// The `[metadata_store]` table, backing both the metadata and job stores; the
+/// default `Inherit` resolves to the blob-store configuration. Unknown keys are
+/// ignored so a config carrying retired knobs still loads.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub enum RegistryStorageConfig {
-    /// Inherit the whole blob-store configuration, transport knobs included,
-    /// resolved via `Configuration::resolve_registry_storage` before any
-    /// backend is built.
     #[default]
     Inherit,
     #[serde(rename = "fs")]
@@ -24,96 +15,11 @@ pub enum RegistryStorageConfig {
     S3(Box<S3BackendConfig>),
 }
 
-/// A [`RegistryStorageConfig`] whose `Inherit` default has been resolved to a
-/// concrete backend, so consumers match without a dead `Inherit` arm.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ResolvedStorageConfig {
-    FS(FsBackendConfig),
-    S3(Box<S3BackendConfig>),
-}
-
-impl ResolvedStorageConfig {
-    /// Mirror the given blob-store config, which is how `Inherit` resolves.
-    pub fn from_blob_store(blob: &BlobStoreConfig) -> Self {
-        match blob {
-            BlobStoreConfig::FS(config) => ResolvedStorageConfig::FS(config.clone()),
-            BlobStoreConfig::S3(config) => ResolvedStorageConfig::S3(config.clone()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use angos_secret::Secret;
-
     use super::*;
-    use crate::registry::blob_store::TransportFields;
-    use crate::registry::s3_connection::S3ConnectionConfig;
-
-    /// The metadata store inherits the blob store's transport knobs too, not
-    /// only its connection.
-    #[test]
-    fn test_from_blob_store_s3_copies_connection_and_transport() {
-        let blob = BlobStoreConfig::S3(Box::new(S3BackendConfig {
-            connection: S3ConnectionConfig {
-                access_key_id: Secret::new("key".to_string()),
-                secret_key: Secret::new("secret".to_string()),
-                endpoint: "http://localhost:9000".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                key_prefix: "foo".to_string(),
-            },
-            transport: TransportFields {
-                max_attempts: 7,
-                operation_timeout_secs: 42,
-                ..TransportFields::default()
-            },
-        }));
-        match ResolvedStorageConfig::from_blob_store(&blob) {
-            ResolvedStorageConfig::S3(c) => {
-                assert_eq!(c.transport.max_attempts, 7);
-                assert_eq!(c.transport.operation_timeout_secs, 42);
-                assert_eq!(c.connection.bucket, "test-bucket");
-                assert_eq!(c.connection.region, "us-east-1");
-                assert_eq!(c.connection.endpoint, "http://localhost:9000");
-                assert_eq!(c.connection.access_key_id.expose(), "key");
-                assert_eq!(c.connection.secret_key.expose(), "secret");
-                assert_eq!(c.connection.key_prefix, "foo");
-            }
-            ResolvedStorageConfig::FS(_) => {
-                panic!("expected S3 storage config")
-            }
-        }
-    }
-
-    /// Flat TOML deserialises into the metadata store's S3 config, transport
-    /// knobs included. The ignored keys of removed subsystems are kept in the
-    /// fixture: a config carrying them must still load.
-    #[test]
-    fn s3_backend_config_toml_round_trip() {
-        let toml = r#"
-            access_key_id            = "meta-key"
-            secret_key               = "meta-secret"
-            endpoint                 = "https://meta.s3.example.com"
-            bucket                   = "meta-bucket"
-            region                   = "eu-central-1"
-            key_prefix               = "_meta"
-            max_attempts             = 7
-            link_cache_ttl           = 60
-            access_time_debounce_secs = 120
-        "#;
-
-        let cfg: S3BackendConfig = toml::from_str(toml).expect("deserialize");
-        assert_eq!(cfg.connection.access_key_id.expose(), "meta-key");
-        assert_eq!(cfg.connection.secret_key.expose(), "meta-secret");
-        assert_eq!(cfg.connection.endpoint, "https://meta.s3.example.com");
-        assert_eq!(cfg.connection.bucket, "meta-bucket");
-        assert_eq!(cfg.connection.region, "eu-central-1");
-        assert_eq!(cfg.connection.key_prefix, "_meta");
-        assert_eq!(cfg.transport.max_attempts, 7);
-    }
 
     fn s3_toml_with(extra: &str) -> String {
         format!(

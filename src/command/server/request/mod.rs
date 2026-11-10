@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use hyper::HeaderMap;
 use hyper::body::Incoming;
 use hyper::header::{
-    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RANGE,
+    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderName, HeaderValue, RANGE,
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
@@ -24,7 +24,6 @@ use crate::command::server::error::Error;
 /// OCI clients never send it, so their redirect fast path is unaffected.
 pub const X_ANGOS_NO_REDIRECT: &str = "X-Angos-No-Redirect";
 
-#[derive(Clone, Debug)]
 pub struct RequestHeaders<'a> {
     headers: &'a HeaderMap,
 }
@@ -121,14 +120,14 @@ impl<'a> RequestHeaders<'a> {
         Some(parsed.min(Utc::now()))
     }
 
-    /// The window carried by `header`, spelled `<start>-<end>` as end-5 has a
+    /// The `Content-Range` window, spelled `<start>-<end>` as end-5 has a
     /// chunk declare it.
-    pub fn chunk_range(&self, header: HeaderName) -> Result<Option<ByteWindow>, Error> {
-        let Some(range_header) = self.header_string(header)? else {
+    pub fn chunk_range(&self) -> Result<Option<ByteWindow>, Error> {
+        let Some(range_header) = self.header_str(CONTENT_RANGE)? else {
             return Ok(None);
         };
 
-        ByteWindow::chunk_bounds(&range_header)
+        ByteWindow::chunk_bounds(range_header)
             .map(Some)
             .map_err(|error| Error::RangeNotSatisfiable(error.to_string()))
     }
@@ -139,23 +138,22 @@ impl<'a> RequestHeaders<'a> {
     /// whole representation served. A `416` is for a range that parses and
     /// cannot be met.
     pub fn blob_range(&self) -> Result<Option<RequestRange>, Error> {
-        let Some(range_header) = self.header_string(RANGE)? else {
+        let Some(range_header) = self.header_str(RANGE)? else {
             return Ok(None);
         };
 
-        Ok(RequestRange::parse(&range_header).ok().flatten())
+        Ok(RequestRange::parse(range_header).ok().flatten())
     }
 
-    fn header_string(&self, header: HeaderName) -> Result<Option<String>, Error> {
-        let Some(value) = self.headers.get(header) else {
-            return Ok(None);
-        };
-
-        let value = value
-            .to_str()
-            .map_err(|error| Error::BadRequest(format!("Invalid header value: {error}")))?;
-
-        Ok(Some(value.to_string()))
+    fn header_str(&self, header: HeaderName) -> Result<Option<&'a str>, Error> {
+        self.headers
+            .get(header)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|error| Error::BadRequest(format!("Invalid header value: {error}")))
+            })
+            .transpose()
     }
 }
 

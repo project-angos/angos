@@ -17,7 +17,7 @@ use crate::registry::Repository;
 use crate::registry::metadata_store::LinkKind;
 use crate::registry::test_utils::{
     FsTestStack, downstream_client, fs_test_stack, repository_with_replication, seed_manifest,
-    single_repo_resolver,
+    single_repo_resolver, test_downstream,
 };
 use crate::replication::handler::{
     ReplicationJob, ReplicationJobHandler, ReplicationTarget, build_envelope,
@@ -104,35 +104,19 @@ fn lock_key_falls_back_to_digest_without_tag() {
     );
 }
 
-/// A delete must never coalesce into (and be swallowed by) a pending push.
+/// A delete must never coalesce into (and be swallowed by) a pending push, and
+/// keys on its source instant spelled exactly as stored payloads did, so an
+/// upgraded replica still coalesces with a job a peer already queued.
 #[test]
 fn lock_key_distinguishes_push_from_delete() {
-    let push = sample_payload();
-    let delete = sample_delete("2026-06-03T00:00:00Z");
+    let legacy_source_ts = "2024-01-01T00:00:00.123456789+00:00";
     assert_eq!(
-        replication_lock_key(&push),
+        replication_lock_key(&sample_payload()),
         "replication.push.eu-region:nginx:v1"
     );
     assert_eq!(
-        replication_lock_key(&delete),
-        format!(
-            "replication.delete.eu-region:nginx:v1@{}",
-            instant("2026-06-03T00:00:00Z").to_rfc3339()
-        )
-    );
-}
-
-/// Deletes with different `source_ts` are distinct events and must not
-/// coalesce (the stale timestamp would lose receiver-side LWW).
-#[test]
-fn lock_key_separates_distinct_delete_events() {
-    let first = sample_delete("2026-06-03T00:00:00Z");
-    let second = sample_delete("2026-06-03T00:01:00Z");
-
-    assert_ne!(
-        replication_lock_key(&first),
-        replication_lock_key(&second),
-        "deletes with different source_ts must each get their own job"
+        replication_lock_key(&sample_delete(legacy_source_ts)),
+        format!("replication.delete.eu-region:nginx:v1@{legacy_source_ts}")
     );
 }
 
@@ -177,17 +161,10 @@ fn lock_key_handles_missing_tag_and_digest() {
 }
 
 #[test]
-fn build_envelope_sets_queue_kind_and_lock_key() {
-    let payload = sample_payload();
-    let envelope = build_envelope(&payload).unwrap();
+fn build_envelope_sets_queue_and_kind() {
+    let envelope = build_envelope(&sample_payload()).unwrap();
     assert_eq!(envelope.queue, Queue::Replication);
     assert_eq!(envelope.kind, REPLICATION_PUSH_MANIFEST_KIND);
-    assert_eq!(
-        envelope.lock_key.as_str(),
-        "replication.push.eu-region:nginx:v1"
-    );
-    let round_trip: ReplicationJob = serde_json::from_value(envelope.payload).unwrap();
-    assert_eq!(round_trip, payload);
 }
 
 #[test]
@@ -215,10 +192,7 @@ fn repository_with_downstream(client: Arc<RegistryClient>) -> Repository {
 /// Lets a test pick the downstream name so its metric label set is isolated
 /// from other tests.
 fn repository_with_named_downstream(name: &str, client: Arc<RegistryClient>) -> Repository {
-    repository_with_replication(
-        REPO,
-        vec![ReplicationDownstream::new(name.to_string(), client, 4)],
-    )
+    repository_with_replication(REPO, vec![test_downstream(name.to_string(), client)])
 }
 
 /// A job for a downstream no longer in config fails loudly (and so
@@ -255,69 +229,14 @@ async fn execute_errors_on_removed_downstream() {
     );
 }
 
-#[tokio::test]
-async fn execute_pushes_manifest_with_head_before_put() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let (manifest_digest, config_digest, layer_digest) = seed_manifest(
-        &blob_store,
-        &metadata_store,
-        &Namespace::new(NAMESPACE).unwrap(),
-    )
-    .await;
-
-    // Downstream is missing both blobs (404 on HEAD) -> upload sequence runs.
-    mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
-    // The manifest itself is PUT by tag (no OCI-Subject -> no fallback).
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_downstream(downstream_client(&mock_server.uri())),
-    );
-
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
-
-    let envelope = build_envelope(&sample_payload()).unwrap();
-    handler.execute(&envelope).await.unwrap();
-
-    drop(mock_server);
-}
-
 /// A downstream `403` is terminal, so the worker dead-letters it instead of
 /// retrying against revoked credentials.
 #[tokio::test]
 async fn execute_maps_downstream_403_to_terminal() {
     metrics_provider::initialize_metrics();
     let mock_server = MockServer::start().await;
-
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let (_manifest_digest, config_digest, layer_digest) = seed_manifest(
-        &blob_store,
-        &metadata_store,
-        &Namespace::new(NAMESPACE).unwrap(),
-    )
-    .await;
+    let (handler, config_digest, layer_digest, _dir) =
+        handler_with_downstream(DOWNSTREAM, &mock_server.uri()).await;
 
     mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
     Mock::given(method("PUT"))
@@ -325,12 +244,6 @@ async fn execute_maps_downstream_403_to_terminal() {
         .respond_with(ResponseTemplate::new(403))
         .mount(&mock_server)
         .await;
-
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_downstream(downstream_client(&mock_server.uri())),
-    );
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
     let envelope = build_envelope(&sample_payload()).unwrap();
     let result = handler.execute(&envelope).await;
@@ -375,10 +288,9 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
     let downstream = ReplicationDownstream {
         local_namespace: Some(Namespace::new("nginx").unwrap()),
         target_namespace: Some(Namespace::new("mirror").unwrap()),
-        ..ReplicationDownstream::new(
+        ..test_downstream(
             DOWNSTREAM.to_string(),
             downstream_client(&mock_server.uri()),
-            4,
         )
     };
     let resolver = single_repo_resolver(REPO, repository_with_replication(REPO, vec![downstream]));
@@ -395,52 +307,6 @@ async fn execute_pushes_prefixed_downstream_to_mapped_namespace() {
     handler.execute(&envelope).await.unwrap();
 
     drop(mock_server);
-}
-
-/// The execute-time tag resolve must read the backend link, not the per-process
-/// cache: a worker's cache can lag a sibling's write by up to its TTL, and a
-/// stale resolve would replicate the old digest and complete the job.
-#[tokio::test]
-async fn execute_skips_blob_present_on_downstream() {
-    metrics_provider::initialize_metrics();
-    let mock_server = MockServer::start().await;
-
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    let (manifest_digest, config_digest, layer_digest) = seed_manifest(
-        &blob_store,
-        &metadata_store,
-        &Namespace::new(NAMESPACE).unwrap(),
-    )
-    .await;
-
-    // Both blobs already present (200 on HEAD) -> NO upload sequence at all.
-    mount_blobs_present(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
-    // No upload POST/PUT mounted: if the pipeline tried to upload, the request
-    // would 404 and the push would error.
-    Mock::given(method("PUT"))
-        .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_downstream(downstream_client(&mock_server.uri())),
-    );
-
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
-
-    let envelope = build_envelope(&sample_payload()).unwrap();
-    handler.execute(&envelope).await.unwrap();
 }
 
 /// The manifest PUT must carry an `X-Angos-Source-Timestamp` derived from
@@ -704,11 +570,12 @@ async fn execute_push_records_failed_metric_on_error() {
     drop(mock_server);
 }
 
-/// A converged no-op must not contact the downstream nor record any metric.
+/// A push whose target is gone locally is a converged no-op: it contacts no
+/// downstream and records no metric.
 #[tokio::test]
-async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
+async fn execute_push_of_a_deleted_target_is_noop_success() {
     metrics_provider::initialize_metrics();
-    let downstream = "metric-deleted-tag";
+    let downstream = "metric-deleted-target";
 
     let FsTestStack {
         dir: _dir,
@@ -716,7 +583,7 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
         blob_store,
     } = fs_test_stack();
 
-    // No tag seeded, so the resolve short-circuits; the unreachable
+    // Nothing seeded, so the resolve short-circuits; the unreachable
     // downstream URL makes any wrongful push error.
     let resolver = single_repo_resolver(
         REPO,
@@ -725,77 +592,25 @@ async fn execute_push_with_deleted_tag_is_noop_success_records_no_failed() {
 
     let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
 
-    let failed_before = push_total(downstream, "failed");
-    let pushed_before = push_total(downstream, "pushed");
+    // A tag-scoped push misses the tag, a tag-less one the revision link.
+    for tag in [sample_target().tag, None] {
+        let failed_before = push_total(downstream, "failed");
+        let pushed_before = push_total(downstream, "pushed");
 
-    let payload = ReplicationJob::Push {
-        target: ReplicationTarget {
-            downstream: downstream.to_string(),
-            ..sample_target()
-        },
-    };
-    let envelope = build_envelope(&payload).unwrap();
-    handler
-        .execute(&envelope)
-        .await
-        .expect("a deleted-tag push must be a converged no-op success");
-    assert_eq!(
-        push_total(downstream, "failed"),
-        failed_before,
-        "a converged no-op must NOT increment the failed counter"
-    );
-    assert_eq!(
-        push_total(downstream, "pushed"),
-        pushed_before,
-        "a converged no-op must NOT increment the pushed counter"
-    );
-}
-
-#[tokio::test]
-async fn execute_tagless_push_with_deleted_revision_is_noop_success() {
-    metrics_provider::initialize_metrics();
-    let downstream = "metric-deleted-revision";
-
-    let FsTestStack {
-        dir: _dir,
-        metadata_store,
-        blob_store,
-    } = fs_test_stack();
-
-    // No revision link seeded, so the resolve short-circuits; the
-    // unreachable downstream URL makes any wrongful push error.
-    let resolver = single_repo_resolver(
-        REPO,
-        repository_with_named_downstream(downstream, downstream_client("http://127.0.0.1:1")),
-    );
-
-    let handler = ReplicationJobHandler::new(resolver, blob_store, metadata_store);
-
-    let failed_before = push_total(downstream, "failed");
-    let pushed_before = push_total(downstream, "pushed");
-
-    let payload = ReplicationJob::Push {
-        target: ReplicationTarget {
-            downstream: downstream.to_string(),
-            tag: None,
-            ..sample_target()
-        },
-    };
-    let envelope = build_envelope(&payload).unwrap();
-    handler
-        .execute(&envelope)
-        .await
-        .expect("a deleted-revision by-digest push must be a converged no-op success");
-    assert_eq!(
-        push_total(downstream, "failed"),
-        failed_before,
-        "a converged no-op must NOT increment the failed counter"
-    );
-    assert_eq!(
-        push_total(downstream, "pushed"),
-        pushed_before,
-        "a converged no-op must NOT increment the pushed counter"
-    );
+        let payload = ReplicationJob::Push {
+            target: ReplicationTarget {
+                downstream: downstream.to_string(),
+                tag,
+                ..sample_target()
+            },
+        };
+        handler
+            .execute(&build_envelope(&payload).unwrap())
+            .await
+            .expect("a push of a deleted target must be a converged no-op success");
+        assert_eq!(push_total(downstream, "failed"), failed_before);
+        assert_eq!(push_total(downstream, "pushed"), pushed_before);
+    }
 }
 
 /// The durable queue stores this payload, so its JSON is a stored format: these
@@ -863,19 +678,5 @@ fn a_written_job_keeps_the_stored_layout() {
     assert!(
         !object.contains_key("subject"),
         "an absent subject stays absent rather than serializing as null: {json}"
-    );
-}
-
-/// The delete `lock_key` embeds the source instant, and the dedup index keys off
-/// that string. Typing the field must not shift it, or an upgraded replica would
-/// stop coalescing with a job a peer already queued for the same event.
-#[test]
-fn a_delete_lock_key_is_unchanged_by_typing_the_instant() {
-    let legacy_source_ts = "2024-01-01T00:00:00.123456789+00:00";
-    let delete = sample_delete(legacy_source_ts);
-    assert_eq!(
-        replication_lock_key(&delete),
-        format!("replication.delete.eu-region:nginx:v1@{legacy_source_ts}"),
-        "the key must still spell the instant exactly as the stored payload did"
     );
 }

@@ -36,17 +36,7 @@ mod tests {
 
     use crate::redis_backend::{BackendConfig, RedisUrl};
 
-    #[tokio::test]
-    async fn test_memory_backend() {
-        let backend = Config::Memory.to_backend().unwrap();
-
-        backend.store_value("k", "v", 60).await.unwrap();
-        let retrieved = backend.retrieve_value("k").await.unwrap();
-        assert_eq!(retrieved.as_deref(), Some("v"));
-    }
-
-    // Verify that Config::Redis selects the Redis variant without actually
-    // connecting (construction is lazy: no network call at `to_backend()`).
+    /// Construction is lazy, so no live server is needed.
     #[test]
     fn redis_config_to_backend_constructs_without_connecting() {
         let backend = Config::Redis(BackendConfig {

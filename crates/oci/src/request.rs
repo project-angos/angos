@@ -1,10 +1,6 @@
-//! One struct per distribution-API operation, spoken by both ends: a registry
-//! reads what it was asked for, and the client that pulls or replicates to an
-//! upstream fills in the same shape.
-//!
-//! An open upload session is addressed by the continuation URL the server
-//! assigns, which the spec keeps opaque, so only the receiving side of those
-//! operations names a session by [`UploadSessionId`].
+//! One struct per distribution-API operation, shared by both ends. Only the
+//! receiving side names a session by [`UploadSessionId`]; a client follows the
+//! opaque URL the server assigned.
 
 use std::slice;
 
@@ -17,10 +13,7 @@ use crate::types::{
     Algorithm, Digest, MediaRange, MediaType, Namespace, Reference, Tag, UploadSessionId,
 };
 
-/// What a manifest PUT writes: a by-tag push targets a single tag, while a
-/// by-digest push targets the digest and may create extra tags via `?tag=`
-/// query parameters. Modeling both as one enum keeps the illegal "tag reference
-/// with extra tags" state unrepresentable.
+/// What a manifest PUT writes: one tag, or a digest plus any `?tag=` tags.
 #[derive(Clone, Debug)]
 pub enum ManifestPutTarget {
     Tag(Tag),
@@ -28,7 +21,6 @@ pub enum ManifestPutTarget {
 }
 
 impl ManifestPutTarget {
-    /// The reference this push addresses.
     #[must_use]
     pub fn reference(&self) -> Reference {
         match self {
@@ -37,8 +29,6 @@ impl ManifestPutTarget {
         }
     }
 
-    /// Every tag this push creates: the path tag for a by-tag push, or the
-    /// `?tag=` query parameters for a by-digest push.
     #[must_use]
     pub fn created_tags(&self) -> &[Tag] {
         match self {
@@ -47,8 +37,7 @@ impl ManifestPutTarget {
         }
     }
 
-    /// Decompose into the addressed reference and the extra `?tag=` tags (empty
-    /// for a by-tag push, whose only tag is the reference itself).
+    /// The reference and the extra `?tag=` tags, empty for a by-tag push.
     #[must_use]
     pub fn into_parts(self) -> (Reference, Vec<Tag>) {
         match self {
@@ -59,9 +48,7 @@ impl ManifestPutTarget {
 }
 
 impl Serialize for ManifestPutTarget {
-    /// Project the push target onto the policy input: `tags` always lists every
-    /// tag the push creates (empty for a bare by-digest push), and `digest` is
-    /// added for a by-digest push.
+    /// The policy input: every created tag, plus the digest of a by-digest push.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         if let Self::Digest { digest, .. } = self {
@@ -200,9 +187,8 @@ pub struct DeleteUploadRequest {
     pub session_id: UploadSessionId,
 }
 
-/// The non-body inputs to a chunk push; the chunk is passed separately as the
-/// stream. A missing `content_length` is a chunked (`Transfer-Encoding:
-/// chunked`) upload, which docker push sends; the body is then streamed to EOF.
+/// The chunk is passed separately, as a stream; a missing `content_length` is
+/// a chunked upload, which docker push sends.
 #[derive(Debug)]
 pub struct PatchUploadRequest {
     pub namespace: Namespace,
@@ -211,9 +197,7 @@ pub struct PatchUploadRequest {
     pub content_length: Option<u64>,
 }
 
-/// The non-body inputs to an upload completion: the target session and digest,
-/// plus the optional resume offset and declared length. The blob body is passed
-/// separately as the stream.
+/// The body is passed separately, as a stream.
 #[derive(Debug)]
 pub struct CompleteUploadRequest {
     pub namespace: Namespace,

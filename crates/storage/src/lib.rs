@@ -1,22 +1,6 @@
-//! Unified storage abstraction shared by `blob_store`, `metadata_store`, and
-//! `job_store`.
-//!
-//! # Capability traits
-//!
-//! - [`ObjectStore`]: universal floor: object CRUD, prefix-batch delete,
-//!   head, two listing modes (flat-recursive and one-level-children),
-//!   server-side copy, and the keyed, append-only streaming upload primitive
-//!   (FS opens an append-mode file; S3 wraps its native multipart-upload
-//!   protocol, hiding the wire details (upload IDs, parts, staged remainders)
-//!   from callers, recovering them from S3 on each call). Every backend
-//!   implements this.
-//! - [`PresignedStore`]: signed download URLs. Only S3 implements this.
-//!
-//! # Backends
-//!
-//! - [`fs::Backend`]: [`ObjectStore`] on top of `tokio::fs`.
-//! - [`s3::Backend`]: [`ObjectStore`] + [`PresignedStore`] wrapping
-//!   [`angos_s3_client::Backend`].
+//! The object-storage abstraction shared by the blob, metadata and job stores:
+//! [`ObjectStore`] on [`fs::Backend`] and [`s3::Backend`], plus
+//! [`PresignedStore`] on S3 alone.
 
 mod error;
 mod object;
@@ -40,11 +24,7 @@ pub use crate::object::{KeyStream, ObjectStore};
 pub use crate::pagination::paginated;
 pub use crate::presigned::PresignedStore;
 pub use crate::types::{Children, ChildrenPage, ObjectMeta, Page};
-pub use crate::upload_session::{
-    ByteStream, MultipartUploadPage, PendingMultipartUpload, channel_stream,
-};
+pub use crate::upload_session::{ByteStream, MultipartUploadPage, PendingMultipartUpload};
 
-/// Boxed `AsyncRead` returned by [`ObjectStore::get_stream`]. Matches the
-/// shape `blob_store` already uses so future migrations don't need a
-/// conversion layer.
+/// Boxed `AsyncRead` returned by [`ObjectStore::get_stream`].
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send + Sync>;

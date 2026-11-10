@@ -4,15 +4,8 @@ use regex::{Error as RegexError, Regex};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A pre-compiled regular expression that is validated at deserialisation time.
-///
-/// Storing the original source alongside the compiled [`Regex`] lets the value
-/// round-trip through `Serialize` as a plain string, preserving the JSON API
-/// contract for external callers.
-///
-/// Invalid patterns are rejected when the TOML configuration is parsed, so the
-/// registry fails fast with a clear error rather than silently dropping rules
-/// at runtime.
+/// A regex validated at parse time; the source is kept so it serializes back as
+/// the plain string the JSON API exposes.
 #[derive(Clone)]
 pub struct RegexPattern {
     source: String,
@@ -20,11 +13,6 @@ pub struct RegexPattern {
 }
 
 impl RegexPattern {
-    /// Compile a regular expression from `source`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegexError`] when `source` is not a valid regular expression.
     pub fn compile(source: &str) -> Result<Self, RegexError> {
         let regex = Regex::new(source)?;
         Ok(Self {
@@ -33,17 +21,14 @@ impl RegexPattern {
         })
     }
 
-    /// The original pattern string as written in the configuration file.
     pub fn as_source(&self) -> &str {
         &self.source
     }
 
-    /// Returns `true` if `text` is matched by this pattern.
     pub fn is_match(&self, text: &str) -> bool {
         self.regex.is_match(text)
     }
 
-    /// Consumes the wrapper, returning the compiled [`Regex`].
     #[must_use]
     pub fn into_regex(self) -> Regex {
         self.regex

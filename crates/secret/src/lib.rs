@@ -3,12 +3,7 @@ use std::fmt;
 use serde::Deserialize;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// A wrapper type for sensitive values that are automatically zeroed from memory when dropped.
-///
-/// This type provides:
-/// - Automatic memory clearing on drop via `ZeroizeOnDrop`
-/// - Debug output that hides the actual value
-/// - Transparent deserialization from TOML/JSON
+/// A sensitive value, zeroed from memory on drop and redacted from `Debug` output.
 #[derive(Clone, Default, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct Secret<T: Zeroize>(T);
@@ -36,8 +31,6 @@ mod tests {
     #[test]
     fn test_secret_debug_redacts_value() {
         let secret = Secret::new("my-password".to_string());
-        let debug_output = format!("{secret:?}");
-        assert_eq!(debug_output, "[REDACTED]");
-        assert!(!debug_output.contains("my-password"));
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
     }
 }

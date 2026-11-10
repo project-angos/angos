@@ -5,10 +5,9 @@ use url::Url;
 
 use angos_oci::{Digest, Namespace, Reference};
 
-use crate::configuration::RegexPattern;
 use crate::event_webhook::config::{DeliveryPolicy, EventWebhookConfig};
 use crate::event_webhook::dispatcher::{EventDispatcher, WebhookEndpoint};
-use crate::event_webhook::event::{Event, EventKind};
+use crate::event_webhook::event::{Event, EventKind, EventSubject};
 use crate::metrics_provider;
 use angos_mtls_client::ClientTls;
 use angos_secret::Secret;
@@ -42,29 +41,15 @@ pub fn single_hook_dispatcher(
 
 pub fn create_test_event() -> Event {
     let digest: Digest = TEST_DIGEST.parse().expect("test digest should parse");
-    Event::push_manifest(
+    Event::new(
+        EventSubject::ManifestPush {
+            digest: digest.clone(),
+            reference: Reference::Digest(digest),
+        },
         &Namespace::new("library/nginx").expect("test namespace should parse"),
         "docker-hub",
-        &digest,
-        &Reference::Digest(digest.clone()),
         None,
     )
-}
-
-pub fn create_test_config(
-    events: Vec<EventKind>,
-    repository_filter: Option<Vec<RegexPattern>>,
-) -> EventWebhookConfig {
-    EventWebhookConfig {
-        url: Url::parse("https://example.com/webhook").unwrap(),
-        policy: DeliveryPolicy::Optional,
-        token: None,
-        timeout_ms: 5000,
-        max_retries: Some(0),
-        events,
-        repository_filter,
-        tls: ClientTls::default(),
-    }
 }
 
 pub fn build_endpoint(config: EventWebhookConfig) -> WebhookEndpoint {

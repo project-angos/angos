@@ -11,7 +11,7 @@ use chrono::Utc;
 use reqwest::Client;
 use tracing::{debug, info};
 
-use angos_mtls_client::MtlsClientBuilder;
+use angos_mtls_client::build_client;
 use angos_oci::request::{PutManifestRequest, StartUploadRequest, StartUploadTarget};
 use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, Reference};
 use angos_secret::Secret;
@@ -43,11 +43,11 @@ impl ScanJobHandler {
         metadata_store: Arc<MetadataStore>,
         config: &ScanConfig,
     ) -> Result<Self, Error> {
-        let client = MtlsClientBuilder::new()
-            .with_timeout(Duration::from_secs(config.timeout_secs))
-            .with_tls(&config.tls)
-            .build()
-            .map_err(|e| Error::Initialization(format!("scanner client: {e}")))?;
+        let client = build_client(
+            Client::builder().timeout(Duration::from_secs(config.timeout_secs)),
+            &config.tls,
+        )
+        .map_err(|e| Error::Initialization(format!("scanner client: {e}")))?;
         Ok(Self {
             registry,
             blob_store,
@@ -140,15 +140,13 @@ impl ScanJobHandler {
         subject: Descriptor,
         report: &[u8],
     ) -> Result<(), Error> {
-        let config_digest = Digest::sha256_of_bytes(EMPTY_CONFIG_BODY);
-        self.push_blob(namespace, &config_digest, EMPTY_CONFIG_BODY.to_vec())
-            .await?;
-        let layer_digest = Digest::sha256_of_bytes(report);
-        self.push_blob(namespace, &layer_digest, report.to_vec())
-            .await?;
-
         let sarif =
             MediaType::new(SARIF_MEDIA_TYPE).map_err(|e| Error::Execution(e.to_string()))?;
+        let config = self
+            .push_blob(namespace, MediaType::oci_empty(), EMPTY_CONFIG_BODY)
+            .await?;
+        let layer = self.push_blob(namespace, sarif.clone(), report).await?;
+
         let manifest = Manifest {
             schema_version: 2,
             media_type: Some(MediaType::oci_manifest()),
@@ -158,24 +156,10 @@ impl ScanJobHandler {
                 .into_iter()
                 .chain([(CREATED_ANNOTATION.to_string(), Utc::now().to_rfc3339())])
                 .collect(),
-            artifact_type: Some(sarif.clone()),
+            artifact_type: Some(sarif),
             content: Content::Image {
-                config: Some(Box::new(Descriptor {
-                    media_type: MediaType::oci_empty(),
-                    digest: config_digest,
-                    size: EMPTY_CONFIG_BODY.len() as u64,
-                    annotations: HashMap::default(),
-                    artifact_type: None,
-                    platform: None,
-                })),
-                layers: vec![Descriptor {
-                    media_type: sarif,
-                    digest: layer_digest,
-                    size: report.len() as u64,
-                    annotations: HashMap::default(),
-                    artifact_type: None,
-                    platform: None,
-                }],
+                config: Some(Box::new(config)),
+                layers: vec![layer],
             },
         };
         let body = serde_json::to_vec(&manifest)
@@ -200,10 +184,11 @@ impl ScanJobHandler {
     async fn push_blob(
         &self,
         namespace: &Namespace,
-        digest: &Digest,
-        bytes: Vec<u8>,
-    ) -> Result<(), Error> {
-        let length = bytes.len() as u64;
+        media_type: MediaType,
+        bytes: &[u8],
+    ) -> Result<Descriptor, Error> {
+        let digest = Digest::sha256_of_bytes(bytes);
+        let size = bytes.len() as u64;
         self.registry
             .handle_start_upload(
                 Some(EventActor::internal(SCAN_ACTOR)),
@@ -212,13 +197,20 @@ impl ScanJobHandler {
                     digest_algorithm: None,
                     target: Some(StartUploadTarget {
                         digest: digest.clone(),
-                        content_length: Some(length),
+                        content_length: Some(size),
                     }),
                 },
-                Cursor::new(bytes),
+                Cursor::new(bytes.to_vec()),
             )
             .await?;
-        Ok(())
+        Ok(Descriptor {
+            media_type,
+            digest,
+            size,
+            annotations: HashMap::default(),
+            artifact_type: None,
+            platform: None,
+        })
     }
 }
 

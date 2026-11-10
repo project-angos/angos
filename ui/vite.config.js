@@ -5,16 +5,7 @@ import { defineConfig } from 'vite';
 export default defineConfig({
 	plugins: [
 		sveltekit({
-			adapter: adapter({
-				pages: 'build',
-				assets: 'build',
-				fallback: 'index.html',
-				precompress: false,
-				strict: true
-			}),
-			paths: {
-				base: ''
-			}
+			adapter: adapter({ fallback: 'index.html' })
 		})
 	]
 });

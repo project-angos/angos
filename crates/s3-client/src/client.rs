@@ -1,10 +1,5 @@
-//! Low-level HTTP client for S3-compatible storage.
-//!
-//! This module contains everything that is "S3 the wire protocol": `SigV4`
-//! signing, request building, retries, timeouts and transport. The rest of the
-//! S3 backend never imports `reqwest`, `hmac`, `sha2` or other HTTP primitives
-//! directly; it talks to [`S3Client`] through the few zero-copy primitives
-//! exposed below.
+//! The S3 wire protocol: `SigV4` signing, request building, retries, timeouts
+//! and transport.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -27,7 +22,8 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT,
+    AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, LAST_MODIFIED, RANGE,
+    USER_AGENT,
 };
 use reqwest::{Body, Client, Error as ReqwestError, Method, Response, StatusCode};
 use sha2::Sha256;
@@ -36,7 +32,7 @@ use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::BackendConfig;
-use crate::xml;
+use crate::xml::{self, S3ErrorBody};
 
 const SERVICE: &str = "s3";
 const SIGNING_ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -76,9 +72,6 @@ pub struct S3Response {
     pub body: Bytes,
 }
 
-/// An S3-level error. Used internally; the operations layer maps it onto
-/// `io::Error` or the registry's `s3_client::Error` before crossing the
-/// module boundary.
 #[derive(Debug, Clone)]
 pub struct S3Error {
     pub status: Option<StatusCode>,
@@ -122,8 +115,8 @@ impl S3Error {
 
     async fn from_response(response: Response) -> Self {
         let status = response.status();
-        let body = read_response_prefix(response, MAX_ERROR_BODY_BYTES).await;
-        Self::from_error_body(Some(status), &body).unwrap_or_else(|| Self {
+        let body = read_response_prefix(response).await;
+        Self::from_error_body(status, &body).unwrap_or_else(|| Self {
             status: Some(status),
             code: Self::status_default_code(status).map(str::to_string),
             message: status.canonical_reason().map_or_else(
@@ -133,20 +126,18 @@ impl S3Error {
         })
     }
 
-    fn from_error_body(status: Option<StatusCode>, body: &[u8]) -> Option<Self> {
-        let parsed = xml::parse_error(body);
+    fn from_error_body(status: StatusCode, body: &[u8]) -> Option<Self> {
+        let parsed: S3ErrorBody = xml::parse(body).unwrap_or_default();
         if parsed.code.is_none() && parsed.message.is_none() {
             return None;
         }
         Some(Self {
-            status,
-            code: parsed.code.or_else(|| {
-                status
-                    .and_then(Self::status_default_code)
-                    .map(str::to_string)
-            }),
+            status: Some(status),
+            code: parsed
+                .code
+                .or_else(|| Self::status_default_code(status).map(str::to_string)),
             message: parsed.message.unwrap_or_else(|| {
-                status.and_then(|s| s.canonical_reason()).map_or_else(
+                status.canonical_reason().map_or_else(
                     || "S3 returned an embedded error response".to_string(),
                     str::to_string,
                 )
@@ -200,19 +191,15 @@ pub struct StreamedFailure {
     pub body_sent: bool,
 }
 
-/// Request body variants. `Bytes` payloads are replayable across retries
-/// (cheap to clone: refcount only). `Stream` is one-shot; it disables
-/// payload signing (UNSIGNED-PAYLOAD) so the body never needs buffering.
+/// A `Bytes` body is replayable across retries; a `Stream` is one-shot and
+/// signed as UNSIGNED-PAYLOAD so it never needs buffering.
 pub enum RequestBody<S> {
-    Empty,
     Bytes(Bytes),
     Stream { content_length: u64, stream: S },
 }
 
-/// Stream type alias used by streaming uploads.
 pub type ByteStream = Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static>;
 
-/// Options selecting per-request behaviour. All flags default to `false`.
 #[derive(Clone, Copy, Default)]
 pub struct SendOpts {
     /// Some S3-compatible servers return HTTP 200 with an `<Error>` document
@@ -254,7 +241,6 @@ pub struct S3Client {
     endpoint: String,
     endpoint_path: String,
     host: String,
-    bucket: String,
     encoded_bucket: String,
     access_key_id: String,
     secret_key: String,
@@ -279,7 +265,7 @@ impl Debug for S3Client {
             .field("endpoint", &self.endpoint)
             .field("endpoint_path", &self.endpoint_path)
             .field("host", &self.host)
-            .field("bucket", &self.bucket)
+            .field("encoded_bucket", &self.encoded_bucket)
             .field("region", &self.region)
             .field("operation_timeout", &self.operation_timeout)
             .field("operation_attempt_timeout", &self.operation_attempt_timeout)
@@ -293,11 +279,6 @@ struct RequestTarget {
     url: String,
     canonical_uri: String,
     canonical_query: String,
-}
-
-struct EncodedQueryParam {
-    name: String,
-    value: Option<String>,
 }
 
 impl S3Client {
@@ -327,14 +308,9 @@ impl S3Client {
             http,
             streaming_http,
             endpoint,
-            endpoint_path: if endpoint_path == "/" {
-                String::new()
-            } else {
-                endpoint_path
-            },
+            endpoint_path,
             host,
-            bucket: config.bucket.clone(),
-            encoded_bucket: encode_bucket(&config.bucket),
+            encoded_bucket: aws_uri_encode(&config.bucket, Slash::Encode),
             access_key_id: config.access_key_id.clone(),
             secret_key: config.secret_key.clone(),
             region: config.region.clone(),
@@ -375,7 +351,7 @@ impl S3Client {
                 .await?;
             let response = collect_full_response(response).await?;
             if opts.check_embedded_error
-                && let Some(error) = S3Error::from_error_body(Some(StatusCode::OK), &response.body)
+                && let Some(error) = S3Error::from_error_body(StatusCode::OK, &response.body)
             {
                 return Err(error);
             }
@@ -384,7 +360,7 @@ impl S3Client {
         .await
     }
 
-    /// Send a request whose body is produced by a `Stream`. The body is one-shot
+    /// `PUT` a body produced by a `Stream`. The body is one-shot
     /// (no retries) and signed as UNSIGNED-PAYLOAD so it never has to be
     /// buffered. The pushing client paces the body, so nothing is timed until
     /// its last byte is out, as any timer would cap that client's speed; from
@@ -392,12 +368,10 @@ impl S3Client {
     ///
     /// # Errors
     /// The failure, telling whether the body had been sent in full.
-    pub async fn send_streaming_body<S>(
+    pub async fn put_streaming<S>(
         &self,
-        method: Method,
         key: &str,
         query: Vec<QueryParam>,
-        headers: HeaderMap,
         content_length: u64,
         stream: S,
     ) -> Result<S3Response, StreamedFailure>
@@ -415,10 +389,10 @@ impl S3Client {
         let exchange = async {
             let response = self
                 .dispatch(
-                    method,
+                    Method::PUT,
                     key,
                     &query,
-                    headers,
+                    HeaderMap::new(),
                     RequestBody::Stream {
                         content_length,
                         stream,
@@ -426,10 +400,6 @@ impl S3Client {
                     None,
                 )
                 .await?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(S3Error::from_response(response).await);
-            }
             collect_full_response(response).await
         };
         let answer_due = async {
@@ -451,22 +421,20 @@ impl S3Client {
         })
     }
 
-    /// Send a request and return the raw response for streaming download.
-    pub async fn send_streaming_response(
-        &self,
-        method: Method,
-        key: &str,
-        query: Vec<QueryParam>,
-        headers: HeaderMap,
-    ) -> Result<Response, S3Error> {
+    /// `GET` from `offset` on, returning the raw response for a streamed download.
+    pub async fn get_streaming(&self, key: &str, offset: Option<u64>) -> Result<Response, S3Error> {
+        let mut headers = HeaderMap::new();
+        if let Some(offset) = offset {
+            insert_header(&mut headers, RANGE, &format!("bytes={offset}-"))?;
+        }
         self.run_with_retries(SendOpts::default(), || async {
             let response = self
                 .dispatch(
-                    method.clone(),
+                    Method::GET,
                     key,
-                    &query,
+                    &[],
                     headers.clone(),
-                    RequestBody::<ByteStream>::Empty,
+                    RequestBody::<ByteStream>::Bytes(Bytes::new()),
                     None,
                 )
                 .await?;
@@ -489,7 +457,7 @@ impl S3Client {
         let now = Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
-        let credential_scope = self.credential_scope(&date);
+        let credential_scope = format!("{date}/{}/{SERVICE}/aws4_request", self.region);
 
         let mut query = vec![
             QueryParam::new("X-Amz-Algorithm", SIGNING_ALGORITHM),
@@ -506,14 +474,9 @@ impl S3Client {
         }
 
         let target = self.request_target(key, &query);
-        let canonical_headers = format!("host:{}\n", self.host);
-        let canonical_request = build_canonical_request(
-            Method::GET.as_str(),
-            &target.canonical_uri,
-            &target.canonical_query,
-            &canonical_headers,
-            "host",
-            UNSIGNED_PAYLOAD,
+        let canonical_request = format!(
+            "GET\n{}\n{}\nhost:{}\n\nhost\n{UNSIGNED_PAYLOAD}",
+            target.canonical_uri, target.canonical_query, self.host
         );
         let signature = self.signature(&date, &amz_date, &credential_scope, &canonical_request)?;
 
@@ -538,7 +501,6 @@ impl S3Client {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<R, S3Error>>,
     {
-        let attempts = self.max_attempts;
         let fut = async {
             // A `loop` (not a bounded `for`) so the final attempt returns its
             // own result and no post-loop arm is needed.
@@ -549,7 +511,7 @@ impl S3Client {
                     // A non-idempotent request may already have landed unless
                     // the error proves it did not.
                     Err(error)
-                        if attempt < attempts
+                        if attempt < self.max_attempts
                             && if opts.non_idempotent {
                                 is_unapplied_error(&error)
                             } else {
@@ -584,14 +546,13 @@ impl S3Client {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
         let (payload_hash, content_length) = match &body {
-            RequestBody::Empty => (Cow::Borrowed(EMPTY_PAYLOAD_SHA256), Some(0)),
-            RequestBody::Bytes(b) if b.is_empty() => (Cow::Borrowed(EMPTY_PAYLOAD_SHA256), Some(0)),
+            RequestBody::Bytes(b) if b.is_empty() => (Cow::Borrowed(EMPTY_PAYLOAD_SHA256), 0),
             RequestBody::Bytes(b) => (
                 Cow::Owned(hex::encode(Sha256::digest(b.as_ref()))),
-                Some(b.len() as u64),
+                b.len() as u64,
             ),
             RequestBody::Stream { content_length, .. } => {
-                (Cow::Borrowed(UNSIGNED_PAYLOAD), Some(*content_length))
+                (Cow::Borrowed(UNSIGNED_PAYLOAD), *content_length)
             }
         };
         let target = self.request_target(key, query);
@@ -608,33 +569,23 @@ impl S3Client {
             HeaderName::from_static("x-amz-content-sha256"),
             &payload_hash,
         )?;
-        if let Some(len) = content_length {
-            insert_header(&mut headers, CONTENT_LENGTH, &len.to_string())?;
-        }
+        insert_header(&mut headers, CONTENT_LENGTH, &content_length.to_string())?;
 
-        let credential_scope = self.credential_scope(&date);
-        let authorization = self.authorization(
-            &method,
-            &target,
-            &headers,
-            &date,
-            &amz_date,
-            &credential_scope,
-        )?;
+        let authorization =
+            self.authorization(&method, &target, &headers, &payload_hash, &date, &amz_date)?;
         insert_header(&mut headers, AUTHORIZATION, &authorization)?;
 
         // Only a streamed request body takes the client without a read
         // timeout; a streamed download still needs one to cut a stall short.
         let client = match &body {
             RequestBody::Stream { .. } => &self.streaming_http,
-            _ => &self.http,
+            RequestBody::Bytes(_) => &self.http,
         };
         let mut request = client.request(method, &target.url).headers(headers);
         if let Some(timeout) = request_timeout {
             request = request.timeout(timeout);
         }
         request = match body {
-            RequestBody::Empty => request,
             RequestBody::Bytes(b) if b.is_empty() => request,
             RequestBody::Bytes(b) => request.body(Body::from(b)),
             RequestBody::Stream { stream, .. } => request.body(Body::wrap_stream(stream)),
@@ -676,21 +627,17 @@ impl S3Client {
         method: &Method,
         target: &RequestTarget,
         headers: &HeaderMap,
+        payload_hash: &str,
         date: &str,
         amz_date: &str,
-        credential_scope: &str,
     ) -> Result<String, S3Error> {
         let (canonical_headers, signed_headers) = canonical_headers(headers)?;
-        let payload_hash = header_value(headers, "x-amz-content-sha256")?;
-        let canonical_request = build_canonical_request(
-            method.as_str(),
-            &target.canonical_uri,
-            &target.canonical_query,
-            &canonical_headers,
-            &signed_headers,
-            &payload_hash,
+        let canonical_request = format!(
+            "{method}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            target.canonical_uri, target.canonical_query
         );
-        let signature = self.signature(date, amz_date, credential_scope, &canonical_request)?;
+        let credential_scope = format!("{date}/{}/{SERVICE}/aws4_request", self.region);
+        let signature = self.signature(date, amz_date, &credential_scope, &canonical_request)?;
         Ok(format!(
             "{SIGNING_ALGORITHM} Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
             self.access_key_id
@@ -735,21 +682,14 @@ impl S3Client {
         Ok(key)
     }
 
-    fn credential_scope(&self, date: &str) -> String {
-        format!("{date}/{}/{SERVICE}/aws4_request", self.region)
+    /// The `x-amz-copy-source` value naming `key` in this client's bucket.
+    pub fn copy_source(&self, key: &str) -> String {
+        format!(
+            "{}/{}",
+            self.encoded_bucket,
+            aws_uri_encode(key, Slash::Keep)
+        )
     }
-}
-
-// public helpers used by the operations module
-
-pub fn range_header(offset: u64) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    // `bytes={offset}-` is always valid ASCII; skip the header on the impossible
-    // parse error rather than panicking.
-    if let Ok(value) = HeaderValue::from_str(&format!("bytes={offset}-")) {
-        headers.insert(RANGE, value);
-    }
-    headers
 }
 
 pub fn insert_header(
@@ -763,62 +703,27 @@ pub fn insert_header(
     Ok(())
 }
 
-pub fn header_value(headers: &HeaderMap, name: &str) -> Result<String, S3Error> {
-    headers
-        .get(name)
-        .ok_or_else(|| S3Error::configuration(format!("missing signed header: {name}")))?
-        .to_str()
-        .map(ToString::to_string)
-        .map_err(|e| S3Error::configuration(format!("invalid header value: {e}")))
-}
-
-pub fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
-}
-
 pub fn content_length(headers: &HeaderMap) -> Result<u64, S3Error> {
     // Defaulting a missing header to zero would report a stored blob as empty
     // and truncate the body served from it.
-    header_string(headers, "content-length")
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
         .ok_or_else(|| S3Error::configuration("S3 response carries no content-length".to_owned()))?
         .parse::<u64>()
         .map_err(|e| S3Error::configuration(format!("invalid S3 content-length: {e}")))
 }
 
 pub fn last_modified(headers: &HeaderMap) -> Option<DateTime<Utc>> {
-    header_string(headers, "last-modified")
-        .and_then(|value| DateTime::parse_from_rfc2822(&value).ok())
+    headers
+        .get(LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
         .map(|dt| dt.with_timezone(&Utc))
-}
-
-pub fn encode_bucket(bucket: &str) -> String {
-    aws_uri_encode(bucket, Slash::Encode)
-}
-
-pub fn copy_source(encoded_bucket: &str, key: &str) -> String {
-    format!("{encoded_bucket}/{}", aws_uri_encode(key, Slash::Keep))
 }
 
 pub fn content_md5_base64(body: &[u8]) -> String {
     BASE64_STANDARD.encode(Md5::digest(body))
-}
-
-// internal helpers
-
-fn build_canonical_request(
-    method: &str,
-    canonical_uri: &str,
-    canonical_query: &str,
-    canonical_headers: &str,
-    signed_headers: &str,
-    payload_hash: &str,
-) -> String {
-    format!(
-        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    )
 }
 
 fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), S3Error> {
@@ -851,10 +756,10 @@ fn canonical_headers(headers: &HeaderMap) -> Result<(String, String), S3Error> {
     Ok((canonical, signed))
 }
 
-fn encode_query(query: &[QueryParam]) -> Vec<EncodedQueryParam> {
+fn encode_query(query: &[QueryParam]) -> Vec<QueryParam> {
     query
         .iter()
-        .map(|param| EncodedQueryParam {
+        .map(|param| QueryParam {
             name: aws_uri_encode(&param.name, Slash::Encode),
             value: param
                 .value
@@ -864,8 +769,8 @@ fn encode_query(query: &[QueryParam]) -> Vec<EncodedQueryParam> {
         .collect()
 }
 
-fn canonical_query(query: &[EncodedQueryParam]) -> String {
-    let mut params: Vec<&EncodedQueryParam> = query.iter().collect();
+fn canonical_query(query: &[QueryParam]) -> String {
+    let mut params: Vec<&QueryParam> = query.iter().collect();
     params.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
     params
         .iter()
@@ -880,7 +785,7 @@ fn canonical_query(query: &[EncodedQueryParam]) -> String {
         .join("&")
 }
 
-fn url_query(query: &[EncodedQueryParam]) -> String {
+fn url_query(query: &[QueryParam]) -> String {
     query
         .iter()
         .map(|param| match &param.value {
@@ -992,18 +897,18 @@ async fn collect_full_response(response: Response) -> Result<S3Response, S3Error
     })
 }
 
-async fn read_response_prefix(response: Response, limit: usize) -> Bytes {
+async fn read_response_prefix(response: Response) -> Bytes {
     let mut stream = response.bytes_stream();
-    let mut body = BytesMut::with_capacity(limit.min(8 * 1024));
+    let mut body = BytesMut::with_capacity(8 * 1024);
 
-    while body.len() < limit {
+    while body.len() < MAX_ERROR_BODY_BYTES {
         let Some(chunk) = stream.next().await else {
             break;
         };
         let Ok(chunk) = chunk else {
             break;
         };
-        let remaining = limit - body.len();
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
         let take = remaining.min(chunk.len());
         body.extend_from_slice(&chunk[..take]);
         if take < chunk.len() {
@@ -1060,11 +965,6 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
-    }
-
-    #[test]
-    fn user_agent_falls_back_to_this_crate_version_when_unset() {
-        assert_eq!(test_client().user_agent, USER_AGENT_VALUE);
     }
 
     #[test]

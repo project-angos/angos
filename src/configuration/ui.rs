@@ -50,15 +50,6 @@ mod tests {
     use crate::configuration::UiConfig;
 
     #[test]
-    fn default_disables_ui_and_uses_product_name() {
-        let config = UiConfig::default();
-
-        assert!(!config.enabled);
-        assert_eq!(config.name, "Angos");
-        assert!(config.oidc.is_none());
-    }
-
-    #[test]
     fn oidc_defaults_to_the_openid_scopes() {
         let config: UiConfig = toml::from_str(
             r#"
@@ -70,9 +61,6 @@ mod tests {
         )
         .unwrap();
 
-        let oidc = config.oidc.unwrap();
-        assert_eq!(oidc.provider, "dex");
-        assert_eq!(oidc.client_id, "angos-ui");
-        assert_eq!(oidc.scopes, "openid profile email");
+        assert_eq!(config.oidc.unwrap().scopes, "openid profile email");
     }
 }

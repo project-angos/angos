@@ -8,42 +8,10 @@ use angos_oci::{Algorithm, Digest, MediaType, Namespace, Reference, UploadSessio
 
 use crate::jobs::{JobState, Queue};
 
-/// Action represents a parsed HTTP request: both the domain operation (for CEL policies)
-/// and the routing information (for handler dispatch).
-///
-/// HEAD and GET variants of blob/manifest requests are distinct variants so the dispatcher
-/// can route them to different handlers, but they serialize to the same kebab-case string
-/// so CEL policies cannot distinguish them:
-///
-/// ```text
-/// Action::GetBlob  → "get-blob"    (CEL string)
-/// Action::HeadBlob → "get-blob"    (same CEL string, different handler)
-/// ```
-///
-/// # Serialization
-///
-/// Serializes to a flat JSON object compatible with CEL policy expressions:
-///
-/// ```json
-/// {"action": "get-blob", "namespace": "library/nginx", "digest": "sha256:..."}
-/// ```
-///
-/// HTTP-only fields such as `UiAsset.path` are excluded from the serialized form because
-/// they have no meaning to the policy engine.
-///
-/// # Available Fields in CEL Policies
-///
-/// - `action`: The operation name (always present)
-/// - `namespace`: The repository namespace (when applicable)
-/// - `digest`: The blob/manifest digest (when applicable)
-/// - `reference`: The manifest tag or digest reference (when applicable)
-/// - `tags`: Tags created by a by-digest manifest push via `?tag=` (when present)
-/// - `session_id`: The upload session id (for upload operations)
-/// - `n`: Maximum number of results for pagination
-/// - `last`: Last result marker for pagination
-/// - `artifact_type`: Filter for referrer queries
-/// - `from`: Source repository of a cross-repo `mount-blob`; absent unless `?from=` is given
-/// - `digest_algorithm`: The `?digest-algorithm=` hint of a `start-upload`; absent unless given
+/// A parsed HTTP request: the operation CEL policies see and the route the
+/// dispatcher follows. Serializes to the flat `request` object of
+/// `doc/reference/cel-expressions.md`; variants sharing a `rename` (HEAD and
+/// GET, say) route differently but look the same to policies.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
@@ -256,7 +224,7 @@ struct ActionData<'a> {
 }
 
 impl Action {
-    /// Returns the action name string as used in CEL policies and webhook headers.
+    /// The CEL action name, also sent as the `X-Registry-Action` webhook header.
     pub fn action_name(&self) -> &'static str {
         match self {
             Action::UiAsset { .. } => "ui-asset",
@@ -400,9 +368,7 @@ impl Action {
         }
     }
 
-    /// Returns `true` if this action writes registry state (uploads or manifest puts).
-    ///
-    /// Used to reject push operations against pull-through cache repositories.
+    /// Whether this action writes registry state (uploads, manifest puts, job mutations).
     pub fn is_push(&self) -> bool {
         self.action_data().is_push
     }

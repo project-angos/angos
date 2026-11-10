@@ -8,7 +8,6 @@ use crate::command::server::listeners::{Connector, HandshakeResult, Listener};
 use crate::configuration::listeners::ListenerBaseConfig;
 use crate::identity::RequestScheme;
 
-/// A non-TLS listener: the shared shell over the pass-through connector.
 pub type InsecureListener = Listener<InsecureConnector>;
 
 pub struct InsecureConnector;
@@ -42,8 +41,6 @@ impl InsecureListener {
         Self::build(config, InsecureConnector, context)
     }
 
-    /// Apply a config reload: refresh the shared-shell timeouts and swap the
-    /// server context; the insecure listener has no scheme-specific state.
     pub fn notify_config_change(&self, config: &ListenerBaseConfig, context: ServerContext) {
         self.store_timeouts(config);
         self.store_context(context);

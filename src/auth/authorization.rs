@@ -5,18 +5,15 @@ use base64::prelude::BASE64_STANDARD;
 use http::HeaderMap;
 use http::header::AUTHORIZATION;
 
-static BEARER_SCHEME: &str = "Bearer";
-static BASIC_SCHEME: &str = "Basic";
-
 /// The token of a `Bearer` authorization header, if one is present.
 pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    authorization_parameter(headers, BEARER_SCHEME).map(str::to_string)
+    authorization_parameter(headers, "Bearer").map(str::to_string)
 }
 
 /// The decoded `(username, password)` of a well-formed `Basic` authorization
 /// header; `None` when the header is absent, malformed, or another scheme.
 pub fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    let value = authorization_parameter(headers, BASIC_SCHEME)?;
+    let value = authorization_parameter(headers, "Basic")?;
     let value = BASE64_STANDARD.decode(value).ok()?;
     let value = String::from_utf8(value).ok()?;
 
@@ -37,99 +34,61 @@ fn authorization_parameter<'a>(headers: &'a HeaderMap, scheme: &str) -> Option<&
 mod tests {
     use super::*;
 
-    fn headers_with_authorization(value: &str) -> HeaderMap {
+    fn headers_with_authorization(value: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, value.parse().unwrap());
+        if let Some(value) = value {
+            headers.insert(AUTHORIZATION, value.parse().unwrap());
+        }
         headers
     }
 
     #[test]
-    fn test_bearer_token_valid() {
-        let headers = headers_with_authorization("Bearer test-token-123");
-        assert_eq!(bearer_token(&headers), Some("test-token-123".to_string()));
+    fn bearer_token_parses_only_a_bearer_header() {
+        for (header, expected) in [
+            (Some("Bearer test-token-123"), Some("test-token-123")),
+            (Some("bearer test-token"), Some("test-token")),
+            (Some("Bearer "), Some("")),
+            (Some("Basic dXNlcjpwYXNz"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                bearer_token(&headers_with_authorization(header)).as_deref(),
+                expected,
+                "{header:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_bearer_token_missing() {
-        assert_eq!(bearer_token(&HeaderMap::new()), None);
-    }
-
-    #[test]
-    fn test_bearer_token_wrong_scheme() {
-        let headers = headers_with_authorization("Basic dXNlcjpwYXNz");
-        assert_eq!(bearer_token(&headers), None);
-    }
-
-    #[test]
-    fn test_bearer_token_scheme_is_case_insensitive() {
-        let headers = headers_with_authorization("bearer test-token");
-        assert_eq!(bearer_token(&headers), Some("test-token".to_string()));
-    }
-
-    #[test]
-    fn test_bearer_token_empty() {
-        let headers = headers_with_authorization("Bearer ");
-        assert_eq!(bearer_token(&headers), Some(String::new()));
-    }
-
-    #[test]
-    fn test_basic_credentials_valid() {
-        let credentials = BASE64_STANDARD.encode("username:password");
-        let headers = headers_with_authorization(&format!("Basic {credentials}"));
-        assert_eq!(
-            basic_credentials(&headers),
-            Some(("username".to_string(), "password".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_credentials_with_colon_in_password() {
-        let credentials = BASE64_STANDARD.encode("user:pass:word");
-        let headers = headers_with_authorization(&format!("Basic {credentials}"));
-        assert_eq!(
-            basic_credentials(&headers),
-            Some(("user".to_string(), "pass:word".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_basic_credentials_missing() {
-        assert_eq!(basic_credentials(&HeaderMap::new()), None);
-    }
-
-    #[test]
-    fn test_basic_credentials_wrong_scheme() {
-        let headers = headers_with_authorization("Bearer test-token");
-        assert_eq!(basic_credentials(&headers), None);
-    }
-
-    #[test]
-    fn test_basic_credentials_invalid_base64() {
-        let headers = headers_with_authorization("Basic not-valid-base64!!!");
-        assert_eq!(basic_credentials(&headers), None);
-    }
-
-    #[test]
-    fn test_basic_credentials_invalid_utf8() {
-        let encoded = BASE64_STANDARD.encode([0xFF, 0xFE, 0xFD]);
-        let headers = headers_with_authorization(&format!("Basic {encoded}"));
-        assert_eq!(basic_credentials(&headers), None);
-    }
-
-    #[test]
-    fn test_basic_credentials_no_colon() {
-        let credentials = BASE64_STANDARD.encode("usernameonly");
-        let headers = headers_with_authorization(&format!("Basic {credentials}"));
-        assert_eq!(basic_credentials(&headers), None);
-    }
-
-    #[test]
-    fn test_basic_credentials_scheme_is_case_insensitive() {
-        let credentials = BASE64_STANDARD.encode("username:password");
-        let headers = headers_with_authorization(&format!("basic {credentials}"));
-        assert_eq!(
-            basic_credentials(&headers),
-            Some(("username".to_string(), "password".to_string()))
-        );
+    fn basic_credentials_parse_only_a_well_formed_basic_header() {
+        let basic = |credentials: &[u8]| format!("Basic {}", BASE64_STANDARD.encode(credentials));
+        for (header, expected) in [
+            (
+                Some(basic(b"username:password")),
+                Some(("username", "password")),
+            ),
+            (Some(basic(b"user:pass:word")), Some(("user", "pass:word"))),
+            (
+                Some(format!(
+                    "basic {}",
+                    BASE64_STANDARD.encode("username:password")
+                )),
+                Some(("username", "password")),
+            ),
+            (Some(basic(b"usernameonly")), None),
+            (Some(basic(&[0xFF, 0xFE, 0xFD])), None),
+            (Some("Basic not-valid-base64!!!".to_string()), None),
+            (Some("Bearer test-token".to_string()), None),
+            (None, None),
+        ] {
+            let credentials = basic_credentials(&headers_with_authorization(header.as_deref()));
+            assert_eq!(
+                credentials
+                    .as_ref()
+                    .map(|(user, password)| (user.as_str(), password.as_str())),
+                expected,
+                "{header:?}"
+            );
+        }
     }
 }

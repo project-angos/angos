@@ -10,7 +10,7 @@ use crate::error::{GateResult, ensure};
 use crate::store::sha256_hex;
 
 /// Every manifest media type the audit accepts, matching what a real client
-/// (and the bash harness before it) negotiates.
+/// negotiates.
 const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json,\
 application/vnd.oci.image.manifest.v1+json,\
 application/vnd.docker.distribution.manifest.v2+json,\
@@ -81,10 +81,13 @@ impl RegistryClient {
         let response = retry_503(|| async move {
             let location = self.upload_location(namespace).await?;
             let separator = if location.contains('?') { '&' } else { '?' };
-            let url = format!(
-                "{}{location}{separator}digest=sha256:{digest_ref}",
-                self.base_for(&location)
-            );
+            // An absolute `Location` is used verbatim, a relative one joins the base.
+            let base = if location.starts_with("http") {
+                ""
+            } else {
+                &self.base
+            };
+            let url = format!("{base}{location}{separator}digest=sha256:{digest_ref}");
             Ok(self
                 .http
                 .put(url)
@@ -148,21 +151,6 @@ impl RegistryClient {
         Ok(response.status())
     }
 
-    /// All repository names, first catalog page (the gates' stores stay well
-    /// under one page).
-    pub async fn catalog(&self) -> GateResult<Vec<String>> {
-        let url = format!("{}/v2/_catalog?n={CATALOG_PAGE}", self.base);
-        let body: Value = self.get_json(&url, "catalog").await?;
-        Ok(string_array(&body["repositories"]))
-    }
-
-    /// All tags of a repository; a repository without tags yields empty.
-    pub async fn tags(&self, repo: &str) -> GateResult<Vec<String>> {
-        let url = format!("{}/v2/{repo}/tags/list?n={CATALOG_PAGE}", self.base);
-        let body: Value = self.get_json(&url, "tags list").await?;
-        Ok(string_array(&body["tags"]))
-    }
-
     /// GET a manifest by tag or digest: its raw bytes plus the
     /// `Docker-Content-Digest` header the server declared for it.
     pub async fn manifest(&self, repo: &str, reference: &str) -> GateResult<(Vec<u8>, String)> {
@@ -183,16 +171,18 @@ impl RegistryClient {
         Ok((body.to_vec(), served))
     }
 
-    /// GET a blob by digest, following redirects, returning status and bytes.
-    pub async fn blob(&self, repo: &str, digest: &str) -> GateResult<(StatusCode, Vec<u8>)> {
+    /// GET a blob by digest, following redirects; anything but `200` fails.
+    pub async fn blob(&self, repo: &str, digest: &str) -> GateResult<Vec<u8>> {
         let response = self
             .http
             .get(format!("{}/v2/{repo}/blobs/{digest}", self.base))
             .send()
             .await?;
         let status = response.status();
-        let body = response.bytes().await?;
-        Ok((status, body.to_vec()))
+        ensure(status == StatusCode::OK, || {
+            format!("blob {repo}@{digest} returned {status}")
+        })?;
+        Ok(response.bytes().await?.to_vec())
     }
 
     /// Re-hash every manifest and blob in the catalog against its declared
@@ -200,18 +190,20 @@ impl RegistryClient {
     /// content.
     pub async fn audit_digests(&self, floor: usize) -> GateResult<()> {
         let mut audited = 0;
-        for repo in self.catalog().await? {
-            for tag in self.tags(&repo).await? {
+        // The gates' stores stay well under one catalog page.
+        let url = format!("{}/v2/_catalog?n={CATALOG_PAGE}", self.base);
+        let catalog = self.get_json(&url, "catalog").await?;
+        for repo in string_array(&catalog["repositories"]) {
+            let url = format!("{}/v2/{repo}/tags/list?n={CATALOG_PAGE}", self.base);
+            let tags = self.get_json(&url, "tags list").await?;
+            for tag in string_array(&tags["tags"]) {
                 let (body, served) = self.manifest(&repo, &tag).await?;
                 let digest = format!("sha256:{}", sha256_hex(&body));
                 ensure(served == digest, || {
                     format!("manifest {repo}:{tag} digest header {served} != body {digest}")
                 })?;
                 for blob_digest in manifest_blob_digests(&body)? {
-                    let (status, bytes) = self.blob(&repo, &blob_digest).await?;
-                    ensure(status == StatusCode::OK, || {
-                        format!("blob {repo}@{blob_digest} returned {status}")
-                    })?;
+                    let bytes = self.blob(&repo, &blob_digest).await?;
                     let actual = format!("sha256:{}", sha256_hex(&bytes));
                     ensure(actual == blob_digest, || {
                         format!("blob {repo}@{blob_digest} content does not match its digest")
@@ -252,20 +244,10 @@ impl RegistryClient {
         })?;
         Ok(response.json().await?)
     }
-
-    /// An absolute `Location` is used verbatim; a path-relative one is
-    /// resolved against the registry base.
-    fn base_for(&self, location: &str) -> &str {
-        if location.starts_with("http") {
-            ""
-        } else {
-            &self.base
-        }
-    }
 }
 
 /// The config and layer digests a manifest declares; an index manifest
-/// (no config/layers) contributes none, exactly like the bash audit.
+/// (no config/layers) contributes none.
 fn manifest_blob_digests(body: &[u8]) -> GateResult<Vec<String>> {
     let parsed: Value = serde_json::from_slice(body)?;
     let mut digests = Vec::new();

@@ -16,14 +16,14 @@ use uuid::Uuid;
 
 use crate::cache_fill::CacheFillJobHandler;
 use crate::command::bootstrap;
-use crate::command::bootstrap::{Error, MaintenanceContext};
+use crate::command::bootstrap::{Error, StoreContext};
 use crate::configuration::Configuration;
 use crate::configuration::listeners::ServerTlsConfig;
 use crate::configuration::watcher::ConfigNotifier;
 use crate::jobs::Queue;
 use crate::jobs::runner::execute_one;
 use crate::jobs::store::{
-    ClaimMode, Error as JobStoreError, JobHandler, JobRetryPolicy, JobStore, ensure_claim_support,
+    ClaimMode, Error as JobStoreError, JobHandler, JobQueueConfig, JobStore, ensure_claim_support,
 };
 use crate::layer::IndexLimits;
 use crate::layer::handler::IndexLayerJobHandler;
@@ -83,8 +83,7 @@ fn queue_concurrency(config: &Configuration, queue: Queue) -> NonZeroUsize {
 }
 
 /// Parses and de-duplicates `--queue` values preserving command-line order,
-/// defaulting to every queue the configuration can drain and rejecting an
-/// unknown name or a scan queue with no scanner service configured.
+/// defaulting to every queue the configuration can drain.
 fn resolve_queues(requested: &[String], scan_configured: bool) -> Result<Vec<Queue>, Error> {
     if requested.is_empty() {
         let mut queues = vec![Queue::Cache, Queue::Replication, Queue::Index];
@@ -99,11 +98,6 @@ fn resolve_queues(requested: &[String], scan_configured: bool) -> Result<Vec<Que
         let queue: Queue = name
             .parse()
             .map_err(|e| Error::JobQueue(JobStoreError::Initialization(e)))?;
-        if queue == Queue::Scan && !scan_configured {
-            return Err(Error::JobQueue(JobStoreError::Initialization(
-                "[global.scan] is required to drain the scan queue".to_string(),
-            )));
-        }
         if seen.insert(queue) {
             queues.push(queue);
         }
@@ -240,7 +234,7 @@ struct WorkerContext {
     metadata_store: Arc<MetadataStore>,
     repositories: Arc<RepositoryResolver>,
     registry: Arc<Registry>,
-    retry_policy: JobRetryPolicy,
+    job_queue: JobQueueConfig,
     claim_mode: ClaimMode,
     scan: Option<ScanConfig>,
     index_limits: IndexLimits,
@@ -248,7 +242,7 @@ struct WorkerContext {
 
 impl WorkerContext {
     async fn build(config: &Configuration) -> Result<Self, Error> {
-        let MaintenanceContext {
+        let StoreContext {
             blob_store,
             metadata_store,
             repositories,
@@ -259,7 +253,6 @@ impl WorkerContext {
                 "[global.job_queue] is required for the worker subcommand".to_string(),
             )));
         };
-        let retry_policy = job_queue.retry_policy();
 
         let claim_mode = ensure_claim_support(&metadata_store).await?;
         let registry = bootstrap::registry(
@@ -271,7 +264,7 @@ impl WorkerContext {
                 &metadata_store,
                 "worker",
                 claim_mode,
-                retry_policy,
+                job_queue,
             )),
         )?;
 
@@ -280,7 +273,7 @@ impl WorkerContext {
             metadata_store,
             repositories,
             registry,
-            retry_policy,
+            job_queue: job_queue.clone(),
             claim_mode,
             scan: config.global.scan.clone(),
             index_limits: config.global.index_limits(),
@@ -294,7 +287,7 @@ impl WorkerContext {
             &self.metadata_store,
             &Uuid::new_v4().to_string(),
             self.claim_mode,
-            self.retry_policy,
+            &self.job_queue,
         ));
         let handler: Arc<dyn JobHandler> = match queue {
             Queue::Replication => Arc::new(ReplicationJobHandler::new(
@@ -314,15 +307,12 @@ impl WorkerContext {
                         "[global.scan] is required to drain the scan queue".to_string(),
                     ))
                 })?;
-                Arc::new(
-                    ScanJobHandler::new(
-                        self.registry.clone(),
-                        self.blob_store.clone(),
-                        self.metadata_store.clone(),
-                        scan,
-                    )
-                    .map_err(Error::JobQueue)?,
-                )
+                Arc::new(ScanJobHandler::new(
+                    self.registry.clone(),
+                    self.blob_store.clone(),
+                    self.metadata_store.clone(),
+                    scan,
+                )?)
             }
             Queue::Index => Arc::new(IndexLayerJobHandler::new(
                 self.blob_store.clone(),
@@ -353,7 +343,7 @@ mod tests {
     use crate::cache_fill::CACHE_FETCH_BLOB_KIND;
     use crate::configuration::global::GlobalConfig;
     use crate::jobs::Queue;
-    use crate::jobs::store::{ClaimMode, JobEnvelope, JobRetryPolicy, JobStore};
+    use crate::jobs::store::{ClaimMode, JobEnvelope, JobQueueConfig, JobStore};
     use crate::metrics_provider;
     use crate::registry::blob_store::BlobStore;
     use crate::registry::metadata_store::{MetadataStore, Settings};
@@ -362,10 +352,14 @@ mod tests {
     use crate::replication::REPLICATION_PUSH_MANIFEST_KIND;
 
     #[test]
-    fn resolve_queues_defaults_to_cache_replication_and_index() {
+    fn resolve_queues_defaults_to_scan_only_when_a_scanner_is_configured() {
         assert_eq!(
             resolve_queues(&[], false).unwrap(),
             vec![Queue::Cache, Queue::Replication, Queue::Index]
+        );
+        assert_eq!(
+            resolve_queues(&[], true).unwrap(),
+            vec![Queue::Cache, Queue::Replication, Queue::Index, Queue::Scan]
         );
     }
 
@@ -387,18 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_queues_drains_scan_only_when_a_scanner_is_configured() {
-        assert_eq!(
-            resolve_queues(&[], true).unwrap(),
-            vec![Queue::Cache, Queue::Replication, Queue::Index, Queue::Scan]
-        );
-        let Err(err) = resolve_queues(&["scan".to_string()], false) else {
-            panic!("an explicit scan queue needs a scanner service");
-        };
-        assert!(err.to_string().contains("[global.scan]"), "{err}");
-    }
-
-    #[test]
     fn resolve_queues_rejects_unknown_queue() {
         let Err(err) = resolve_queues(&["some-other-queue".to_string()], false) else {
             panic!("an unknown queue must be rejected");
@@ -414,9 +396,9 @@ mod tests {
     fn worker_context() -> (WorkerContext, TempDir) {
         metrics_provider::initialize_metrics();
         let dir = TempDir::new().unwrap();
-        let storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(dir.path(), false));
         let metadata_store = Arc::new(MetadataStore::new(storage.clone(), Settings::default()));
-        let blob_store = Arc::new(BlobStore::new(storage.clone(), None));
+        let blob_store = Arc::new(BlobStore::new(storage, None));
         let repositories = Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap());
 
         let registry = Registry::new(
@@ -430,7 +412,7 @@ mod tests {
             ))),
         );
         let context = WorkerContext {
-            retry_policy: JobRetryPolicy::default(),
+            job_queue: JobQueueConfig::default(),
             claim_mode: ClaimMode::Atomic,
             blob_store,
             metadata_store,
@@ -445,47 +427,39 @@ mod tests {
     /// The handler is an opaque `Arc<dyn JobHandler>`, so the binding is
     /// asserted via each handler rejecting a foreign job kind.
     #[tokio::test]
-    async fn components_for_binds_replication_queue_to_replication_handler() {
+    async fn components_for_binds_each_queue_to_its_handler() {
         let (context, _dir) = worker_context();
 
-        let cache_envelope = JobEnvelope::new(
-            Queue::Cache,
-            CACHE_FETCH_BLOB_KIND,
-            "lock",
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        let replication_handler = context.components_for(Queue::Replication).unwrap().handler;
-        let err = replication_handler
-            .execute(&cache_envelope)
-            .await
-            .expect_err("replication handler must reject a cache job kind");
-        assert!(
-            err.to_string().contains("unsupported job kind"),
-            "replication queue bound to the wrong handler: {err}"
-        );
+        for (queue, foreign_queue, foreign_kind) in [
+            (Queue::Replication, Queue::Cache, CACHE_FETCH_BLOB_KIND),
+            (
+                Queue::Cache,
+                Queue::Replication,
+                REPLICATION_PUSH_MANIFEST_KIND,
+            ),
+        ] {
+            let envelope =
+                JobEnvelope::new(foreign_queue, foreign_kind, "lock", &serde_json::json!({}))
+                    .unwrap();
+            let handler = context.components_for(queue).unwrap().handler;
+            let err = handler
+                .execute(&envelope)
+                .await
+                .expect_err("a handler must reject a foreign job kind");
+            assert!(
+                err.to_string().contains("unsupported job kind"),
+                "{queue} queue bound to the wrong handler: {err}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn components_for_binds_cache_queue_to_cache_handler() {
+    async fn the_scan_queue_needs_a_scanner_service() {
         let (context, _dir) = worker_context();
-
-        let replication_envelope = JobEnvelope::new(
-            Queue::Replication,
-            REPLICATION_PUSH_MANIFEST_KIND,
-            "lock",
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        let cache_handler = context.components_for(Queue::Cache).unwrap().handler;
-        let err = cache_handler
-            .execute(&replication_envelope)
-            .await
-            .expect_err("cache handler must reject a replication job kind");
-        assert!(
-            err.to_string().contains("unsupported job kind"),
-            "cache queue bound to the wrong handler: {err}"
-        );
+        let Err(err) = context.components_for(Queue::Scan) else {
+            panic!("draining the scan queue needs a scanner service");
+        };
+        assert!(err.to_string().contains("[global.scan]"), "{err}");
     }
 
     #[tokio::test]

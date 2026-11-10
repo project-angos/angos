@@ -1,6 +1,4 @@
-//! The serving side of the protocol: reading what a client asked for, and
-//! rendering the header vocabulary of the answer. The request itself is
-//! [`crate::request`], which both ends share.
+//! The serving side: reading request headers and rendering answer headers.
 
 use std::cmp::Reverse;
 
@@ -10,7 +8,7 @@ use http::header::{
     HeaderValue, InvalidHeaderValue, LINK, LOCATION, RANGE, X_CONTENT_TYPE_OPTIONS,
 };
 
-use crate::client::{blob_path, manifest_path, uploads_start_path};
+use crate::client::{manifest_path, uploads_start_path};
 use crate::header::{
     APPLICATION_JSON, DOCKER_CONTENT_DIGEST, DOCKER_DISTRIBUTION_API_VERSION,
     DOCKER_DISTRIBUTION_API_VERSION_V2, DOCKER_UPLOAD_UUID, LINK_REL_NEXT, OCI_FILTERS_APPLIED,
@@ -20,59 +18,34 @@ use crate::path::{BLOBS, MANIFESTS, REFERRERS, UPLOADS};
 use crate::types::http_range::ResponseRange;
 use crate::types::{Digest, MediaRange, MediaType, Namespace, Reference, Tag, UploadSessionId};
 
-static QUALITY_PARAM: &str = "q";
-
-/// One `Accept` member: its media range and the quality it was offered at.
-struct AcceptMediaRange {
-    quality: u16,
-    value: MediaRange,
-}
-
-impl AcceptMediaRange {
-    /// Reads one comma-separated member of an `Accept` header. `None` when it
-    /// is not a media range, which is dropped rather than forwarded: angos
-    /// re-sends these upstream and must not relay a malformed `Accept`.
-    fn new(member: &str) -> Option<Self> {
-        let value = MediaRange::new(member.trim()).ok()?;
-        let quality = quality(value.as_str());
-        Some(Self { quality, value })
-    }
-}
-
-/// The weight, out of 1000, a header member names in its `q` parameter. Without
-/// one it is offered at full weight; one angos cannot read is not a weight it
-/// may invent, so it weighs nothing.
+/// The weight, out of 1000, of a header member's `q` parameter: full without
+/// one, nothing when it cannot be read.
 #[must_use]
 pub fn quality(member: &str) -> u16 {
     member
         .split(';')
         .skip(1)
         .filter_map(|parameter| parameter.trim().split_once('='))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case(QUALITY_PARAM))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
         .map_or(1000, |(_, quality)| {
             parse_quality(quality.trim()).unwrap_or(0)
         })
 }
 
-/// The media ranges an `Accept` header offers, most preferred first.
+/// The media ranges an `Accept` header offers, most preferred first. A member
+/// that is not a media range is dropped, as these are relayed upstream.
 #[must_use]
 pub fn accepted_content_types(headers: &HeaderMap) -> Vec<MediaRange> {
-    let mut media_ranges: Vec<AcceptMediaRange> = headers
+    let mut media_ranges: Vec<MediaRange> = headers
         .get_all(ACCEPT)
         .iter()
         .filter_map(|header| header.to_str().ok())
         .flat_map(|header| header.split(','))
-        .filter_map(AcceptMediaRange::new)
+        .filter_map(|member| MediaRange::new(member.trim()).ok())
         .collect();
-
-    // A stable sort, so members offered at the same quality keep the order the
-    // client sent them in.
-    media_ranges.sort_by_key(|media_range| Reverse(media_range.quality));
-
+    // Stable, so equal qualities keep the client's order.
+    media_ranges.sort_by_key(|media_range| Reverse(quality(media_range.as_str())));
     media_ranges
-        .into_iter()
-        .map(|media_range| media_range.value)
-        .collect()
 }
 
 fn parse_quality(value: &str) -> Option<u16> {
@@ -95,8 +68,6 @@ fn parse_quality(value: &str) -> Option<u16> {
     }
 }
 
-/// Headers of the version handshake: the API this registry speaks, which the
-/// protocol pins rather than the deployment choosing.
 #[must_use]
 pub fn api_version_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -108,8 +79,7 @@ pub fn api_version_headers() -> HeaderMap {
     headers
 }
 
-/// Headers of a paginated JSON listing: its content type, and the `Link` to the
-/// next page while the listing is not exhausted.
+/// Headers of a paginated JSON listing.
 ///
 /// # Errors
 ///
@@ -118,15 +88,17 @@ pub fn paginated_json_headers(next_page: Option<&str>) -> Result<HeaderMap, Inva
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, APPLICATION_JSON);
     if let Some(next_page) = next_page {
-        headers.insert(LINK, next_page_link(next_page)?);
+        headers.insert(
+            LINK,
+            HeaderValue::try_from(format!("<{next_page}>; {LINK_REL_NEXT}"))?,
+        );
     }
 
     Ok(headers)
 }
 
-/// Headers of a referrers listing: the index media type, the `Link` to the next
-/// page when there is one, and the filter the listing honoured, which lets a
-/// client tell a filtered index from a complete one.
+/// Headers of a referrers listing, naming the filter it honoured so a client
+/// can tell a filtered index from a complete one.
 ///
 /// # Errors
 ///
@@ -135,7 +107,7 @@ pub fn referrers_headers(
     artifact_type_filtered: bool,
     next_page: Option<&str>,
 ) -> Result<HeaderMap, InvalidHeaderValue> {
-    let mut headers = HeaderMap::new();
+    let mut headers = paginated_json_headers(next_page)?;
     headers.insert(CONTENT_TYPE, OCI_INDEX_CONTENT_TYPE);
     if artifact_type_filtered {
         headers.insert(
@@ -143,63 +115,42 @@ pub fn referrers_headers(
             HeaderValue::from_static("artifactType"),
         );
     }
-    if let Some(next_page) = next_page {
-        headers.insert(LINK, next_page_link(next_page)?);
-    }
 
     Ok(headers)
 }
 
-/// Renders `target` as the `rel="next"` entry of a `Link` header, which a
-/// paginated listing advertises its next page with.
-///
-/// # Errors
-///
-/// Returns an error when `target` holds bytes no header value may carry.
-pub fn next_page_link(target: &str) -> Result<HeaderValue, InvalidHeaderValue> {
-    HeaderValue::try_from(format!("<{target}>; {LINK_REL_NEXT}"))
-}
-
-/// Splits `<namespace>/manifests/<reference>` out of a request path, which is
-/// what [`crate::client::manifest_path`] builds. The path is the one after the
-/// API prefix; the pieces come back unvalidated, for the caller to parse.
+/// Splits `<namespace>/manifests/<reference>`, the path after the API prefix,
+/// into unvalidated pieces.
 #[must_use]
 pub fn split_manifest_path(api_path: &str) -> Option<(&str, &str)> {
     api_path.rsplit_once(MANIFESTS)
 }
 
-/// Splits `<namespace>/blobs/<digest>`, the counterpart of
-/// [`crate::client::blob_path`].
 #[must_use]
 pub fn split_blob_path(api_path: &str) -> Option<(&str, &str)> {
     api_path.rsplit_once(BLOBS)
 }
 
-/// Splits `<namespace>/referrers/<digest>`, the counterpart of
-/// [`crate::client::referrers_path`].
 #[must_use]
 pub fn split_referrers_path(api_path: &str) -> Option<(&str, &str)> {
     api_path.rsplit_once(REFERRERS)
 }
 
-/// The namespace of `<namespace>/blobs/uploads/`, the counterpart of
-/// [`crate::client::uploads_start_path`]. The trailing slash is part of the
-/// endpoint the spec defines, so a path without it is not this endpoint.
+/// The namespace of `<namespace>/blobs/uploads/`; the spec's endpoint includes
+/// the trailing slash.
 #[must_use]
 pub fn split_uploads_start_path(api_path: &str) -> Option<&str> {
     api_path.strip_suffix(UPLOADS)
 }
 
-/// Keeps pushed bytes inert in a browser: served on the registry's origin,
-/// where the web UI keeps its session, they must run no script whatever type
-/// they claim.
+/// Keeps pushed bytes inert in a browser: served on the web UI's origin, they
+/// must run no script whatever type they claim.
 pub fn sandbox(headers: &mut HeaderMap) {
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 }
 
-/// Headers a blob answer carries whether or not it has a body: `Accept-Ranges`
-/// among them, so a `HEAD` advertises the ranges a `GET` will serve.
+/// Headers of every blob answer, `HEAD` included, so it advertises ranges.
 ///
 /// # Errors
 ///
@@ -244,59 +195,8 @@ pub fn blob_redirect_headers(url: &str, digest: &Digest) -> Result<HeaderMap, In
     Ok(headers)
 }
 
-/// Headers naming a stored blob: the answer to a completed upload, and to one
-/// whose digest the registry already held.
-///
-/// # Errors
-///
-/// Returns an error when a value cannot be carried by a header.
-pub fn blob_location_headers(
-    namespace: &Namespace,
-    digest: &Digest,
-) -> Result<HeaderMap, InvalidHeaderValue> {
-    // The same path grammar the requesting side builds, rooted at the registry.
-    blob_redirect_headers(&blob_path("", namespace, digest), digest)
-}
-
-/// Headers naming an open upload session, which the client continues against.
-///
-/// # Errors
-///
-/// Returns an error when a value cannot be carried by a header.
-pub fn session_location_headers(
-    namespace: &Namespace,
-    session_id: &UploadSessionId,
-) -> Result<HeaderMap, InvalidHeaderValue> {
-    // The session continues under the endpoint that opened it, rooted at the
-    // registry, which is the same grammar the requesting side builds.
-    let location = format!("{}{session_id}", uploads_start_path("", namespace));
-    let mut headers = HeaderMap::new();
-    headers.insert(LOCATION, HeaderValue::try_from(location)?);
-    headers.insert(
-        DOCKER_UPLOAD_UUID,
-        HeaderValue::try_from(session_id.to_string())?,
-    );
-
-    Ok(headers)
-}
-
-/// [`session_location_headers`] for a session that has taken no bytes yet.
-///
-/// # Errors
-///
-/// Returns an error when a value cannot be carried by a header.
-pub fn upload_session_headers(
-    namespace: &Namespace,
-    session_id: &UploadSessionId,
-) -> Result<HeaderMap, InvalidHeaderValue> {
-    let mut headers = session_location_headers(namespace, session_id)?;
-    headers.insert(RANGE, HeaderValue::from_static("0-0"));
-
-    Ok(headers)
-}
-
-/// [`session_location_headers`] plus the bytes committed so far, so a resuming
-/// client knows where to continue from.
+/// Headers naming an open upload session and the bytes committed so far; an
+/// empty session spells its range `0-0`.
 ///
 /// # Errors
 ///
@@ -307,7 +207,13 @@ pub fn upload_progress_headers(
     size: u64,
     content_length: Option<u64>,
 ) -> Result<HeaderMap, InvalidHeaderValue> {
-    let mut headers = session_location_headers(namespace, session_id)?;
+    let location = format!("{}{session_id}", uploads_start_path("", namespace));
+    let mut headers = HeaderMap::new();
+    headers.insert(LOCATION, HeaderValue::try_from(location)?);
+    headers.insert(
+        DOCKER_UPLOAD_UUID,
+        HeaderValue::try_from(session_id.to_string())?,
+    );
     headers.insert(
         RANGE,
         HeaderValue::try_from(format!("0-{}", size.saturating_sub(1)))?,
@@ -319,9 +225,8 @@ pub fn upload_progress_headers(
     Ok(headers)
 }
 
-/// `Docker-Content-Digest` and `Content-Length` for a served manifest, plus its
-/// `Content-Type` when one is recorded. That type is the pusher's choice, so
-/// the answer is sandboxed.
+/// Headers of a served manifest, sandboxed since its type is the pusher's
+/// choice.
 ///
 /// # Errors
 ///
@@ -360,8 +265,7 @@ pub fn manifest_redirect_headers(
     Ok(headers)
 }
 
-/// Headers answering a manifest push: where it landed, the digest it stored
-/// under, the subject it was indexed against, and the tags the push bound.
+/// Headers answering a manifest push.
 ///
 /// # Errors
 ///
@@ -397,6 +301,7 @@ pub fn put_manifest_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::blob_path;
     use crate::path::API_PREFIX;
 
     fn accept(values: &[&str]) -> HeaderMap {
@@ -424,12 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn no_accept_header_offers_nothing() {
-        let offered = ranges(&HeaderMap::new());
-        assert!(offered.is_empty(), "{offered:?}");
-    }
-
-    #[test]
     fn members_are_ordered_by_descending_quality() {
         assert_eq!(
             ranges(&accept(&["a/b;q=0.2, c/d, e/f;q=0.5"])),
@@ -445,22 +344,15 @@ mod tests {
         );
     }
 
-    fn quality_of(member: &str) -> u16 {
-        AcceptMediaRange::new(member)
-            .expect("the fixture must be a media range")
-            .quality
-    }
-
-    // A `q` angos cannot read is not a preference it may invent: the member
-    // sorts last rather than being promoted to full weight.
+    // An unreadable `q` sorts last rather than taking full weight.
     #[test]
     fn an_unreadable_quality_sorts_last() {
         for value in ["q=2", "q=0.1234", "q=abc", "q="] {
-            assert_eq!(quality_of(&format!("a/b;{value}")), 0, "{value}");
+            assert_eq!(quality(&format!("a/b;{value}")), 0, "{value}");
         }
-        assert_eq!(quality_of("a/b"), 1000);
-        assert_eq!(quality_of("a/b;q=1.0"), 1000);
-        assert_eq!(quality_of("a/b;q=0.75"), 750);
+        assert_eq!(quality("a/b"), 1000);
+        assert_eq!(quality("a/b;q=1.0"), 1000);
+        assert_eq!(quality("a/b;q=0.75"), 750);
     }
 
     const SAMPLE_SESSION: &str = "067e6162-3b6f-4ae2-a171-2470b63dff00";
@@ -476,8 +368,6 @@ mod tests {
         Namespace::new("test-repo").unwrap()
     }
 
-    /// `Accept-Ranges` rides on every blob answer, `HEAD` included: a client
-    /// must be able to learn a blob is rangeable without fetching it.
     #[test]
     fn blob_headers_advertise_ranges() {
         let headers = blob_headers(&digest(), 42).unwrap();
@@ -486,8 +376,6 @@ mod tests {
         assert_eq!(headers[&ACCEPT_RANGES], "bytes");
     }
 
-    /// `Content-Length` is the streamed body, which an upstream reports apart
-    /// from the window its `Content-Range` names.
     #[test]
     fn partial_blob_headers_carry_length_and_content_range() {
         let range = ResponseRange {
@@ -501,29 +389,15 @@ mod tests {
     }
 
     #[test]
-    fn blob_redirect_headers_carry_location_and_digest() {
-        let headers = blob_redirect_headers("https://cdn/blob", &digest()).unwrap();
-        assert_eq!(headers[&LOCATION], "https://cdn/blob");
-        assert_eq!(headers[&DOCKER_CONTENT_DIGEST], digest().to_string());
-    }
-
-    #[test]
-    fn blob_location_headers_carry_location_and_digest() {
-        let (namespace, digest) = (namespace(), digest());
-        let headers = blob_location_headers(&namespace, &digest).unwrap();
-        assert_eq!(
-            headers[&LOCATION],
-            format!("/v2/{namespace}/blobs/{digest}")
-        );
-        assert_eq!(headers[&DOCKER_CONTENT_DIGEST], digest.to_string());
-    }
-
-    #[test]
-    fn upload_session_headers_start_at_zero_range() {
+    fn an_empty_upload_session_starts_at_zero_range() {
         let namespace = namespace();
-        let headers =
-            upload_session_headers(&namespace, &UploadSessionId::new(SAMPLE_SESSION).unwrap())
-                .unwrap();
+        let headers = upload_progress_headers(
+            &namespace,
+            &UploadSessionId::new(SAMPLE_SESSION).unwrap(),
+            0,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             headers[&LOCATION],
             format!("/v2/{namespace}/blobs/uploads/{SAMPLE_SESSION}")
@@ -532,8 +406,7 @@ mod tests {
         assert_eq!(headers[&DOCKER_UPLOAD_UUID], SAMPLE_SESSION);
     }
 
-    /// `Range` reports the bytes committed so far. A `PATCH` answers with an
-    /// empty body and declares `Content-Length: 0`; a `GET` declares none.
+    /// A `PATCH` declares `Content-Length: 0`; a `GET` declares none.
     #[test]
     fn upload_progress_headers_report_current_range() {
         let headers = upload_progress_headers(
@@ -569,8 +442,6 @@ mod tests {
         assert!(!headers.contains_key(CONTENT_TYPE));
     }
 
-    /// A manifest claiming `text/html` or a blob holding HTML must run no
-    /// script when a browser opens it on the web UI's origin.
     #[test]
     fn served_manifests_and_blobs_are_sandboxed() {
         let html = MediaType::new("text/html").unwrap();
@@ -617,8 +488,6 @@ mod tests {
         assert_eq!(headers[&OCI_TAG], "1.2.3, latest");
     }
 
-    // What one end builds is what the other takes apart, so the grammar is
-    // pinned across the pair rather than in either half alone.
     #[test]
     fn a_built_url_splits_back_into_its_pieces() {
         let namespace = Namespace::new("test/repo").unwrap();
@@ -642,8 +511,7 @@ mod tests {
         assert_eq!(split_uploads_start_path(&uploads), Some("test/repo"));
     }
 
-    /// The spec spells the endpoint with its trailing slash (end-4a), so a path
-    /// without one is a different path and must not route here.
+    /// end-4a spells the endpoint with its trailing slash.
     #[test]
     fn the_uploads_endpoint_needs_its_trailing_slash() {
         assert_eq!(

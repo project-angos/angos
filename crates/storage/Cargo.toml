@@ -15,7 +15,6 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
-serde = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
@@ -23,12 +22,8 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Self-reference so the crate's own tests and doctests see the
-# feature-gated test-util surface.
-angos-storage = { workspace = true, features = ["test-util"] }
 angos-s3-client = { workspace = true, features = ["test-util"] }
 bytesize = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
 uuid = { workspace = true }
 wiremock = { workspace = true }

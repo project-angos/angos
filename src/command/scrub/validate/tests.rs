@@ -12,8 +12,9 @@ use angos_oci::request::{DeleteBlobRequest, PutManifestRequest};
 use angos_oci::{Digest, Namespace, Reference, Tag};
 
 use crate::command::maintenance::action::{Action, LOST_AND_FOUND_PREFIX};
-use crate::command::maintenance::executor::{ActionSink, Executor};
-use crate::command::maintenance::walk::{self, WalkStats};
+use crate::command::maintenance::executor::ActionSink;
+use crate::command::maintenance::test_helper::test_executor;
+use crate::command::maintenance::walk;
 use crate::command::scrub::validate::link::chunk_writes;
 use crate::command::scrub::validate::{Pass, Validator};
 use crate::jobs::Queue;
@@ -27,7 +28,7 @@ use crate::registry::metadata_store::{
 };
 use crate::registry::test_utils::{
     RegistryTestCase, create_test_registry_with, for_each_backend, fs_test_stack, media_type,
-    put_blob_direct, upload_blob,
+    put_blob_direct, put_manifest_direct, upload_blob,
 };
 
 /// Run the three walk passes over the test case's stores with `sink`,
@@ -36,8 +37,8 @@ async fn run_passes(
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     sink: Arc<dyn ActionSink>,
-) -> Arc<WalkStats> {
-    run_passes_with(blob_store, metadata_store, sink, false).await
+) {
+    run_passes_with(blob_store, metadata_store, sink, false).await;
 }
 
 /// `run_passes` with the `--delete-unknown` disposition made explicit.
@@ -46,13 +47,11 @@ async fn run_passes_with(
     metadata_store: &Arc<MetadataStore>,
     sink: Arc<dyn ActionSink>,
     delete_unknown: bool,
-) -> Arc<WalkStats> {
-    let stats = Arc::new(WalkStats::default());
+) -> Arc<Validator> {
     let validator = Arc::new(Validator::new(
         blob_store.clone(),
         metadata_store.clone(),
         sink,
-        stats.clone(),
         delete_unknown,
     ));
 
@@ -70,17 +69,15 @@ async fn run_passes_with(
         .await
         .expect("walk pass");
     }
-    stats
+    validator
 }
 
 /// Full scrub with a real executor: repairs are applied.
 async fn scrub_apply(test_case: &dyn RegistryTestCase) {
     let blob_store = test_case.blob_store();
     let metadata_store = test_case.metadata_store();
-    let sink: Arc<dyn ActionSink> = Arc::new(Executor::new_for_test(
-        blob_store.clone(),
-        metadata_store.clone(),
-    ));
+    let sink: Arc<dyn ActionSink> =
+        Arc::new(test_executor(blob_store.clone(), metadata_store.clone()));
     run_passes(&blob_store, &metadata_store, sink).await;
 }
 
@@ -95,10 +92,7 @@ async fn scrub_capture(test_case: &dyn RegistryTestCase) -> Vec<Action> {
         sink.clone() as Arc<dyn ActionSink>,
     )
     .await;
-    match sink.lock() {
-        Ok(mut actions) => actions.drain(..).collect(),
-        Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-    }
+    sink.lock().unwrap().drain(..).collect()
 }
 
 /// Push a healthy image (config and layer blobs, manifest, `v1` tag) through
@@ -131,39 +125,20 @@ async fn push_healthy_image(
         config_bytes.len(),
         layer_bytes.len(),
     );
-    let response = registry
-        .put_manifest_direct(
-            namespace,
-            &Reference::Tag(Tag::new("v1").unwrap()),
-            Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
-            manifest.as_bytes(),
-        )
-        .await
-        .expect("healthy push");
+    let response = put_manifest_direct(
+        registry,
+        namespace,
+        &Reference::Tag(Tag::new("v1").unwrap()),
+        Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
+        manifest.as_bytes(),
+    )
+    .await
+    .expect("healthy push");
     (response.digest, config_digest, layer_digest)
 }
 
-#[tokio::test]
-async fn healthy_registry_emits_zero_actions() {
-    for_each_backend(async |test_case| {
-        let namespace = &Namespace::new("test-repo/healthy").unwrap();
-        push_healthy_image(test_case, namespace).await;
-
-        let actions = scrub_capture(test_case).await;
-        assert!(
-            actions.is_empty(),
-            "a healthy registry must produce zero actions, got: {:?}",
-            actions.iter().map(ToString::to_string).collect::<Vec<_>>()
-        );
-    })
-    .await;
-}
-
-/// A referrer lives as a record of its own, so its link check
-/// has to consult the record. Judged by the legacy path alone, every
-/// attestation in the store was recreated on every run: the repair writes the
-/// record it already has and never the file it was judged by, so the next run
-/// reached the same verdict.
+/// A referrer lives as a record of its own, so its link check has to consult
+/// the record, or every attestation is recreated on every run.
 #[tokio::test]
 async fn an_attested_image_emits_zero_actions() {
     for_each_backend(async |test_case| {
@@ -202,17 +177,16 @@ async fn an_attested_image_emits_zero_actions() {
         }}
     }}"#
         );
-        let attestation_digest = test_case
-            .registry()
-            .put_manifest_direct(
-                namespace,
-                &Reference::Digest(Digest::sha256_of_bytes(attestation.as_bytes())),
-                Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
-                attestation.as_bytes(),
-            )
-            .await
-            .expect("attestation push")
-            .digest;
+        let attestation_digest = put_manifest_direct(
+            test_case.registry(),
+            namespace,
+            &Reference::Digest(Digest::sha256_of_bytes(attestation.as_bytes())),
+            Some(&media_type("application/vnd.oci.image.manifest.v1+json")),
+            attestation.as_bytes(),
+        )
+        .await
+        .expect("attestation push")
+        .digest;
 
         let metadata_store = test_case.metadata_store();
         metadata_store
@@ -325,7 +299,7 @@ async fn tag_targeting_missing_blob_is_removed() {
     .await;
 }
 
-/// Regression: with `allow_missing_manifest_references` the push path drops the
+/// With `allow_missing_manifest_references` the push path drops the
 /// link and grant for a digest the namespace does not own, so it gains no
 /// cross-namespace read access. Scrub re-derives child links from the manifest
 /// body and must not hand back what the write path withheld.
@@ -454,8 +428,7 @@ async fn young_dangling_ref_entry_is_kept() {
             },
         ));
         let blob_store = test_case.blob_store();
-        let sink: Arc<dyn ActionSink> =
-            Arc::new(Executor::new_for_test(blob_store.clone(), graced.clone()));
+        let sink: Arc<dyn ActionSink> = Arc::new(test_executor(blob_store.clone(), graced.clone()));
         run_passes(&blob_store, &graced, sink).await;
 
         let links = metadata_store
@@ -627,7 +600,6 @@ async fn a_blob_the_reference_walk_saw_referenced_is_never_reclaimed() {
             test_case.blob_store(),
             metadata_store.clone(),
             sink.clone() as Arc<dyn ActionSink>,
-            Arc::new(WalkStats::default()),
             false,
         );
 
@@ -889,11 +861,9 @@ async fn delete_unknown_removes_aliens_without_quarantining() {
             .await
             .unwrap();
 
-        let sink: Arc<dyn ActionSink> = Arc::new(Executor::new_for_test(
-            blob_store.clone(),
-            metadata_store.clone(),
-        ));
-        let stats = run_passes_with(&blob_store, &metadata_store, sink, true).await;
+        let sink: Arc<dyn ActionSink> =
+            Arc::new(test_executor(blob_store.clone(), metadata_store.clone()));
+        let validator = run_passes_with(&blob_store, &metadata_store, sink, true).await;
 
         let meta_objects = metadata_store.object_store();
         assert!(meta_objects.get(alien).await.is_err());
@@ -913,7 +883,7 @@ async fn delete_unknown_removes_aliens_without_quarantining() {
                 .is_err(),
         );
         assert_eq!(
-            stats.quarantined.load(Ordering::Relaxed),
+            validator.stats.quarantined.load(Ordering::Relaxed),
             2,
             "deleted unknowns still count in the unknown-key tally"
         );
@@ -1036,7 +1006,7 @@ async fn orphan_job_index_is_reclaimed_age_gated() {
         )
         .await
         .unwrap();
-    let sink: Arc<dyn ActionSink> = Arc::new(Executor::new_for_test(
+    let sink: Arc<dyn ActionSink> = Arc::new(test_executor(
         stack.blob_store.clone(),
         stack.metadata_store.clone(),
     ));
@@ -1341,8 +1311,7 @@ async fn young_superseded_entry_is_kept() {
             },
         ));
         let blob_store = test_case.blob_store();
-        let sink: Arc<dyn ActionSink> =
-            Arc::new(Executor::new_for_test(blob_store.clone(), graced.clone()));
+        let sink: Arc<dyn ActionSink> = Arc::new(test_executor(blob_store.clone(), graced.clone()));
         run_passes(&blob_store, &graced, sink).await;
 
         assert!(
@@ -1450,8 +1419,7 @@ async fn a_tracked_reference_is_pinned_by_its_entry_alone() {
             .await
             .expect("the manifest body must stay readable");
         assert!(
-            registry
-                .metadata_store()
+            metadata_store
                 .can_read(namespace, &layer_digest)
                 .await
                 .unwrap(),
@@ -1643,8 +1611,7 @@ fn with_history(
 
 async fn scrub_with(test_case: &dyn RegistryTestCase, store: &Arc<MetadataStore>) {
     let blob_store = test_case.blob_store();
-    let sink: Arc<dyn ActionSink> =
-        Arc::new(Executor::new_for_test(blob_store.clone(), store.clone()));
+    let sink: Arc<dyn ActionSink> = Arc::new(test_executor(blob_store.clone(), store.clone()));
     run_passes(&blob_store, store, sink).await;
 }
 

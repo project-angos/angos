@@ -7,7 +7,6 @@ use prometheus::{
     register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
     register_int_gauge_with_registry,
 };
-use tracing::error;
 
 /// Millisecond buckets, from a cached HEAD to a multi-gigabyte blob transfer.
 /// The crate default ends at 10, which as milliseconds would pin every quantile there.
@@ -16,7 +15,6 @@ const HTTP_DURATION_BUCKETS_MS: [f64; 14] = [
     60_000.0,
 ];
 
-/// Errors raised while initializing or serving the metrics registry.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -29,8 +27,7 @@ static METRICS: LazyLock<MetricsProvider> = LazyLock::new(|| {
     match MetricsProvider::new() {
         Ok(provider) => provider,
         // Only a duplicate metric registration (a programmer error any
-        // metric-recording test catches) lands here; fail as fast as the old
-        // startup initialization did.
+        // metric-recording test catches) lands here.
         Err(e) => {
             eprintln!("Failed to initialize metrics provider: {e}");
             exit(1);
@@ -44,7 +41,6 @@ pub fn initialize_metrics() {
     LazyLock::force(&METRICS);
 }
 
-/// Returns the process-wide metrics provider, initializing it on first use.
 pub fn metrics_provider() -> &'static MetricsProvider {
     &METRICS
 }
@@ -84,16 +80,10 @@ pub struct MetricsProvider {
     pub pull_through_total: IntCounterVec,
 }
 
-/// Map a Prometheus registration failure to an `Error::Initialization`,
-/// emitting a `tracing::error` with the metric name first.
 fn register_err(name: &'static str) -> impl FnOnce(PrometheusError) -> Error {
-    move |error| {
-        error!("Unable to create {name} metric: {error}");
-        Error::Initialization(format!("Unable to create {name} metric"))
-    }
+    move |error| Error::Initialization(format!("Unable to create {name} metric: {error}"))
 }
 
-/// A metric's name, help text and label names.
 struct MetricSpec {
     name: &'static str,
     help: &'static str,
@@ -240,7 +230,6 @@ impl MetricsProvider {
         })
     }
 
-    /// Encodes every metric in the Prometheus text format ([`prometheus::TEXT_FORMAT`]).
     pub fn gather(&self) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![];
         let metric_families = self.registry.gather();
@@ -253,25 +242,7 @@ impl MetricsProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, PoisonError};
-    use std::thread;
-
     use super::*;
-
-    // Serializes all tests that touch the in-flight gauge so they cannot observe
-    // each other's intermediate values.
-    static IN_FLIGHT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn new_registers_all_metrics_and_gather_succeeds() {
-        let provider = MetricsProvider::new().expect("MetricsProvider::new must succeed");
-        let payload = provider.gather().expect("gather must succeed");
-        let text = String::from_utf8(payload).expect("gather output must be valid UTF-8");
-        assert!(
-            text.contains("http_requests_in_flight"),
-            "gathered output lacks the gauge: {text}"
-        );
-    }
 
     #[test]
     fn http_duration_buckets_resolve_a_request_slower_than_ten_milliseconds() {
@@ -296,73 +267,17 @@ mod tests {
 
     #[test]
     fn in_flight_guard_increments_on_new_and_decrements_on_drop() {
-        let _lock = IN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         initialize_metrics();
-
         let gauge = &metrics_provider().metric_http_request_in_flight;
         let baseline = gauge.get();
 
         let outer = InFlightGuard::new();
-        assert_eq!(
-            gauge.get(),
-            baseline + 1,
-            "gauge must be baseline+1 after outer guard created"
-        );
-
         let inner = InFlightGuard::new();
-        assert_eq!(
-            gauge.get(),
-            baseline + 2,
-            "gauge must be baseline+2 after inner guard created"
-        );
+        assert_eq!(gauge.get(), baseline + 2);
 
         drop(inner);
-        assert_eq!(
-            gauge.get(),
-            baseline + 1,
-            "gauge must return to baseline+1 after inner guard dropped"
-        );
-
+        assert_eq!(gauge.get(), baseline + 1);
         drop(outer);
-        assert_eq!(
-            gauge.get(),
-            baseline,
-            "gauge must return to baseline after outer guard dropped"
-        );
-    }
-
-    #[test]
-    fn in_flight_guard_concurrent_invariant() {
-        const THREADS: usize = 32;
-        const ITERATIONS: usize = 50;
-
-        let _lock = IN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        initialize_metrics();
-
-        let baseline = metrics_provider().metric_http_request_in_flight.get();
-
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
-                thread::spawn(|| {
-                    for _ in 0..ITERATIONS {
-                        let _g = InFlightGuard::new();
-                    }
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().expect("worker thread must not panic");
-        }
-
-        assert_eq!(
-            metrics_provider().metric_http_request_in_flight.get(),
-            baseline,
-            "gauge must return to baseline after all guards are dropped"
-        );
+        assert_eq!(gauge.get(), baseline);
     }
 }

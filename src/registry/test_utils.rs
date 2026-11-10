@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytesize::ByteSize;
+use chrono::{DateTime, Utc};
 use http::Response;
 use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
@@ -17,36 +20,42 @@ use uuid::Uuid;
 use angos_cache::Config as CacheConfig;
 use angos_oci::header::{DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID};
 use angos_oci::http_range::RequestRange;
-use angos_oci::request::{CompleteUploadRequest, GetBlobRequest, GetReferrersRequest};
+use angos_oci::request::{
+    CompleteUploadRequest, GetBlobRequest, GetManifestRequest, GetReferrersRequest,
+};
 use angos_oci::{
-    Descriptor, Digest, Manifest, MediaRange, MediaType, Namespace, Tag, UploadSessionId,
+    Descriptor, Digest, Manifest, MediaRange, MediaType, Namespace, Reference, Tag, UploadSessionId,
 };
 use angos_oci_client::RegistryClient;
+use angos_oci_service::{ManifestGet, ManifestWritten};
 use angos_s3_client::Backend as S3HttpBackend;
 use angos_s3_client::test_util::{
     TEST_ACCESS_KEY, TEST_BUCKET, TEST_REGION, TEST_SECRET_KEY, test_endpoint,
 };
 use angos_secret::Secret;
-use angos_storage::ObjectStore;
 use angos_storage::fs::Backend as StorageFsBackend;
 use angos_storage::s3::Backend as StorageS3Backend;
+use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+use angos_storage::{Error as StorageError, ObjectStore};
 use angos_transport::ResponseBody;
 
-use crate::configuration::{GlobalConfig, RegexPattern};
+use crate::configuration::RegexPattern;
+use crate::event_webhook::event::EventActor;
 use crate::jobs::Queue;
 use crate::jobs::store::{ClaimMode, JobStore};
 use crate::metrics_provider;
-use crate::policy::{RetentionPolicy, RetentionPolicyConfig, SystemClock};
-use crate::registry::blob_store::{
-    BlobStore, BlobStoreConfig, FsBackendConfig, S3BackendConfig, TransportFields,
-};
+use crate::policy::RetentionPolicy;
+use crate::registry::blob_store::config::TransportFields;
+use crate::registry::blob_store::{BlobStore, BlobStoreConfig, FsBackendConfig, S3BackendConfig};
 use crate::registry::keys::NamespaceExt;
-use crate::registry::manifest::DEFAULT_MAX_MANIFEST_SIZE_BYTES;
-use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
+use crate::registry::manifest::{
+    DEFAULT_MAX_MANIFEST_SIZE_BYTES, ReferencePolicy, StoreManifest, hosted_manifest_error,
+};
+use crate::registry::metadata_store::{AccessEntry, LinkKind, MetadataStore, Settings};
 use crate::registry::repository_resolver::RepositoryResolver;
 use crate::registry::s3_connection::S3ConnectionConfig;
 use crate::registry::{Error, Registry, RegistryConfig, Repository};
-use crate::replication::{ReplicationDownstream, ReplicationJob};
+use crate::replication::{ReplicationDownstream, ReplicationJob, ReplicationMode};
 
 /// Connection to the live S3 test backend, single-sourced from the s3-client
 /// fixtures so credentials, bucket, and the endpoint override live in one place.
@@ -75,11 +84,11 @@ pub fn fs_test_stack() -> FsTestStack {
     metrics_provider::initialize_metrics();
     let dir = TempDir::new().expect("temp dir for fs test stack");
     let metadata_store = Arc::new(MetadataStore::new(
-        Arc::new(StorageFsBackend::builder(&dir.path().join("meta")).build()),
+        Arc::new(StorageFsBackend::new(&dir.path().join("meta"), false)),
         Settings::default(),
     ));
     let blob_store = Arc::new(BlobStore::new(
-        Arc::new(StorageFsBackend::builder(&dir.path().join("blob")).build()),
+        Arc::new(StorageFsBackend::new(&dir.path().join("blob"), false)),
         None,
     ));
     FsTestStack {
@@ -97,13 +106,16 @@ pub fn single_repo_resolver(name: &str, repository: Repository) -> Arc<Repositor
 }
 
 /// Run `test` once per registry backend, naming the active one in the captured
-/// output and running the case's cleanup afterwards. The single home of the
-/// backend matrix: tests never iterate [`backends`] themselves.
+/// output and running the case's cleanup afterwards.
 pub async fn for_each_backend<F>(test: F)
 where
     F: AsyncFn(&dyn RegistryTestCase),
 {
-    for case in backends() {
+    let cases: [Box<dyn RegistryTestCase>; 2] = [
+        Box::new(FSRegistryTestCase::new()),
+        Box::new(S3RegistryTestCase::new()),
+    ];
+    for case in cases {
         eprintln!("running against the {} backend", case.name());
         test(case.as_ref()).await;
         case.cleanup().await;
@@ -123,6 +135,64 @@ pub fn metadata_store_over(object: Arc<dyn ObjectStore>) -> Arc<MetadataStore> {
             ..Settings::default()
         },
     ))
+}
+
+/// Counts the store operations its predicate matches.
+struct OpCounter<F> {
+    counted: F,
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl<F: Fn(&StoreOp<'_>) -> bool + Send + Sync> StoreHook for OpCounter<F> {
+    async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        if (self.counted)(&op) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// A [`MetadataStore`] over `object` counting the operations `counted` matches.
+pub fn counting_metadata_store(
+    object: Arc<dyn ObjectStore>,
+    counted: impl Fn(&StoreOp<'_>) -> bool + Send + Sync + 'static,
+) -> (Arc<MetadataStore>, Arc<AtomicUsize>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let hook = OpCounter {
+        counted,
+        count: count.clone(),
+    };
+    (
+        metadata_store_over(Arc::new(HookedStore::new(object, hook))),
+        count,
+    )
+}
+
+/// Plant one access entry stamped `at` with a raw put, as a sibling replica's
+/// pull would land.
+pub async fn put_access_entry_at(
+    metadata_store: &MetadataStore,
+    namespace: &Namespace,
+    link: &LinkKind,
+    client: &str,
+    at: DateTime<Utc>,
+) {
+    let body = serde_json::to_vec(&AccessEntry {
+        client: client.to_string(),
+        client_ip: None,
+        method: None,
+        at,
+    })
+    .unwrap();
+    metadata_store
+        .object_store()
+        .put(
+            &namespace.atime_entry_path(link, at, client).unwrap(),
+            Bytes::from(body),
+        )
+        .await
+        .unwrap();
 }
 
 /// The queue a test registry enqueues into. Nothing drains it unless the test
@@ -162,16 +232,8 @@ pub fn create_test_registry_with(
         RepositoryResolver::new(create_test_repositories())
             .expect("test repositories must not have overlapping prefixes"),
     );
-    let global = GlobalConfig::default();
-
     let config = RegistryConfig {
-        update_pull_time: global.update_pull_time,
-        redirect: global.redirect,
-        max_manifest_size_bytes: global.max_manifest_size_bytes(),
-        max_blob_size_bytes: global.max_blob_size_bytes(),
         validate_manifest_references,
-        global_immutable_tags: global.immutable_tags,
-        global_immutable_tags_exclusions: global.immutable_tags_exclusions.clone(),
         ..RegistryConfig::new(test_job_store(&metadata_store))
     };
 
@@ -304,6 +366,24 @@ pub async fn put_blob_direct(blob_store: &BlobStore, content: &[u8]) -> Digest {
     digest
 }
 
+/// A downstream with the defaults: event+reconcile mode, a match-all filter,
+/// no prune and a verbatim namespace mapping.
+pub fn test_downstream(
+    name: String,
+    registry_client: Arc<RegistryClient>,
+) -> ReplicationDownstream {
+    ReplicationDownstream {
+        name,
+        registry_client,
+        mode: ReplicationMode::default(),
+        namespace_filter: Vec::new(),
+        max_concurrent_pushes: NonZeroUsize::new(4).unwrap(),
+        prune: false,
+        local_namespace: None,
+        target_namespace: None,
+    }
+}
+
 /// Fetch a blob the way `handle_get_blob` does for an explicit `repository`,
 /// minus the resolver, the redirect and the event.
 pub async fn get_blob(
@@ -314,10 +394,7 @@ pub async fn get_blob(
     digest: &Digest,
     range: Option<RequestRange>,
 ) -> Result<Response<ResponseBody>, Error> {
-    let has_access = registry
-        .metadata_store()
-        .can_read(namespace, digest)
-        .await?;
+    let has_access = registry.metadata_store.can_read(namespace, digest).await?;
     let request = GetBlobRequest {
         namespace: namespace.clone(),
         digest: digest.clone(),
@@ -338,6 +415,60 @@ pub async fn get_blob(
         .expect("a served blob renders"))
 }
 
+/// Fetch a manifest the way `handle_get_manifest` does for an explicit
+/// `repository`, minus the resolver, the redirect and the event.
+pub async fn get_manifest(
+    registry: &Registry,
+    repository: Option<&Repository>,
+    accepted_types: &[MediaRange],
+    namespace: &Namespace,
+    reference: Reference,
+    is_tag_immutable: bool,
+    client: &EventActor,
+) -> Result<ManifestGet, Error> {
+    let request = GetManifestRequest {
+        namespace: namespace.clone(),
+        reference,
+        accepted_types: accepted_types.to_vec(),
+    };
+    match repository.filter(|repository| repository.is_pull_through()) {
+        Some(upstream) => {
+            registry
+                .get_cached_manifest(upstream, &request, is_tag_immutable, client)
+                .await
+        }
+        None => registry
+            .get_local_manifest(namespace, &request.reference, client)
+            .await
+            .map_err(|error| hosted_manifest_error(namespace, &request.reference, error)),
+    }
+}
+
+/// Store a manifest the way a push does, minus the events, replication and
+/// immutability check.
+pub async fn put_manifest_direct(
+    registry: &Registry,
+    namespace: &Namespace,
+    reference: &Reference,
+    content_type: Option<&MediaType>,
+    body: &[u8],
+) -> Result<ManifestWritten, Error> {
+    registry
+        .store_manifest(
+            StoreManifest {
+                namespace,
+                reference,
+                content_type,
+                created_tags: &[],
+                reference_policy: ReferencePolicy::Strict,
+                created_at: None,
+                repository: None,
+            },
+            body,
+        )
+        .await
+}
+
 pub async fn create_test_blob(
     registry: &Registry,
     namespace: &Namespace,
@@ -345,27 +476,16 @@ pub async fn create_test_blob(
 ) -> (Digest, Repository) {
     let digest = put_blob_direct(&registry.blob_store, content).await;
 
-    let tag_link = LinkKind::Tag(Tag::new("latest").unwrap());
-    let layer_link = LinkKind::ReferencedBy(digest.clone());
     seed_links(
         &registry.metadata_store,
         namespace,
         &[
-            (tag_link.clone(), digest.clone()),
-            (layer_link.clone(), digest.clone()),
+            (LinkKind::Tag(Tag::new("latest").unwrap()), digest.clone()),
+            (LinkKind::ReferencedBy(digest.clone()), digest.clone()),
         ],
     )
     .await
     .unwrap();
-
-    let blob_index = registry
-        .metadata_store
-        .read_blob_index(&digest)
-        .await
-        .unwrap();
-    assert!(blob_index.contains_key(namespace));
-    let namespace_links = blob_index.get(namespace).unwrap();
-    assert!(namespace_links.contains(&layer_link));
 
     let repository = repository_with_replication("test-repo", Vec::new());
 
@@ -379,13 +499,6 @@ pub trait RegistryTestCase {
     fn blob_store(&self) -> Arc<BlobStore>;
     fn metadata_store(&self) -> Arc<MetadataStore>;
     async fn cleanup(&self) {}
-}
-
-pub fn backends() -> Vec<Box<dyn RegistryTestCase>> {
-    vec![
-        Box::new(FSRegistryTestCase::new()),
-        Box::new(S3RegistryTestCase::new()),
-    ]
 }
 
 pub struct FSRegistryTestCase {
@@ -410,11 +523,7 @@ impl FSRegistryTestCase {
         });
         let blob_store = Arc::new(config.build_backend().expect("fs blob backend"));
 
-        let meta_storage: Arc<dyn ObjectStore> = Arc::new(
-            StorageFsBackend::builder(&meta_path)
-                .sync_to_disk(false)
-                .build(),
-        );
+        let meta_storage: Arc<dyn ObjectStore> = Arc::new(StorageFsBackend::new(&meta_path, false));
         let metadata_store = metadata_store_over(meta_storage);
         let registry = create_test_registry(blob_store.clone(), metadata_store.clone());
 
@@ -444,10 +553,6 @@ impl FSRegistryTestCase {
             ),
             ..case
         }
-    }
-
-    pub fn registry(&self) -> &Registry {
-        &self.registry
     }
 
     pub fn blob_root(&self) -> PathBuf {
@@ -582,10 +687,7 @@ pub fn repository_with_replication(
         namespace: None,
         upstreams: Vec::new(),
         replication,
-        retention_policy: RetentionPolicy::new(
-            &RetentionPolicyConfig::default(),
-            Arc::new(SystemClock),
-        ),
+        retention_policy: RetentionPolicy::new(Vec::new()),
         immutable_tags: false,
         immutable_tags_exclusions: Vec::new(),
         scan: None,
@@ -596,14 +698,7 @@ pub fn repository_with_replication(
 /// A `Repository` carrying exactly one match-all event+reconcile downstream
 /// named "eu-region", backed by `client`.
 pub fn repository_with_downstream(name: &str, client: Arc<RegistryClient>) -> Repository {
-    repository_with_replication(
-        name,
-        vec![ReplicationDownstream::new(
-            "eu-region".to_string(),
-            client,
-            4,
-        )],
-    )
+    repository_with_replication(name, vec![test_downstream("eu-region".to_string(), client)])
 }
 
 /// Decode the payload of the sole pending replication job, panicking unless

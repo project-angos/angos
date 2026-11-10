@@ -19,8 +19,6 @@
 		registryName = getRegistryName();
 		signInError = await completeSignIn();
 	});
-
-	const here = (href: string) => (page.url.pathname === href ? 'page' : undefined);
 </script>
 
 <header>
@@ -44,7 +42,7 @@
 		{/each}
 	</nav>
 	<nav class="pages">
-		<a href={resolve('/')} aria-current={here(resolve('/'))}>Repositories</a>
+		<a href={resolve('/')} aria-current={page.url.pathname === resolve('/') ? 'page' : undefined}>Repositories</a>
 		<a href={resolve('/jobs')} aria-current={page.url.pathname.startsWith(resolve('/jobs')) ? 'page' : undefined}>Jobs</a>
 	</nav>
 	<div class="theme">
@@ -64,7 +62,6 @@
 </main>
 
 <style>
-	/* One bar over a centered page; the bar stays put while the page scrolls. */
 	header {
 		position: sticky;
 		top: 0;

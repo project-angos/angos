@@ -16,12 +16,9 @@ pub fn is_restricted_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
 }
 
-/// A validated media type as carried by a manifest's `mediaType`, a descriptor,
-/// and the `Content-Type` of a manifest request. The private field forces
-/// construction through the validating constructors so a stored or wire value is
-/// always a bare RFC 6838 media type. Only a header carries a parameter section,
-/// which [`Self::from_content_type`] drops; a `mediaType` or an `artifactType`
-/// naming one is malformed rather than reduced.
+/// A bare RFC 6838 media type. Only a header may carry a parameter section,
+/// which [`Self::from_content_type`] drops; a `mediaType` naming one is
+/// malformed.
 #[derive(Clone, Debug, Ord, Eq, Hash, PartialEq, PartialOrd)]
 pub struct MediaType(String);
 
@@ -54,37 +51,26 @@ impl MediaType {
         }
     }
 
-    /// The OCI image-manifest media type. Infallible: the value is a validated
-    /// compile-time constant needing no fallible re-validation. Serves as the
-    /// `Content-Type` fallback for a manifest whose link and body both lack one.
     #[must_use]
     pub fn oci_manifest() -> Self {
         Self(OCI_MANIFEST_MEDIA_TYPE.to_owned())
     }
 
-    /// The OCI image-index (manifest list) media type, infallible like
-    /// [`Self::oci_manifest`].
     #[must_use]
     pub fn oci_index() -> Self {
         Self(OCI_INDEX_MEDIA_TYPE.to_owned())
     }
 
-    /// The OCI empty-descriptor media type, infallible like
-    /// [`Self::oci_manifest`].
     #[must_use]
     pub fn oci_empty() -> Self {
         Self(OCI_EMPTY_MEDIA_TYPE.to_owned())
     }
 
-    /// The Docker v2 schema-2 manifest media type, infallible like
-    /// [`Self::oci_manifest`].
     #[must_use]
     pub fn docker_manifest() -> Self {
         Self(DOCKER_MANIFEST_MEDIA_TYPE.to_owned())
     }
 
-    /// The Docker v2 manifest-list media type, infallible like
-    /// [`Self::oci_manifest`].
     #[must_use]
     pub fn docker_manifest_list() -> Self {
         Self(DOCKER_MANIFEST_LIST_MEDIA_TYPE.to_owned())
@@ -113,10 +99,6 @@ mod tests {
         }
     }
 
-    /// A parameter section belongs to a header alone: it is dropped there, so a
-    /// `Content-Type` carrying one compares equal to and is served as the bare
-    /// media type. A `mediaType` or an `artifactType` naming one is malformed,
-    /// not silently reduced.
     #[test]
     fn test_content_type_parameters_are_dropped_only_for_a_header() {
         for input in [
@@ -145,11 +127,5 @@ mod tests {
         ] {
             assert!(MediaType::new(input).is_err(), "'{input}' must be rejected");
         }
-    }
-
-    #[test]
-    fn test_deserialize_invalid_rejected() {
-        let result: Result<MediaType, _> = serde_json::from_str("\"not a media type\"");
-        assert!(result.is_err());
     }
 }

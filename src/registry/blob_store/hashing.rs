@@ -1,8 +1,7 @@
 //! Hashing an upload as it streams, across chunks.
 //!
-//! [`Hasher`] is the live digest; its [`HashState`] serializes mid-stream so a
-//! chunked upload can resume one, and [`HashingReader`] feeds it every byte a
-//! reader yields.
+//! [`Hasher`] is the live digest, checkpointed mid-stream so a chunked upload
+//! can resume it, and [`HashingReader`] feeds it every byte a reader yields.
 
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
@@ -114,15 +113,45 @@ impl Hasher {
         }
     }
 
-    /// Capture every present hasher's resumable state into a [`HashState`].
-    pub fn state(&self) -> HashState {
-        HashState {
-            states: self
-                .hashers
-                .iter()
-                .map(|h| (h.algorithm(), h.serialized_state()))
-                .collect(),
+    /// The JSON checkpoint of every present hasher: algorithm name to its
+    /// base64-encoded resumable state.
+    pub fn checkpoint(&self) -> Result<Vec<u8>, Error> {
+        let map: BTreeMap<&str, String> = self
+            .hashers
+            .iter()
+            .map(|h| {
+                (
+                    h.algorithm().as_str(),
+                    BASE64_STANDARD.encode(h.serialized_state()),
+                )
+            })
+            .collect();
+        Ok(serde_json::to_vec(&map)?)
+    }
+
+    /// Rebuild from a [`Self::checkpoint`]. Unknown algorithms are ignored so a
+    /// newer build's checkpoint still resumes. A missing one is left out rather
+    /// than started fresh, which would hash from the wrong offset; [`Self::digest`]
+    /// then errors if it is requested.
+    pub fn resume(checkpoint: &[u8]) -> Result<Self, Error> {
+        let map: BTreeMap<String, String> = serde_json::from_slice(checkpoint)
+            .map_err(|e| Error::Internal(format!("invalid hash checkpoint: {e}")))?;
+
+        let mut hashers = Vec::new();
+        for (name, encoded) in map {
+            let Ok(algorithm) = name.parse::<Algorithm>() else {
+                continue;
+            };
+            let state = BASE64_STANDARD
+                .decode(&encoded)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            hashers.push(AlgorithmHasher::from_state(algorithm, &state)?);
         }
+
+        if hashers.is_empty() {
+            return Err(Error::Internal("empty hash checkpoint".to_string()));
+        }
+        Ok(Self { hashers })
     }
 
     /// The digest for `algorithm`, or an error if this hasher carries no state
@@ -139,61 +168,6 @@ impl Hasher {
 impl Default for Hasher {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// The serializable checkpoint of a [`Hasher`]: each algorithm's resumable
-/// state, encoded as a JSON map of algorithm name to base64-encoded state.
-pub struct HashState {
-    states: BTreeMap<Algorithm, Vec<u8>>,
-}
-
-impl HashState {
-    /// Encode as the JSON checkpoint bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let map: BTreeMap<&str, String> = self
-            .states
-            .iter()
-            .map(|(algorithm, state)| (algorithm.as_str(), BASE64_STANDARD.encode(state)))
-            .collect();
-        Ok(serde_json::to_vec(&map)?)
-    }
-
-    /// Decode from the JSON checkpoint bytes; unknown algorithms are ignored so
-    /// a newer build's checkpoint still resumes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let map: BTreeMap<String, String> = serde_json::from_slice(bytes)
-            .map_err(|e| Error::Internal(format!("invalid hash checkpoint: {e}")))?;
-
-        let mut states = BTreeMap::new();
-        for (name, encoded) in map {
-            let Ok(algorithm) = name.parse::<Algorithm>() else {
-                continue;
-            };
-            let decoded = BASE64_STANDARD
-                .decode(&encoded)
-                .map_err(|e| Error::Internal(e.to_string()))?;
-            states.insert(algorithm, decoded);
-        }
-
-        if states.is_empty() {
-            return Err(Error::Internal("empty hash checkpoint".to_string()));
-        }
-        Ok(Self { states })
-    }
-
-    /// Rebuild a live [`Hasher`] from the checkpointed states. A missing
-    /// algorithm (e.g. one added after the checkpoint was written) is left out
-    /// rather than started fresh, which would hash from the wrong offset and
-    /// silently corrupt the result; [`Hasher::digest`] then errors if it is
-    /// requested.
-    pub fn into_hasher(self) -> Result<Hasher, Error> {
-        let hashers = self
-            .states
-            .into_iter()
-            .map(|(algorithm, state)| AlgorithmHasher::from_state(algorithm, &state))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Hasher { hashers })
     }
 }
 
@@ -302,22 +276,13 @@ where
 mod tests {
     use std::io::Cursor;
 
-    use tokio::io::AsyncReadExt;
-
-    use angos_oci::Algorithm;
-
     use super::*;
 
     #[test]
     fn hasher_combined_state_round_trips() {
         let mut hasher = Hasher::new();
         hasher.update(b"some streamed bytes");
-        let bytes = hasher.state().to_bytes().unwrap();
-
-        let restored = HashState::from_bytes(&bytes)
-            .unwrap()
-            .into_hasher()
-            .unwrap();
+        let restored = Hasher::resume(&hasher.checkpoint().unwrap()).unwrap();
         assert_eq!(
             restored.digest(Algorithm::Sha256).unwrap(),
             hasher.digest(Algorithm::Sha256).unwrap()
@@ -329,49 +294,32 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_rejects_non_json_checkpoint() {
+    fn resume_rejects_non_json_checkpoint() {
         // A non-JSON payload (corrupt, or a pre-JSON bare state) is rejected
         // rather than resumed.
-        assert!(HashState::from_bytes(&[0xAB, 0xCD, 0xEF]).is_err());
+        assert!(Hasher::resume(&[0xAB, 0xCD, 0xEF]).is_err());
     }
 
     const HELLO_SHA256: &str =
         "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const HELLO_SHA512: &str = "sha512:309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
 
+    /// Every byte a reader yields reaches the hasher, however small the reads.
     #[tokio::test]
-    async fn test_known_payload_produces_correct_digests() {
-        let reader = Cursor::new(b"hello world");
-        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
+    async fn small_reads_forward_and_hash_every_byte() {
+        let mut hashing_reader = HashingReader::new(Cursor::new(b"hello world"), Hasher::new());
 
-        let mut buf = Vec::new();
-        hashing_reader.read_to_end(&mut buf).await.unwrap();
-
-        assert_eq!(buf, b"hello world");
-        let hasher = hashing_reader.into_hasher();
-        assert_eq!(
-            hasher.digest(Algorithm::Sha256).unwrap().to_string(),
-            HELLO_SHA256
-        );
-        assert_eq!(
-            hasher.digest(Algorithm::Sha512).unwrap().to_string(),
-            HELLO_SHA512
-        );
-    }
-
-    #[tokio::test]
-    async fn test_multiple_small_reads_produce_same_digest() {
-        let reader = Cursor::new(b"hello world");
-        let mut hashing_reader = HashingReader::new(reader, Hasher::new());
-
+        let mut forwarded = Vec::new();
         let mut chunk = [0u8; 3];
         loop {
             let n = hashing_reader.read(&mut chunk).await.unwrap();
             if n == 0 {
                 break;
             }
+            forwarded.extend_from_slice(&chunk[..n]);
         }
 
+        assert_eq!(forwarded, b"hello world");
         let hasher = hashing_reader.into_hasher();
         assert_eq!(
             hasher.digest(Algorithm::Sha256).unwrap().to_string(),

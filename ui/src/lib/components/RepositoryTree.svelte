@@ -1,15 +1,6 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type { RevisionSort, SortOrder, UploadEntry } from '#lib/api.js';
-	import {
-		formatSize,
-		formatTimeAgo,
-		isInteractiveTarget,
-		manifestUrl,
-		selectedUploadsConfirmKey,
-		uploadConfirmKey,
-		type TreeRowNode
-	} from '#lib/utils.js';
+	import { formatSize, formatTimeAgo, selectedUploadsConfirmKey, type TreeRowNode } from '#lib/utils.js';
 	import Card from './Card.svelte';
 	import DeleteButton from './DeleteButton.svelte';
 	import SortHeader from './SortHeader.svelte';
@@ -29,8 +20,8 @@
 		expanded: Set<string>;
 		ontoggleexpand: (digest: string, event: MouseEvent) => void;
 		onconfirmchange: (value: string | null) => void;
-		ondeletemanifest: (digest: string) => void;
-		ondeletetag: (tag: string) => void;
+		/** Deletes a manifest by digest or a tag by name. */
+		ondelete: (reference: string) => void;
 		oncancelupload: (uuid: string) => void;
 		onuploadselectionchange: (selected: Set<string>) => void;
 		oncancelselecteduploads: () => void;
@@ -67,8 +58,7 @@
 		expanded,
 		ontoggleexpand,
 		onconfirmchange,
-		ondeletemanifest,
-		ondeletetag,
+		ondelete,
 		oncancelupload,
 		onuploadselectionchange,
 		oncancelselecteduploads,
@@ -105,11 +95,7 @@
 
 	function toggleUploadSelection(uuid: string) {
 		const selected = new Set(selectedUploads);
-		if (selected.has(uuid)) {
-			selected.delete(uuid);
-		} else {
-			selected.add(uuid);
-		}
+		if (!selected.delete(uuid)) selected.add(uuid);
 		onuploadselectionchange(selected);
 	}
 
@@ -117,11 +103,6 @@
 		onuploadselectionchange(
 			allUploadsSelected ? new Set() : new Set(uploads.map((upload) => upload.uuid))
 		);
-	}
-
-	function handleRowClick(event: MouseEvent, targetDigest: string) {
-		if (isInteractiveTarget(event)) return;
-		goto(manifestUrl(path, targetDigest));
 	}
 </script>
 
@@ -179,11 +160,11 @@
 						<td>
 							<DeleteButton
 								label="cancel"
-								isConfirming={deleteConfirm === uploadConfirmKey(upload.uuid)}
+								isConfirming={deleteConfirm === `upload:${upload.uuid}`}
 								disabled={deleting}
 								onconfirm={() => oncancelupload(upload.uuid)}
 								oncancel={() => onconfirmchange(null)}
-								onrequestconfirm={() => onconfirmchange(uploadConfirmKey(upload.uuid))}
+								onrequestconfirm={() => onconfirmchange(`upload:${upload.uuid}`)}
 							/>
 						</td>
 					</tr>
@@ -239,6 +220,7 @@
 		{:else}
 			{#each rows as node (`${node.kind}:${node.digest}`)}
 				<TreeRow
+					{path}
 					{node}
 					depth={0}
 					{expanded}
@@ -250,12 +232,8 @@
 					ontoggleselect={toggleManifestSelection}
 					{getdeleteconfirmlabel}
 					{ontoggleexpand}
-					onrowclick={handleRowClick}
-					{ondeletemanifest}
-					{ondeletetag}
+					{ondelete}
 					{onconfirmchange}
-					gettaghref={(tag) => manifestUrl(path, tag)}
-					getdigesthref={(rowDigest) => manifestUrl(path, rowDigest)}
 				/>
 			{/each}
 		{/if}
@@ -266,6 +244,3 @@
 		<button class="secondary" onclick={onloadmoremanifests} disabled={loadingMore === 'manifests'}>Load more</button>
 	</div>
 {/if}
-
-<style>
-</style>

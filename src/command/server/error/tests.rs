@@ -1,13 +1,33 @@
 use std::io;
 
 use hyper::StatusCode;
+use hyper::header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER, WWW_AUTHENTICATE};
 
 use angos_oci::response::{
     ErrorCode, RECLAMATION_IN_PROGRESS_CODE, REPLICATION_SUPERSEDED_CODE, UPSTREAM_UNAVAILABLE_CODE,
 };
 
 use crate::command::server::Error;
+use crate::command::server::http_server::error_to_response;
 use crate::registry;
+
+/// The error codes the distribution spec defines.
+const SPEC_CODES: [ErrorCode; 14] = [
+    ErrorCode::BlobUnknown,
+    ErrorCode::BlobUploadInvalid,
+    ErrorCode::BlobUploadUnknown,
+    ErrorCode::DigestInvalid,
+    ErrorCode::ManifestBlobUnknown,
+    ErrorCode::ManifestInvalid,
+    ErrorCode::ManifestUnknown,
+    ErrorCode::NameInvalid,
+    ErrorCode::NameUnknown,
+    ErrorCode::SizeInvalid,
+    ErrorCode::Unauthorized,
+    ErrorCode::Denied,
+    ErrorCode::Unsupported,
+    ErrorCode::TooManyRequests,
+];
 
 /// Whether this error's `code` must come from the set the spec fixes for a 4XX.
 /// Exhaustive on purpose: a variant added later does not compile until it is
@@ -38,79 +58,63 @@ fn owes_a_spec_code(error: &registry::Error) -> bool {
         | registry::Error::EventDelivery(_)
         | registry::Error::Internal(_)
         | registry::Error::Corrupt(_)
-        | registry::Error::Configuration(_)
-        | registry::Error::Cache(_)
         | registry::Error::Io(_)
         | registry::Error::Serde(_) => false,
     }
 }
 
-/// One answer the server sends: the error and the status, code and message it
+/// An answer the server sends: the error and the status, code and message it
 /// must map to. A `None` message is a body carrying none, as every 5XX does.
-struct Answer {
-    error: Error,
-    status: u16,
-    code: &'static str,
-    message: Option<&'static str>,
-}
-
-fn answer(error: Error, status: u16, code: &'static str, message: Option<&'static str>) -> Answer {
-    Answer {
-        error,
-        status,
-        code,
-        message,
-    }
-}
+type Answer = (Error, u16, &'static str, Option<&'static str>);
 
 /// The answers the server raises itself.
 fn server_answers() -> Vec<Answer> {
     vec![
-        answer(
+        (
             Error::Unauthorized("auth".into()),
             401,
             "UNAUTHORIZED",
             Some("auth"),
         ),
-        answer(
+        (
             Error::BadRequest("bad".into()),
             400,
             "UNSUPPORTED",
             Some("bad"),
         ),
-        answer(
+        (
             Error::RangeNotSatisfiable("r".into()),
             416,
             "SIZE_INVALID",
             Some("r"),
         ),
-        answer(
+        (
             Error::NotFound("missing".into()),
             404,
             "NAME_UNKNOWN",
             Some("missing"),
         ),
-        answer(
+        (
             Error::ProviderUnavailable("down".into()),
             503,
             "PROVIDER_UNAVAILABLE",
             None,
         ),
-        answer(
+        (
             Error::Initialization("init".into()),
             500,
             "INTERNAL_ERROR",
             None,
         ),
-        answer(Error::Execution("exec".into()), 500, "INTERNAL_ERROR", None),
-        answer(
+        (Error::Execution("exec".into()), 500, "INTERNAL_ERROR", None),
+        (
             Error::Internal("internal".into()),
             500,
             "INTERNAL_ERROR",
             None,
         ),
         // A custom answer passes its own status and code through.
-        answer(
+        (
             Error::Custom {
                 status_code: StatusCode::TOO_MANY_REQUESTS,
                 code: "TOOMANYREQUESTS".to_string(),
@@ -127,7 +131,7 @@ fn server_answers() -> Vec<Answer> {
 fn registry_answers() -> Vec<Answer> {
     let errors: Vec<(registry::Error, u16, &str, Option<&str>)> = vec![
         // Every `registry::Error` [`owes_a_spec_code`] calls client-facing,
-        // plus one that it does not.
+        // plus some that it does not.
         (registry::Error::BlobUnknown, 404, "BLOB_UNKNOWN", None),
         // end-10 lists `404/400/405` as a blob delete's failures, so a
         // still-referenced blob answers within that set.
@@ -229,39 +233,62 @@ fn registry_answers() -> Vec<Answer> {
     ];
     errors
         .into_iter()
-        .map(|(error, status, code, message)| answer(error.into(), status, code, message))
+        .map(|(error, status, code, message)| {
+            assert_eq!(owes_a_spec_code(&error), status / 100 == 4, "{error:?}");
+            (error.into(), status, code, message)
+        })
         .collect()
 }
 
-/// The status, code and message of every answer, and the rule over them: a 4XX
-/// names a code the spec defines, so a new mapping cannot invent one.
+/// The status, code, message and headers of every answer, and the rule over
+/// them: a 4XX names a code the spec defines, so a new mapping cannot invent one.
+/// Only our own denial is challenged, and only the reclamation refusal, which
+/// clears in about a second, says when to retry.
 #[test]
 fn every_answer_maps_to_its_status_code_and_message() {
-    for Answer {
-        error,
-        status,
-        code,
-        message,
-    } in server_answers().into_iter().chain(registry_answers())
-    {
-        let answered = error.status_code();
-        assert_eq!(answered.as_u16(), status, "{error:?} answers a status");
-        let body = serde_json::to_value(error.error_body(None)).unwrap();
+    for (error, status, code, message) in server_answers().into_iter().chain(registry_answers()) {
+        let response = error_to_response(&error, None, None);
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "{error:?} answers a status"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE).is_some(),
+            matches!(error, Error::Unauthorized(_)),
+            "{error:?} challenges"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .map(HeaderValue::as_bytes),
+            (code == RECLAMATION_IN_PROGRESS_CODE).then_some(b"1".as_slice()),
+            "{error:?} retries"
+        );
 
-        assert_eq!(body["errors"][0]["code"], code, "{error:?} names a code");
+        let body = serde_json::to_value(error.error_body(Some("req-1"))).unwrap();
+        assert_eq!(body["errors"].as_array().map(Vec::len), Some(1));
+        let entry = &body["errors"][0];
+        assert_eq!(entry["code"], code, "{error:?} names a code");
+        assert_eq!(entry["detail"]["request_id"], "req-1");
         match message {
-            Some(message) => assert_eq!(body["errors"][0]["message"], message),
+            Some(message) => assert_eq!(entry["message"], message),
             None => assert!(
-                body["errors"][0]["message"].is_null(),
+                entry["message"].is_null(),
                 "{error:?} must carry no message"
             ),
         }
 
-        if answered.is_client_error() {
+        if response.status().is_client_error() {
             assert!(
-                ErrorCode::ALL
+                SPEC_CODES
                     .iter()
-                    .any(|known| body["errors"][0]["code"] == known.as_str()),
+                    .any(|known| entry["code"] == known.as_str()),
                 "{error:?} answers with {code}, which the spec does not define"
             );
         }
@@ -280,7 +307,7 @@ fn the_replication_code_is_the_only_exception() {
     let body = serde_json::to_value(error.error_body(None)).unwrap();
     assert_eq!(body["errors"][0]["code"], REPLICATION_SUPERSEDED_CODE);
     assert!(
-        !ErrorCode::ALL
+        !SPEC_CODES
             .iter()
             .any(|known| known.as_str() == REPLICATION_SUPERSEDED_CODE),
         "the replication code must stay outside the spec's set"
@@ -303,36 +330,14 @@ fn a_5xx_body_omits_the_internal_error_string() {
             msg: Some(secret.to_string()),
         },
     ];
-    let request_id = "req-abc";
-
     for error in errors {
         assert!(error.status_code().is_server_error());
-        let body = serde_json::to_value(error.error_body(Some(request_id)))
+        let body = serde_json::to_value(error.error_body(Some("req-abc")))
             .unwrap()
             .to_string();
         assert!(
             !body.contains(secret),
             "5xx body leaked internal detail: {body}"
         );
-        assert!(
-            body.contains(request_id),
-            "request id must still be present"
-        );
     }
-}
-
-/// The body is one `errors` entry carrying the request id a client quotes back.
-#[test]
-fn a_body_carries_one_error_and_the_request_id() {
-    let request_id = "abc-123";
-    let body = serde_json::to_value(
-        Error::NotFound("Resource missing".to_string()).error_body(Some(request_id)),
-    )
-    .unwrap();
-
-    assert_eq!(body["errors"].as_array().map(Vec::len), Some(1));
-    let entry = &body["errors"][0];
-    assert_eq!(entry["code"], "NAME_UNKNOWN");
-    assert_eq!(entry["message"], "Resource missing");
-    assert_eq!(entry["detail"]["request_id"], request_id);
 }

@@ -1,3 +1,4 @@
+use std::iter::repeat_n;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,18 +11,17 @@ use tracing::{info, warn};
 use angos_cache::Cache;
 
 use crate::cache_fill::CacheFillJobHandler;
-use crate::command::bootstrap;
+use crate::command::bootstrap::{self, StoreContext};
 use crate::command::server::error::Error;
-use crate::configuration::{Configuration, RegistryStorageConfig, ResolvedStorageConfig};
+use crate::configuration::{Configuration, GlobalConfig, RegistryStorageConfig};
 use crate::event_webhook::dispatcher::EventDispatcher;
 use crate::jobs::Queue;
 use crate::jobs::runner::claim_loop;
 use crate::jobs::store::{
     ClaimMode, JobHandler, JobStore, QueueDepthRefresh, ensure_claim_support,
 };
-use crate::layer::IndexLimits;
 use crate::layer::handler::IndexLayerJobHandler;
-use crate::registry::blob_store::BlobStore;
+use crate::registry::blob_store::{BlobStore, BlobStoreConfig};
 use crate::registry::metadata_store::MetadataStore;
 use crate::registry::repository_resolver::RepositoryResolver;
 use crate::registry::{Registry, RegistryConfig};
@@ -47,18 +47,17 @@ pub struct InProcessLoops {
 }
 
 impl InProcessLoops {
-    /// Adds `count` claim loops for `queue`, stopped with the others.
     fn spawn(
         &self,
         job_store: &Arc<JobStore>,
-        handler: &Arc<dyn JobHandler>,
+        handler: Arc<dyn JobHandler>,
         queue: Queue,
         count: NonZeroUsize,
     ) {
-        for _ in 0..count.get() {
+        for handler in repeat_n(handler, count.get()) {
             self.tracker.spawn(claim_loop(
                 job_store.clone(),
-                handler.clone(),
+                handler,
                 queue,
                 self.shutdown.clone(),
             ));
@@ -83,13 +82,6 @@ impl InProcessLoops {
     }
 }
 
-/// How many in-process loops each queue gets.
-struct LoopCounts {
-    cache: NonZeroUsize,
-    replication: NonZeroUsize,
-    index: NonZeroUsize,
-}
-
 /// Spawn the claim loops draining `job_store`. Replication drains only when a
 /// downstream is configured: an always-empty queue would just storm the object
 /// store with `LIST`s.
@@ -99,59 +91,52 @@ fn spawn_in_process_loops(
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     event_dispatcher: Option<Arc<EventDispatcher>>,
-    counts: &LoopCounts,
-    index_limits: IndexLimits,
+    global: &GlobalConfig,
 ) -> InProcessLoops {
     let loops = InProcessLoops::default();
 
     // Any image may be indexed on demand, so the queue always drains.
-    let index_handler: Arc<dyn JobHandler> = Arc::new(IndexLayerJobHandler::new(
-        blob_store.clone(),
-        metadata_store.clone(),
-        index_limits,
-    ));
-    loops.spawn(job_store, &index_handler, Queue::Index, counts.index);
-
-    let cache_handler: Arc<dyn JobHandler> = Arc::new(CacheFillJobHandler::new(
-        resolver.clone(),
-        blob_store.clone(),
-        metadata_store.clone(),
-        event_dispatcher,
-    ));
-    loops.spawn(job_store, &cache_handler, Queue::Cache, counts.cache);
+    loops.spawn(
+        job_store,
+        Arc::new(IndexLayerJobHandler::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            global.index_limits(),
+        )),
+        Queue::Index,
+        global.max_concurrent_index_jobs,
+    );
+    loops.spawn(
+        job_store,
+        Arc::new(CacheFillJobHandler::new(
+            resolver.clone(),
+            blob_store.clone(),
+            metadata_store.clone(),
+            event_dispatcher,
+        )),
+        Queue::Cache,
+        global.max_concurrent_cache_jobs,
+    );
 
     let any_downstream = resolver
-        .keys()
-        .filter_map(|name| resolver.get(name))
+        .values()
         .any(|repository| !repository.replication.is_empty());
     if any_downstream {
         // Mesh cycles terminate: only state-changing writes dispatch, and
         // receiver-side no-op suppression stops any remaining replays.
-        let replication_handler: Arc<dyn JobHandler> = Arc::new(ReplicationJobHandler::new(
-            resolver.clone(),
-            blob_store.clone(),
-            metadata_store.clone(),
-        ));
         loops.spawn(
             job_store,
-            &replication_handler,
+            Arc::new(ReplicationJobHandler::new(
+                resolver.clone(),
+                blob_store.clone(),
+                metadata_store.clone(),
+            )),
             Queue::Replication,
-            counts.replication,
+            global.max_concurrent_replication_jobs,
         );
     }
 
     loops
-}
-
-/// Resolve the registry-storage config once per (re)build.
-fn resolve_storage_config(config: &Configuration) -> ResolvedStorageConfig {
-    let storage_config = config.resolve_registry_storage();
-    if matches!(config.registry_storage, RegistryStorageConfig::Inherit)
-        && matches!(&storage_config, ResolvedStorageConfig::S3(_))
-    {
-        info!("Auto-configuring S3 metadata-store from blob-store");
-    }
-    storage_config
 }
 
 /// Build the runtime `Registry` and the job queue it enqueues into. With
@@ -162,23 +147,16 @@ pub async fn build_registry(
     config: &Configuration,
     auth_cache: &Arc<Cache>,
 ) -> Result<BuiltRegistry, Error> {
-    let blob_backend = Arc::new(
-        config
-            .blob_store
-            .build_backend()?
-            .with_namespace_walk_concurrency(config.global.namespace_walk_concurrency),
-    );
-    let storage_config = resolve_storage_config(config);
-    let metadata_store = bootstrap::metadata_store(
-        &storage_config,
-        config.global.namespace_walk_concurrency,
-        config.global.gc_grace_secs,
-        config.global.pull_history,
-    )
-    .map_err(Error::from)?;
-    let max_manifest_size_bytes = config.global.max_manifest_size_bytes();
-    let repositories =
-        bootstrap::repositories(&config.repository, auth_cache, &config.global).await?;
+    if matches!(config.registry_storage, RegistryStorageConfig::Inherit)
+        && matches!(config.blob_store, BlobStoreConfig::S3(_))
+    {
+        info!("Auto-configuring S3 metadata-store from blob-store");
+    }
+    let StoreContext {
+        blob_store: blob_backend,
+        metadata_store,
+        repositories,
+    } = bootstrap::build_context(config, auth_cache).await?;
 
     let event_dispatcher = EventDispatcher::from_config(config)?;
 
@@ -188,11 +166,11 @@ pub async fn build_registry(
     let (job_store, depth_refresh, in_process_loops) =
         if let Some(jq_config) = &config.global.job_queue {
             let claim_mode = ensure_claim_support(&metadata_store).await?;
-            let job_store: Arc<JobStore> = Arc::new(JobStore::with_retry_policy(
+            let job_store = Arc::new(JobStore::with_retry_policy(
                 &metadata_store,
                 "server",
                 claim_mode,
-                jq_config.retry_policy(),
+                jq_config,
             ));
             let refresh = QueueDepthRefresh {
                 store: job_store.clone(),
@@ -202,7 +180,7 @@ pub async fn build_registry(
             (job_store, Some(refresh), InProcessLoops::default())
         } else {
             // Atomic mode: in-process draining runs no startup probe to pick one.
-            let job_store: Arc<JobStore> = Arc::new(JobStore::new(
+            let job_store = Arc::new(JobStore::new(
                 &metadata_store,
                 "in-process",
                 ClaimMode::Atomic,
@@ -213,12 +191,7 @@ pub async fn build_registry(
                 &blob_backend,
                 &metadata_store,
                 event_dispatcher.clone(),
-                &LoopCounts {
-                    cache: config.global.max_concurrent_cache_jobs,
-                    replication: config.global.max_concurrent_replication_jobs,
-                    index: config.global.max_concurrent_index_jobs,
-                },
-                config.global.index_limits(),
+                &config.global,
             );
             (job_store, None, loops)
         };
@@ -226,8 +199,8 @@ pub async fn build_registry(
     let registry_config = RegistryConfig {
         update_pull_time: config.global.update_pull_time,
         redirect: config.global.redirect,
-        max_manifest_size_bytes,
-        max_blob_size_bytes: config.global.max_blob_size_bytes(),
+        max_manifest_size_bytes: config.global.max_manifest_size_bytes(),
+        max_blob_size_bytes: config.global.max_blob_size.as_u64(),
         blob_stream_frame_size: config.global.blob_stream_frame_size_bytes(),
         validate_manifest_references: !config.global.allow_missing_manifest_references,
         global_immutable_tags: config.global.immutable_tags,
@@ -236,29 +209,27 @@ pub async fn build_registry(
         revision_cache_entries: config.global.revision_cache_entries,
         namespace_counts: config.global.namespace_counts,
         event_dispatcher,
-        ..RegistryConfig::new(job_store)
+        ..RegistryConfig::new(job_store.clone())
     };
-    let job_store = registry_config.job_queue.clone();
-    let (blob_store_for_scan, metadata_store_for_scan) =
-        (blob_backend.clone(), metadata_store.clone());
-    let registry = Registry::new(blob_backend, metadata_store, repositories, registry_config);
+    let registry = Registry::new(
+        blob_backend.clone(),
+        metadata_store.clone(),
+        repositories,
+        registry_config,
+    );
     // The scan handler pushes reports through the registry, so its loops can
     // only start once the registry exists.
     if let Some(scan) = &config.global.scan
         && config.global.job_queue.is_none()
     {
-        let handler: Arc<dyn JobHandler> = Arc::new(
-            ScanJobHandler::new(
-                registry.clone(),
-                blob_store_for_scan,
-                metadata_store_for_scan,
-                scan,
-            )
-            .map_err(Error::from)?,
-        );
         in_process_loops.spawn(
             &job_store,
-            &handler,
+            Arc::new(ScanJobHandler::new(
+                registry.clone(),
+                blob_backend,
+                metadata_store,
+                scan,
+            )?),
             Queue::Scan,
             config.global.max_concurrent_scan_jobs,
         );
@@ -282,14 +253,11 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use angos_oci::header::DOCKER_CONTENT_DIGEST;
-    use angos_oci::{Digest, Namespace, Tag};
+    use angos_oci::{Namespace, Tag};
     use angos_oci_client::RegistryClient;
 
-    use super::{InProcessLoops, LoopCounts, spawn_in_process_loops};
-    use crate::configuration::global::{
-        DEFAULT_MAX_CONCURRENT_CACHE_JOBS, DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-        DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS, GlobalConfig,
-    };
+    use super::{InProcessLoops, spawn_in_process_loops};
+    use crate::configuration::GlobalConfig;
     use crate::jobs::Queue;
     use crate::jobs::store::{ClaimMode, JobEnvelope, JobStore};
     use crate::metrics_provider::initialize_metrics;
@@ -302,6 +270,7 @@ mod tests {
     };
     use crate::registry::{Registry, RegistryConfig, Repository};
     use crate::replication::REPLICATION_PUSH_MANIFEST_KIND;
+    use crate::test_fixtures::mocks::mount_blob_upload_accepted;
 
     const NAMESPACE: &str = "nginx";
     const REPO: &str = "nginx";
@@ -336,12 +305,7 @@ mod tests {
             &blob_store,
             &metadata_store,
             None,
-            &LoopCounts {
-                cache: DEFAULT_MAX_CONCURRENT_CACHE_JOBS,
-                replication: DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS,
-                index: DEFAULT_MAX_CONCURRENT_INDEX_JOBS,
-            },
-            GlobalConfig::default().index_limits(),
+            &GlobalConfig::default(),
         );
         let registry = Registry::new(
             blob_store.clone(),
@@ -359,44 +323,6 @@ mod tests {
         }
     }
 
-    /// Mounts a downstream that lacks `blobs` and accepts their upload, then the
-    /// manifest push under tag `v1`.
-    async fn mount_push_downstream(
-        mock_server: &MockServer,
-        manifest_digest: &Digest,
-        blobs: [&Digest; 2],
-    ) {
-        for blob in blobs {
-            Mock::given(method("HEAD"))
-                .and(path(format!("/v2/{NAMESPACE}/blobs/{blob}")))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(mock_server)
-                .await;
-        }
-        Mock::given(method("POST"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/")))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .insert_header("Location", format!("/v2/{NAMESPACE}/blobs/uploads/s1")),
-            )
-            .mount(mock_server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/blobs/uploads/s1")))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(mock_server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
-            )
-            .expect(1..)
-            .mount(mock_server)
-            .await;
-    }
-
     /// The drained job runs the whole push pipeline (HEAD before PUT for each
     /// blob, then the manifest) against a wiremock downstream.
     #[tokio::test]
@@ -409,14 +335,18 @@ mod tests {
         let (manifest_digest, config_digest, layer_digest) =
             seed_manifest(&stack.blob_store, &stack.metadata_store, &namespace).await;
 
-        mount_push_downstream(
-            &mock_server,
-            &manifest_digest,
-            [&config_digest, &layer_digest],
-        )
-        .await;
+        mount_blob_upload_accepted(&mock_server, NAMESPACE, &[&config_digest, &layer_digest]).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{NAMESPACE}/manifests/v1")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(DOCKER_CONTENT_DIGEST, manifest_digest.to_string().as_str()),
+            )
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
 
-        let repository = stack.registry.repository_for_namespace(&namespace).ok();
+        let repository = stack.registry.repository_for_namespace(&namespace);
         let tag = Tag::new("v1").unwrap();
         stack
             .registry

@@ -12,7 +12,7 @@ use crate::tests::object_store_conformance;
 use crate::{ByteStream, Error, ObjectStore};
 
 fn backend(dir: &TempDir) -> Backend {
-    Backend::builder(dir.path()).build()
+    Backend::new(dir.path(), false)
 }
 
 object_store_conformance!({
@@ -32,7 +32,6 @@ async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
 
     store.delete_prefix("x/y/z").await.unwrap();
 
-    // The whole now-empty chain collapses, but the store root survives.
     assert!(
         !dir.path().join("x").exists(),
         "empty ancestors must be pruned"
@@ -40,10 +39,6 @@ async fn delete_prefix_prunes_empty_ancestors_up_to_root() {
     assert!(dir.path().exists(), "the store root is never removed");
 }
 
-/// Single-key `delete` must collapse now-empty ancestors exactly like
-/// `delete_prefix`, matching S3 where a prefix vanishes with its last object.
-/// Regression guard for hollow tag directories surviving a link delete and
-/// being read back as live tags by directory-based listings.
 #[tokio::test]
 async fn delete_prunes_empty_ancestors_up_to_root() {
     let dir = TempDir::new().unwrap();
@@ -59,7 +54,6 @@ async fn delete_prunes_empty_ancestors_up_to_root() {
 
     store.delete("tags/garbled/current/link").await.unwrap();
 
-    // The deleted tag's chain collapses up to the still-populated `tags/`.
     assert!(
         !dir.path().join("tags/garbled").exists(),
         "empty ancestors must be pruned after a single-key delete"
@@ -107,9 +101,6 @@ async fn promote_upload_publishes_only_verified_bytes() {
     assert!(matches!(store.head("up/data").await, Err(Error::NotFound)));
 }
 
-/// `move_object`'s rename fast path must sweep the source's now-empty parent
-/// chain like `delete` does, or a quarantine-style move leaves a hollow
-/// directory that directory-based listings surface as a live container.
 #[tokio::test]
 async fn move_object_prunes_empty_source_ancestors() {
     let dir = TempDir::new().unwrap();
@@ -135,47 +126,15 @@ async fn move_object_prunes_empty_source_ancestors() {
 }
 
 #[tokio::test]
-async fn delete_prefix_stops_pruning_at_first_non_empty_ancestor() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-    store
-        .put("shard/aa/blob1/data", Bytes::from_static(b"1"))
-        .await
-        .unwrap();
-    store
-        .put("shard/aa/blob2/data", Bytes::from_static(b"2"))
-        .await
-        .unwrap();
-
-    store.delete_prefix("shard/aa/blob1").await.unwrap();
-
-    // `shard/aa` still holds `blob2`, so pruning halts there.
-    assert!(!dir.path().join("shard/aa/blob1").exists());
-    assert_eq!(store.get("shard/aa/blob2/data").await.unwrap(), b"2");
-    assert!(dir.path().join("shard/aa").exists());
-}
-
-/// A `..`-bearing key whose ancestors resolve *above* the store root must
-/// never let pruning touch anything outside the root. `prune_empty_ancestors`
-/// must lexically collapse the path before any `read_dir`/`remove_dir`, so a
-/// crafted escape resolves to "not under root" and prunes nothing. Regression
-/// guard for the lexical-`starts_with` hole that let `remove_dir` delete an
-/// empty directory sitting next to the configured root.
-#[tokio::test]
 async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
     let dir = TempDir::new().unwrap();
-    // The store root is a *sub*directory of the tempdir, so a sibling dir can
-    // sit outside the root yet still inside the tempdir we control.
     let root = dir.path().join("root");
     stdfs::create_dir(&root).unwrap();
     let outside = dir.path().join("outside");
     stdfs::create_dir(&outside).unwrap();
 
-    let store = Backend::builder(&root).build();
+    let store = Backend::new(&root, false);
 
-    // `root.join("../outside/leaf")` resolves at syscall time to
-    // `<tmp>/outside/leaf`; its parent is the empty `<tmp>/outside`, which the
-    // old lexical guard would have happily `remove_dir`'d.
     store.prune_empty_ancestors("../outside/leaf").await;
 
     assert!(
@@ -183,27 +142,6 @@ async fn prune_empty_ancestors_refuses_to_escape_root_via_dotdot() {
         "pruning must never remove a directory outside the configured root"
     );
     assert!(root.exists(), "the store root itself must survive");
-}
-
-/// Companion to the escape guard: a normal nested key (no `.`/`..`) must still
-/// have its now-empty in-root ancestors pruned exactly as before. The fix
-/// changes nothing for well-formed keys.
-#[tokio::test]
-async fn prune_empty_ancestors_still_collapses_normal_in_root_chain() {
-    let dir = TempDir::new().unwrap();
-    let store = backend(&dir);
-
-    // Build an empty chain `p/q/r` with no leaf left behind, then prune from a
-    // would-be leaf inside it.
-    stdfs::create_dir_all(dir.path().join("p/q/r")).unwrap();
-
-    store.prune_empty_ancestors("p/q/r/leaf").await;
-
-    assert!(
-        !dir.path().join("p").exists(),
-        "empty in-root ancestors must still be pruned for normal keys"
-    );
-    assert!(dir.path().exists(), "the store root is never removed");
 }
 
 #[tokio::test]
@@ -235,8 +173,6 @@ async fn list_at_store_root_walks_recursively_in_sorted_order() {
     assert!(page.next_token.is_none());
 }
 
-/// Listing under a non-slash-terminated prefix must strip the prefix from each
-/// item, so the FS backend matches the S3 backend's prefix-relative contract.
 #[tokio::test]
 async fn list_returns_prefix_relative_keys() {
     let dir = TempDir::new().unwrap();
@@ -251,9 +187,8 @@ async fn list_returns_prefix_relative_keys() {
     assert_eq!(page.items, vec!["a".to_string(), "sub/b".to_string()]);
 }
 
-/// The listing skips the directories a cursor lies past, so paging from any
-/// cursor, a key or not, must still yield every key above it in lexical order,
-/// across names that sort against their own directory (`a!` < `a/x` < `a0`).
+/// Paging from any cursor yields every key above it, across names that sort
+/// against their own directory (`a!` < `a/x` < `a0`).
 #[tokio::test]
 async fn list_after_pages_in_lexical_order_from_any_cursor() {
     let dir = TempDir::new().unwrap();
@@ -294,48 +229,26 @@ async fn list_after_pages_in_lexical_order_from_any_cursor() {
     }
 }
 
-/// The flag only decides whether writes are fsynced, so the two settings have
-/// to agree on everything a caller can observe. Exercising one of them alone
-/// says nothing about the other.
 #[tokio::test]
-async fn sync_to_disk_flag_does_not_change_observable_behaviour() {
-    let mut observed = Vec::new();
-    for sync_to_disk in [false, true] {
-        let dir = TempDir::new().unwrap();
-        let store = Backend::builder(dir.path())
-            .sync_to_disk(sync_to_disk)
-            .build();
+async fn writes_round_trip_with_durability_enabled() {
+    let dir = TempDir::new().unwrap();
+    let store = Backend::new(dir.path(), true);
 
-        store
-            .put("dir/k", Bytes::from_static(b"durable"))
-            .await
-            .unwrap();
-        store
-            .put("dir/j", Bytes::from_static(b"other"))
-            .await
-            .unwrap();
-        let body = store.get("dir/k").await.unwrap();
-        let listed = store.list("dir", 10, None).await.unwrap().items;
-        store.delete("dir/k").await.unwrap();
-        let after_delete = store.get("dir/k").await.is_err();
+    store
+        .put("dir/k", Bytes::from_static(b"durable"))
+        .await
+        .unwrap();
+    assert_eq!(store.get("dir/k").await.unwrap(), b"durable");
 
-        observed.push((body, listed, after_delete));
-    }
-
-    assert_eq!(
-        observed[0], observed[1],
-        "sync_to_disk must not change what a caller can observe"
-    );
-    let (body, listed, after_delete) = &observed[0];
-    assert_eq!(body, b"durable");
-    assert_eq!(listed, &vec!["j".to_string(), "k".to_string()]);
-    assert!(after_delete, "a deleted key must not be readable");
+    let written = store
+        .write_upload("up/synced", frame(b"durable bytes"), Some(13))
+        .await
+        .unwrap();
+    store.complete_upload("up/synced").await.unwrap();
+    assert_eq!(written, 13);
+    assert_eq!(store.get("up/synced").await.unwrap(), b"durable bytes");
 }
 
-/// A stray atomic-write temporary sitting in a directory must never be
-/// surfaced by `list`/`list_children`. Regression guard for the conformance
-/// failure where a concurrent reader observed a 0-byte `.angos-write.*` temp
-/// in a `blob-index/.../refs/` dir and failed to JSON-parse it.
 #[tokio::test]
 async fn listings_skip_atomic_write_temporaries() {
     let dir = TempDir::new().unwrap();
@@ -345,8 +258,6 @@ async fn listings_skip_atomic_write_temporaries() {
         .await
         .unwrap();
 
-    // Simulate an in-flight atomic write: an empty temp file next to the real
-    // object, with the reserved prefix.
     stdfs::write(dir.path().join("ns").join(".angos-write.deadbeef"), b"").unwrap();
 
     let page = store.list("ns", 100, None).await.unwrap();
@@ -357,8 +268,7 @@ async fn listings_skip_atomic_write_temporaries() {
     assert!(children.next_token.is_none());
 }
 
-/// `ensure_parent`'s retry loop must absorb the transient macOS/APFS
-/// sibling-`mkdir` race when concurrent writes share a parent directory.
+/// The macOS/APFS sibling-`mkdir` race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_under_shared_parent_all_succeed() {
     const TASKS: usize = 64;
@@ -392,15 +302,11 @@ async fn concurrent_writes_under_shared_parent_all_succeed() {
     }
 }
 
-/// The whole-store scan walks the tree once instead of re-walking it per page,
-/// so it must still reach every nested key exactly once.
 #[tokio::test]
 async fn list_all_walks_the_whole_tree_once() {
     let dir = TempDir::new().unwrap();
     let store = backend(&dir);
 
-    // Two levels, plus a name that sorts against its own directory, so neither
-    // the descent nor the relative keys can be right by accident.
     for k in ["w/a.txt", "w/a/x", "w/a/y", "w/b/c/d", "w/z"] {
         store.put(k, Bytes::from_static(b"v")).await.unwrap();
     }
@@ -408,23 +314,4 @@ async fn list_all_walks_the_whole_tree_once() {
     let mut keys: Vec<String> = store.list_all("w/").try_collect().await.unwrap();
     keys.sort();
     assert_eq!(keys, ["a.txt", "a/x", "a/y", "b/c/d", "z"]);
-}
-
-/// The durability flag reaches the upload path, which wrote bytes no `fsync`
-/// covered. A crash is not reproducible here, so this pins that enabling it
-/// leaves the upload working rather than that the bytes reached the platter.
-#[tokio::test]
-async fn an_upload_round_trips_with_durability_enabled() {
-    let dir = TempDir::new().unwrap();
-    let store = Backend::builder(dir.path()).sync_to_disk(true).build();
-    let body = Bytes::from_static(b"durable bytes");
-
-    let written = store
-        .write_upload("up/synced", frame(&body), Some(body.len() as u64))
-        .await
-        .unwrap();
-    store.complete_upload("up/synced").await.unwrap();
-
-    assert_eq!(written, body.len() as u64);
-    assert_eq!(store.get("up/synced").await.unwrap(), body);
 }

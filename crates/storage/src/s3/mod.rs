@@ -1,45 +1,7 @@
-//! S3-backed implementations of every capability trait.
-//!
-//! Wraps [`angos_s3_client::Backend`] so consumers get the storage abstraction
-//! without depending on the HTTP/S3 layer directly. The wrapper translates
-//! `s3_client::Error` and `io::Error` into [`crate::Error`], adapts S3's
-//! flat/delimited listing modes to [`crate::Page`] /
-//! [`crate::ChildrenPage`], and forwards every presign operation through
-//! unchanged.
-//!
-//! The [`ObjectStore`] upload methods layer the keyed, append-only upload
-//! primitive on top of the S3 multipart protocol. They are *keyless*: every
-//! call recovers the upload's state (the in-flight upload id, the committed
-//! parts, the staged sub-part remainder) from S3 itself, so nothing has to be
-//! persisted by the caller between calls.
-//!
-//! - `write_upload` recovers the upload id (searching `ListMultipartUploads`
-//!   for `key`) and the committed parts (`ListParts`) to compute the next part
-//!   number and the committed byte offset, reads the staged remainder at that
-//!   offset ahead of the incoming stream, and emits `UploadPart`s of
-//!   up to `part_size` bytes (uniform mode) or one `UploadPart` of all
-//!   available bytes once they meet `part_size` (non-uniform mode). The new
-//!   remainder is restaged at the new offset and the superseded staged object
-//!   deleted. Returns the new total size (`sum(parts) + remainder`).
-//! - `complete_upload` recovers the same state, then: with no upload id and no
-//!   remainder it `PutObject(empty)`s `key`; with no upload id but a remainder
-//!   it `PutObject`s the staged remainder at `key`; otherwise it flushes the
-//!   final remainder as the last part and `CompleteMultipartUpload`s, then
-//!   cleans up the staged objects.
-//! - `abort_upload` searches every in-flight multipart upload at `key` and
-//!   aborts each, then deletes any staged remainder under the key's staging
-//!   container. Idempotent.
-//!
-//! The staged remainder lives at a `staged/<offset>` child of the upload key's
-//! container, derived from `key` alone by replacing the key's final path
-//! segment with `staged/<offset>` (so `.../<uuid>/data` stages at
-//! `.../<uuid>/staged/<offset>`), matching the historical layout.
-//!
-//! The known-length path streams bodies frame-by-frame via an mpsc channel
-//! handed to `upload_part_streaming`, so no whole part sits in process memory.
-//! The unknown-length (chunked) path drains the body to EOF, flushing a
-//! `part_size` `UploadPart` each time `part_size` bytes accumulate and staging
-//! the sub-`part_size` remainder, buffering up to `part_size` at a time.
+//! S3 [`ObjectStore`] and [`PresignedStore`]. An upload is an S3 multipart
+//! upload whose state (upload id, committed parts) is recovered from S3 on
+//! every call. Bytes short of a part are staged at `staged/<offset>` beside
+//! the upload key, `offset` being the bytes committed to parts.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -55,32 +17,22 @@ use tokio::sync::mpsc;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::object::dir_prefix;
 use crate::{
     BoxedReader, ByteStream, Children, ChildrenPage, Error, KeyStream, MultipartUploadPage,
-    ObjectMeta, ObjectStore, Page, PendingMultipartUpload, PresignedStore, channel_stream,
+    ObjectMeta, ObjectStore, Page, PendingMultipartUpload, PresignedStore,
 };
 
 mod range_scan;
 
-const DEFAULT_PART_SIZE: u64 = 5 * 1024 * 1024;
-
-/// Default concurrent range chains a truncated children/flat scan fans out to.
 pub const DEFAULT_RANGE_CONCURRENCY: usize = 16;
 
 const FRAME_SIZE: usize = 1024 * 1024;
 const FRAME_BUFFER_CAPACITY: usize = 8;
-/// S3 protocol floor for non-final multipart parts: a part must be at least
-/// 5 MiB before it can be flushed as an `UploadPart`.
+/// S3's floor for a non-final part.
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
-/// S3 protocol ceiling for a single part.
 const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
-/// S3 protocol ceiling on the parts one multipart upload may hold.
 const MAX_PARTS: usize = 10_000;
 
-/// Builder for [`Backend`]. The S3 HTTP client is required and supplied to
-/// [`Backend::builder`]; `part_size` and `uniform_parts` are optional fluent
-/// setters.
 pub struct Builder {
     client: Arc<S3Backend>,
     part_size: u64,
@@ -89,36 +41,32 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// Max concurrent range chains a truncated whole-directory or whole-store
-    /// scan fans out to. Defaults to [`DEFAULT_RANGE_CONCURRENCY`].
+    /// Concurrent range chains a truncated whole-directory or whole-store scan
+    /// fans out to.
     #[must_use]
     pub fn range_concurrency(mut self, concurrency: usize) -> Self {
         self.range_concurrency = concurrency.max(1);
         self
     }
 
-    /// Target part size for upload sessions (uniform mode) or minimum part
-    /// size before flushing (non-uniform mode). Defaults to 5 MiB, the
-    /// S3 minimum, and is raised to it: a smaller non-final part is rejected
-    /// at `CompleteMultipartUpload`, long after the bytes were written.
+    /// Part size (uniform mode) or flush threshold (non-uniform mode), raised to
+    /// the S3 floor: a smaller part is only rejected at
+    /// `CompleteMultipartUpload`, long after the bytes were written.
     #[must_use]
     pub fn part_size(mut self, size: u64) -> Self {
         self.part_size = size.max(MIN_PART_SIZE);
         self
     }
 
-    /// `true` = uniform mode: each `write_upload` call emits as many parts
-    /// of exactly `part_size` bytes as fit, restaging the remainder.
-    /// `false` = non-uniform mode: each call emits at most one part of the
-    /// full available size, flushing only once the combined pending +
-    /// incoming bytes meet `part_size`. Defaults to non-uniform.
+    /// Uniform mode emits parts of exactly `part_size`; non-uniform mode emits
+    /// one part of everything available once it reaches `part_size`. Only a
+    /// known-length write tells them apart.
     #[must_use]
     pub fn uniform_parts(mut self, on: bool) -> Self {
         self.uniform_parts = on;
         self
     }
 
-    /// Consume the builder and produce the [`Backend`].
     #[must_use]
     pub fn build(self) -> Backend {
         Backend {
@@ -130,7 +78,6 @@ impl Builder {
     }
 }
 
-/// S3 [`ObjectStore`] (+ upload, presign) implementation.
 #[derive(Clone, Debug)]
 pub struct Backend {
     client: Arc<S3Backend>,
@@ -140,22 +87,17 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Return a builder wrapping the underlying S3 HTTP `client` (construct it
-    /// with `angos_s3_client::Backend::new(&config)`). Other settings are
-    /// optional fluent setters on the returned builder.
     #[must_use]
     pub fn builder(client: Arc<S3Backend>) -> Builder {
         Builder {
             client,
-            part_size: DEFAULT_PART_SIZE,
+            part_size: MIN_PART_SIZE,
             uniform_parts: false,
             range_concurrency: DEFAULT_RANGE_CONCURRENCY,
         }
     }
 
-    /// Recover an upload's in-flight state from S3: the open multipart upload id
-    /// (if any) and the list of committed parts. State is read fresh on every
-    /// call; nothing is persisted by the caller.
+    /// The open multipart upload id, if any, and its committed parts.
     async fn recover_upload(
         &self,
         key: &str,
@@ -168,19 +110,13 @@ impl Backend {
         Ok((upload_id, parts))
     }
 
-    /// Search the in-flight multipart uploads for the one whose key is exactly
-    /// `key`, paging through `ListMultipartUploads` until found or exhausted.
     async fn search_upload_id(&self, key: &str) -> Result<Option<String>, Error> {
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
         loop {
             let listing = self
                 .client
-                .list_multipart_uploads(
-                    Some(key),
-                    key_marker.as_deref(),
-                    upload_id_marker.as_deref(),
-                )
+                .list_multipart_uploads(key, key_marker.as_deref(), upload_id_marker.as_deref())
                 .await?;
             for upload in listing.uploads {
                 if upload.key == key {
@@ -195,57 +131,17 @@ impl Backend {
         }
     }
 
-    /// HEAD the staged remainder at `offset` for its size, returning 0 when no
-    /// staged object exists there.
+    /// The size of the remainder staged at `offset`, 0 when there is none.
     async fn staged_size(&self, key: &str, offset: u64) -> Result<u64, Error> {
-        match self.client.object_size(&staged_key(key, offset)).await {
-            Ok(size) => Ok(size),
+        match self.client.head_object(&staged_key(key, offset)).await {
+            Ok(head) => Ok(head.size),
             Err(S3Error::NotFound(_)) => Ok(0),
-            Err(e) => Err(Error::Backend(e.to_string())),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Abort every in-flight multipart upload whose key is exactly `key`,
-    /// looping until a listing turns up nothing new so the sweep is bounded
-    /// under S3's eventually-consistent listing. Does not touch staged objects.
-    async fn abort_multiparts_at(&self, key: &str) -> Result<(), Error> {
-        let mut aborted: HashSet<String> = HashSet::new();
-        loop {
-            let listing = self
-                .client
-                .list_multipart_uploads(Some(key), None, None)
-                .await?;
-            let pending: Vec<_> = listing
-                .uploads
-                .into_iter()
-                .filter(|u| u.key == key && !aborted.contains(&u.upload_id))
-                .collect();
-            if pending.is_empty() {
-                break;
-            }
-            for u in pending {
-                // A peer that aborted the same upload between the listing and
-                // this call leaves nothing to abort, which is success here.
-                match self
-                    .client
-                    .abort_multipart_upload(&u.key, &u.upload_id)
-                    .await
-                {
-                    Ok(()) | Err(S3Error::NotFound(_)) => {}
-                    Err(e) => return Err(Error::from(e)),
-                }
-                aborted.insert(u.upload_id);
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit whole multipart parts from `reader` for a known-length append of
-    /// `available` bytes, returning the trailing sub-part remainder. Uniform
-    /// mode flushes `part_size` parts; non-uniform mode flushes everything as
-    /// one part once `available` reaches the operator-configured `part_size`,
-    /// splitting only to stay under the per-part ceiling. See
-    /// [`plan_known_length_parts`].
+    /// Streams the parts of a known-length append of `available` bytes from
+    /// `reader`, returning the remainder to restage.
     async fn emit_known_length_parts<R>(
         &self,
         key: &str,
@@ -265,8 +161,6 @@ impl Backend {
 
         for _ in 0..count {
             let part_number = next_part_number(parts)?;
-            // Open the multipart lazily, only when a part actually needs
-            // flushing.
             let id = ensure_upload_id(&self.client, upload_id, key).await?;
             let etag = stream_part(&self.client, key, &id, part_number, emit_size, reader).await?;
             parts.push(UploadedPart {
@@ -283,7 +177,7 @@ impl Backend {
             .take(restaged)
             .read_to_end(&mut remainder)
             .await?;
-        let actual = u64::try_from(remainder.len()).map_err(|e| Error::Backend(e.to_string()))?;
+        let actual = remainder.len() as u64;
         if actual != restaged {
             return Err(Error::Backend(format!(
                 "short read while restaging: expected {restaged}, got {actual}",
@@ -292,11 +186,9 @@ impl Backend {
         Ok(remainder)
     }
 
-    /// Drain `reader` to EOF for an unknown-length append (a chunked request
-    /// with no `Content-Length`), flushing a `part_size` part each time one
-    /// accumulates and returning the trailing short read as the remainder.
-    /// Non-final parts thus match the known-length uniform path, so a
-    /// mixed-mode session stays uniform.
+    /// Drains `reader` to EOF, flushing a `part_size` part each time one
+    /// accumulates, so a mixed-mode session stays uniform. Returns the short
+    /// tail as the remainder.
     async fn drain_chunked_parts<R>(
         &self,
         key: &str,
@@ -307,30 +199,42 @@ impl Backend {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let flush_size = self.part_size;
-        let cap = usize::try_from(flush_size).map_err(|e| Error::Backend(e.to_string()))?;
+        let cap = usize::try_from(self.part_size).map_err(|e| Error::Backend(e.to_string()))?;
         loop {
             let mut buf = Vec::with_capacity(cap);
             (&mut *reader)
-                .take(flush_size)
+                .take(self.part_size)
                 .read_to_end(&mut buf)
                 .await?;
-            if (buf.len() as u64) < flush_size {
+            if (buf.len() as u64) < self.part_size {
                 return Ok(buf);
             }
-            let part_number = next_part_number(parts)?;
             let id = ensure_upload_id(&self.client, upload_id, key).await?;
-            let body: ByteStream = Box::pin(stream::once(async move { Ok(Bytes::from(buf)) }));
-            let etag = self
-                .client
-                .upload_part_streaming(key, &id, part_number, flush_size, body)
-                .await?;
-            parts.push(UploadedPart {
-                part_number,
-                e_tag: etag,
-                size: flush_size,
-            });
+            self.upload_buffered_part(key, &id, parts, buf).await?;
         }
+    }
+
+    /// Uploads `data` as the next part.
+    async fn upload_buffered_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &mut Vec<UploadedPart>,
+        data: Vec<u8>,
+    ) -> Result<(), Error> {
+        let part_number = next_part_number(parts)?;
+        let size = data.len() as u64;
+        let body: ByteStream = Box::pin(stream::once(async move { Ok(Bytes::from(data)) }));
+        let e_tag = self
+            .client
+            .upload_part_streaming(key, upload_id, part_number, size, body)
+            .await?;
+        parts.push(UploadedPart {
+            part_number,
+            e_tag,
+            size,
+        });
+        Ok(())
     }
 }
 
@@ -346,8 +250,7 @@ impl ObjectStore for Backend {
         offset: Option<u64>,
     ) -> Result<(BoxedReader, u64), Error> {
         let result = self.client.get_object(key, offset).await?;
-        // S3 returns the content-length of the (possibly ranged) response;
-        // the trait contract requires the **total** object size.
+        // S3 reports the ranged length; the contract wants the total.
         let total = result.content_length + offset.unwrap_or(0);
         Ok((result.body, total))
     }
@@ -366,20 +269,16 @@ impl ObjectStore for Backend {
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
-        // S3 DELETE on a missing key returns 204, mapped to Ok by the client.
         Ok(self.client.delete_object(key).await?)
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), Error> {
-        // Normalise to a directory boundary (see `dir_prefix`) so the underlying
-        // raw list-prefix delete cannot wipe keys that merely share a string
-        // prefix (e.g. "tags/v1" must not delete "tags/v1-rc/..."). An empty
-        // prefix is a no-op: it must not delete every object under the bucket.
-        let effective_prefix = dir_prefix(prefix);
-        if effective_prefix.is_empty() {
+        if prefix.is_empty() {
             return Ok(());
         }
-        Ok(self.client.delete_prefix(effective_prefix.as_ref()).await?)
+        // The raw delete is a string prefix: `tags/v1` would take `tags/v1-rc`.
+        let directory = format!("{}/", prefix.strip_suffix('/').unwrap_or(prefix));
+        Ok(self.client.delete_prefix(&directory).await?)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, Error> {
@@ -421,24 +320,27 @@ impl ObjectStore for Backend {
         // express "after this child name": a directory child's own keys sort
         // after the bare name, and a sibling like `v1.2` sorts before `v1/`.
         // So bound on the bare name and drop what the contract excludes.
-        let listing = self
+        let mut listing = self
             .client
-            .list_prefixes(prefix, "/", n, token, start_after.clone())
+            .list_prefixes(prefix, n, token, start_after.clone())
             .await?;
-        let after = start_after.as_deref();
+        if let Some(after) = start_after.as_deref() {
+            listing.prefixes.retain(|name| name.as_str() > after);
+            listing.objects.retain(|name| name.as_str() > after);
+        }
         Ok(ChildrenPage {
-            sub_prefixes: children_after(listing.prefixes, after),
-            objects: children_after(listing.objects, after),
+            sub_prefixes: listing.prefixes,
+            objects: listing.objects,
             next_token: listing.next_token,
         })
     }
 
     async fn list_all_children(&self, prefix: &str) -> Result<Children, Error> {
-        range_scan::scan_all_children(&self.client, prefix, self.range_concurrency).await
+        range_scan::scan_all_children(self, prefix, self.range_concurrency).await
     }
 
     fn list_all<'a>(&'a self, prefix: &'a str) -> KeyStream<'a> {
-        range_scan::scan_all_keys(&self.client, prefix, self.range_concurrency)
+        range_scan::scan_all_keys(self, prefix, self.range_concurrency)
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<u64, Error> {
@@ -451,34 +353,22 @@ impl ObjectStore for Backend {
         body: ByteStream,
         len: Option<u64>,
     ) -> Result<u64, Error> {
-        // Concurrent writes to a single upload session are unsupported: each call
-        // recovers the same committed offset from S3 (the keyless model), so two
-        // in-flight writes would race the staged remainder and the caller's hash
-        // state alike.
-        //
-        // Recover the in-flight state from S3: the upload id (if a multipart is
-        // already open), the committed parts, and from them the committed byte
-        // offset and the next part number.
+        // Concurrent writes to one upload are unsupported: both would recover
+        // the same offset and race the staged remainder.
         let (mut upload_id, mut parts) = self.recover_upload(key).await?;
         let committed_size = parts.iter().map(|p| p.size).sum::<u64>();
 
         if len == Some(0) {
-            // Nothing to append; total is whatever is already committed plus the
-            // staged remainder at the committed offset.
             let staged_len = self.staged_size(key, committed_size).await?;
             return committed_size
                 .checked_add(staged_len)
                 .ok_or_else(|| Error::Backend("upload size overflow".to_string()));
         }
 
-        // The current remainder (if any) sits at `staged/<committed_size>`,
-        // streamed ahead of the incoming body; its GET reports its length.
         let read_key = staged_key(key, committed_size);
         let (staged, staged_len) = staged_stream(&self.client, &read_key).await?;
         let mut reader = StreamReader::new(staged.chain(body));
 
-        // Emit whole multipart parts; the remainder is the trailing sub-part
-        // bytes to restage at the new committed offset.
         let remainder = match len {
             Some(len) => {
                 let remainder = self
@@ -490,9 +380,7 @@ impl ObjectStore for Backend {
                         staged_len + len,
                     )
                     .await?;
-                // `len` is exact, so anything still readable is a longer body
-                // than declared: reject it rather than silently truncate, as
-                // the other backends do.
+                // A body longer than declared is refused, not truncated.
                 let mut beyond = [0u8; 1];
                 if reader.read(&mut beyond).await? > 0 {
                     return Err(Error::Backend(format!(
@@ -507,11 +395,9 @@ impl ObjectStore for Backend {
             }
         };
 
-        // The new remainder is staged at the new committed offset; the previous
-        // staged file (at `committed_size`) is removed once superseded, so at
-        // most one staged file exists per upload.
+        // At most one staged object survives per upload.
         let new_committed = parts.iter().map(|p| p.size).sum::<u64>();
-        let restaged = u64::try_from(remainder.len()).map_err(|e| Error::Backend(e.to_string()))?;
+        let restaged = remainder.len() as u64;
         if restaged > 0 {
             let write_key = staged_key(key, new_committed);
             self.client
@@ -533,46 +419,28 @@ impl ObjectStore for Backend {
         let (upload_id, mut parts) = self.recover_upload(key).await?;
         let committed_size = parts.iter().map(|p| p.size).sum::<u64>();
 
-        // The final remainder sits at the committed offset.
         let read_key = staged_key(key, committed_size);
         let staged_len = self.staged_size(key, committed_size).await?;
 
         match (upload_id, staged_len) {
             (None, 0) => match self.head(key).await {
-                // The object is already materialized: a re-run of a completed
-                // session (any upload size lands here once its multipart is
-                // finalized and staging is gone), or a prior zero-byte
-                // completion. No-op, so completing again never overwrites a
-                // finalized object with an empty one.
+                // A re-run of a completed upload must not empty its object.
                 Ok(_) => {}
-                // Genuinely absent: a zero-byte upload, so create the empty object.
                 Err(Error::NotFound) => self.client.put_object(key, Bytes::new()).await?,
                 Err(e) => return Err(e),
             },
             (None, _) => {
-                // Small upload: `PUT` the staged remainder at the canonical key,
-                // as a server-side copy can report success over an empty object.
+                // A `PUT`, as a server-side copy can report success over an
+                // empty object.
                 let data = self.client.read(&read_key).await?;
                 self.client.put_object(key, Bytes::from(data)).await?;
                 let _ = self.client.delete_object(&read_key).await;
             }
             (Some(upload_id), staged) => {
                 if staged > 0 {
-                    let part_number = next_part_number(&parts)?;
                     let data = self.client.read(&read_key).await?;
-                    let part_len =
-                        u64::try_from(data.len()).map_err(|e| Error::Backend(e.to_string()))?;
-                    let body = Bytes::from(data);
-                    let body_stream: ByteStream = Box::pin(stream::once(async move { Ok(body) }));
-                    let etag = self
-                        .client
-                        .upload_part_streaming(key, &upload_id, part_number, part_len, body_stream)
+                    self.upload_buffered_part(key, &upload_id, &mut parts, data)
                         .await?;
-                    parts.push(UploadedPart {
-                        part_number,
-                        e_tag: etag,
-                        size: part_len,
-                    });
                 }
 
                 self.client
@@ -586,9 +454,32 @@ impl ObjectStore for Backend {
     }
 
     async fn abort_upload(&self, key: &str) -> Result<(), Error> {
-        // Abort the main multipart, then delete every staged object under the
-        // key's staging container.
-        self.abort_multiparts_at(key).await?;
+        // Relist until nothing new turns up, which bounds the sweep under an
+        // eventually-consistent listing.
+        let mut aborted: HashSet<String> = HashSet::new();
+        loop {
+            let listing = self.client.list_multipart_uploads(key, None, None).await?;
+            let pending: Vec<_> = listing
+                .uploads
+                .into_iter()
+                .filter(|u| u.key == key && !aborted.contains(&u.upload_id))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for u in pending {
+                // A peer may have aborted it since the listing.
+                match self
+                    .client
+                    .abort_multipart_upload(&u.key, &u.upload_id)
+                    .await
+                {
+                    Ok(()) | Err(S3Error::NotFound(_)) => {}
+                    Err(e) => return Err(Error::from(e)),
+                }
+                aborted.insert(u.upload_id);
+            }
+        }
         let _ = self.client.delete_prefix(&staged_container(key)).await;
         Ok(())
     }
@@ -600,7 +491,7 @@ impl ObjectStore for Backend {
     ) -> Result<MultipartUploadPage, Error> {
         let listing = self
             .client
-            .list_multipart_uploads(None, key_marker, upload_id_marker)
+            .list_multipart_uploads("", key_marker, upload_id_marker)
             .await?;
         Ok(MultipartUploadPage {
             uploads: listing
@@ -630,17 +521,14 @@ impl PresignedStore for Backend {
     }
 }
 
-/// How a known-length append splits: `count` parts of exactly `emit_size` to
-/// flush now, and `restaged` trailing bytes to stage for the next call.
+/// `count` parts of `emit_size` to flush now, `restaged` bytes to stage.
 struct PartPlan {
     count: u64,
     emit_size: u64,
     restaged: u64,
 }
 
-/// Plan a known-length append of `available` bytes. Every emitted size stays
-/// within the S3 part bounds, so a part is never rejected for being too small
-/// or too large.
+/// Every emitted size stays within the S3 part bounds.
 fn plan_known_length_parts(uniform: bool, part_size: u64, available: u64) -> PartPlan {
     if uniform {
         let count = available / part_size;
@@ -650,7 +538,7 @@ fn plan_known_length_parts(uniform: bool, part_size: u64, available: u64) -> Par
             restaged: available - count * part_size,
         };
     }
-    if available < part_size.max(MIN_PART_SIZE) {
+    if available < part_size {
         return PartPlan {
             count: 0,
             emit_size: 0,
@@ -669,18 +557,6 @@ fn plan_known_length_parts(uniform: bool, part_size: u64, available: u64) -> Par
     }
 }
 
-/// Children strictly after `start_after` by bare name, matching the FS
-/// backend.
-fn children_after(names: Vec<String>, start_after: Option<&str>) -> Vec<String> {
-    match start_after {
-        Some(after) => names
-            .into_iter()
-            .filter(|name| name.as_str() > after)
-            .collect(),
-        None => names,
-    }
-}
-
 fn next_part_number(parts: &[UploadedPart]) -> Result<u32, Error> {
     if parts.len() >= MAX_PARTS {
         return Err(Error::Backend(format!(
@@ -690,10 +566,8 @@ fn next_part_number(parts: &[UploadedPart]) -> Result<u32, Error> {
     u32::try_from(parts.len() + 1).map_err(|e| Error::Backend(e.to_string()))
 }
 
-/// The staging container for the upload at `key`: the key's final path segment
-/// (e.g. `data`) replaced with `staged`. So `.../<uuid>/data` stages under
-/// `.../<uuid>/staged`, matching the historical layout. A key with no `/`
-/// stages under a sibling `staged` directory at the store root.
+/// `key` with its last segment replaced by `staged`: `.../<uuid>/data` stages
+/// under `.../<uuid>/staged`.
 fn staged_container(key: &str) -> String {
     match key.rfind('/') {
         Some(idx) => format!("{}/staged", &key[..idx]),
@@ -701,18 +575,12 @@ fn staged_container(key: &str) -> String {
     }
 }
 
-/// Storage key for the sub-part remainder staged at `offset` bytes. `offset` is
-/// the committed byte count (`sum(parts)`) at the moment the remainder is
-/// written, so the next call recomputes the same key for read-back from the
-/// recovered parts list.
 fn staged_key(key: &str, offset: u64) -> String {
     format!("{}/{offset}", staged_container(key))
 }
 
-/// Stream the staged remainder back rather than loading it: the chunked path
-/// already buffers a whole part, and reading this in would double that. The
-/// length comes from the `GET` itself, and is zero when the staged object is
-/// gone, as it is for a session whose previous call left no remainder.
+/// Streamed rather than loaded, as the chunked path already buffers a whole
+/// part. The length is zero when nothing is staged.
 async fn staged_stream(client: &S3Backend, staging: &str) -> Result<(ByteStream, u64), Error> {
     match client.get_object(staging, None).await {
         Ok(staged) => Ok((
@@ -720,7 +588,7 @@ async fn staged_stream(client: &S3Backend, staging: &str) -> Result<(ByteStream,
             staged.content_length,
         )),
         Err(S3Error::NotFound(_)) => Ok((Box::pin(stream::empty()), 0)),
-        Err(e) => Err(Error::Backend(e.to_string())),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -749,7 +617,9 @@ where
     R: AsyncRead + Unpin + Send,
 {
     let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER_CAPACITY);
-    let body = channel_stream(rx);
+    let body: ByteStream = Box::pin(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (Ok(chunk), rx))
+    }));
 
     let upload_handle = AbortOnDropHandle::new(spawn({
         let client = client.clone();
@@ -776,9 +646,7 @@ where
                 "short read for part {part_number}: expected {size}, got {sent}",
             )));
         }
-        sent = sent
-            .checked_add(u64::try_from(n).map_err(|e| Error::Backend(e.to_string()))?)
-            .ok_or_else(|| Error::Backend("part size overflow".to_string()))?;
+        sent += n as u64;
         if tx.send(buf.split().freeze()).await.is_err() {
             return match upload_handle.await {
                 Ok(Ok(_)) => Err(Error::Backend(

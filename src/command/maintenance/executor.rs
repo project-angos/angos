@@ -15,11 +15,11 @@ use crate::command::maintenance::action::{
 use crate::command::maintenance::error::Error;
 use crate::configuration::Configuration;
 use crate::event_webhook::event::EventActor;
+use crate::jobs::Queue;
 use crate::jobs::store::{
     ClaimMode, Error as JobStoreError, JobEnvelope, JobStore, job_pending_path,
 };
-use crate::jobs::{JobState, Queue};
-use crate::layer::{self, IndexLayerPayload};
+use crate::layer;
 use crate::registry::blob_store::BlobStore;
 use crate::registry::keys::{DigestExt, NamespaceExt};
 use crate::registry::metadata_store::{LinkKind, MetadataStore};
@@ -29,12 +29,7 @@ use crate::replication::{
     ReplicationJob, ReplicationTarget, build_envelope, build_prune_delete_envelope,
     record_reconcile_outcome,
 };
-use crate::scan::{self, ScanImagePayload};
-
-#[cfg(test)]
-use crate::registry::RegistryConfig;
-#[cfg(test)]
-use crate::registry::test_utils::create_test_repositories;
+use crate::scan;
 
 /// Internal-process name stamped on the events retention deletions emit.
 pub const RETENTION_ACTOR: &str = "prune";
@@ -61,6 +56,14 @@ pub trait ActionSink: Send + Sync {
 /// Logs actions as dry-run without applying any mutations to storage.
 pub struct DryRunSink;
 
+#[async_trait]
+impl ActionSink for DryRunSink {
+    async fn apply(&self, action: Action) -> Result<(), Error> {
+        info!("DRY RUN: would {action}");
+        Ok(())
+    }
+}
+
 /// A maintenance run's sink: a dry run only logs what it would apply,
 /// otherwise `executor` builds the sink that applies it.
 ///
@@ -76,127 +79,6 @@ pub fn run_sink(
         return Ok(Box::new(DryRunSink));
     }
     Ok(Box::new(executor()?))
-}
-
-#[async_trait]
-impl ActionSink for DryRunSink {
-    async fn apply(&self, action: Action) -> Result<(), Error> {
-        info!("DRY RUN: would {action}");
-        Ok(())
-    }
-}
-
-/// Applies scrub actions against live storage backends.
-pub struct Executor {
-    blob_store: Arc<BlobStore>,
-    metadata_store: Arc<MetadataStore>,
-    job_store: Arc<JobStore>,
-    /// The registry the retention deletions run through, so they take the
-    /// standard delete path (locking, blob reclaim, events, replication).
-    registry: Option<Arc<Registry>>,
-}
-
-impl Executor {
-    /// Construct an executor over the stores it mutates and the queue
-    /// replication enqueues land on.
-    #[must_use]
-    pub fn new(
-        blob_store: Arc<BlobStore>,
-        metadata_store: Arc<MetadataStore>,
-        job_store: Arc<JobStore>,
-    ) -> Self {
-        Self {
-            blob_store,
-            metadata_store,
-            job_store,
-            registry: None,
-        }
-    }
-
-    /// Wire the registry tag and manifest deletions run through; both scrub
-    /// and prune construct their executors with one.
-    #[must_use]
-    pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
-        self.registry = Some(registry);
-        self
-    }
-
-    /// An executor over a fresh `prefix` run job store whose tag and manifest
-    /// deletions take the registry's standard delete path (locking, blob
-    /// reclaim, events, replication), with that registry for the run to drain
-    /// on exit.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry cannot be built.
-    pub fn with_run_registry(
-        config: &Configuration,
-        blob_store: &Arc<BlobStore>,
-        metadata_store: &Arc<MetadataStore>,
-        repositories: &Arc<RepositoryResolver>,
-        prefix: &str,
-    ) -> Result<(Self, Arc<Registry>), Error> {
-        let job_store = run_job_store(metadata_store, prefix);
-        let registry = bootstrap::registry(
-            config,
-            blob_store.clone(),
-            metadata_store.clone(),
-            repositories.clone(),
-            job_store.clone(),
-        )?;
-        let executor = Self::new(blob_store.clone(), metadata_store.clone(), job_store)
-            .with_registry(registry.clone());
-        Ok((executor, registry))
-    }
-
-    fn retention_registry(&self) -> Result<&Registry, Error> {
-        self.registry.as_deref().ok_or_else(|| {
-            Error::Initialization(
-                "retention actions require a registry; construct the executor with one".to_string(),
-            )
-        })
-    }
-
-    /// Test-only constructor synthesizing a `JobStore` and a registry over the
-    /// same stores, so the retention arms work out of the box.
-    #[cfg(test)]
-    #[must_use]
-    pub fn new_for_test(blob_store: Arc<BlobStore>, metadata_store: Arc<MetadataStore>) -> Self {
-        let job_store = Arc::new(JobStore::new(
-            &metadata_store,
-            "scrub-test",
-            ClaimMode::Atomic,
-        ));
-        let resolver = Arc::new(
-            RepositoryResolver::new(create_test_repositories())
-                .expect("test repositories must not have overlapping prefixes"),
-        );
-        let registry = Registry::new(
-            blob_store.clone(),
-            metadata_store.clone(),
-            resolver,
-            RegistryConfig::new(job_store.clone()),
-        );
-        Self::new(blob_store, metadata_store, job_store).with_registry(registry)
-    }
-
-    /// Lands the envelope on the durable replication queue, coalescing on the
-    /// `lock_key` its builder chose.
-    async fn enqueue_replication(
-        &self,
-        envelope: Result<JobEnvelope, JobStoreError>,
-    ) -> Result<(), Error> {
-        let envelope = envelope.map_err(|e| {
-            record_reconcile_outcome("failed");
-            Error::Replication(format!("failed to build replication envelope: {e}"))
-        })?;
-        self.job_store.enqueue(envelope).await.map_err(|e| {
-            record_reconcile_outcome("failed");
-            Error::Replication(format!("failed to enqueue replication job: {e}"))
-        })?;
-        record_reconcile_outcome("enqueued");
-        Ok(())
-    }
 }
 
 /// Whether the object at `key` is younger than `grace_secs`, by the
@@ -218,7 +100,88 @@ pub async fn object_younger_than_grace(
     })))
 }
 
+/// Applies scrub actions against live storage backends.
+pub struct Executor {
+    blob_store: Arc<BlobStore>,
+    metadata_store: Arc<MetadataStore>,
+    job_store: Arc<JobStore>,
+    /// The registry the retention deletions run through, so they take the
+    /// standard delete path (locking, blob reclaim, events, replication).
+    registry: Option<Arc<Registry>>,
+}
+
 impl Executor {
+    #[must_use]
+    pub fn new(
+        blob_store: Arc<BlobStore>,
+        metadata_store: Arc<MetadataStore>,
+        job_store: Arc<JobStore>,
+        registry: Option<Arc<Registry>>,
+    ) -> Self {
+        Self {
+            blob_store,
+            metadata_store,
+            job_store,
+            registry,
+        }
+    }
+
+    /// An executor over a fresh `prefix` run job store, plus the registry its
+    /// deletions go through, for the run to drain on exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be built.
+    pub fn with_run_registry(
+        config: &Configuration,
+        blob_store: &Arc<BlobStore>,
+        metadata_store: &Arc<MetadataStore>,
+        repositories: &Arc<RepositoryResolver>,
+        prefix: &str,
+    ) -> Result<(Self, Arc<Registry>), Error> {
+        let job_store = run_job_store(metadata_store, prefix);
+        let registry = bootstrap::registry(
+            config,
+            blob_store.clone(),
+            metadata_store.clone(),
+            repositories.clone(),
+            job_store.clone(),
+        )?;
+        let executor = Self::new(
+            blob_store.clone(),
+            metadata_store.clone(),
+            job_store,
+            Some(registry.clone()),
+        );
+        Ok((executor, registry))
+    }
+
+    fn retention_registry(&self) -> Result<&Registry, Error> {
+        self.registry.as_deref().ok_or_else(|| {
+            Error::Initialization(
+                "retention actions require a registry; construct the executor with one".to_string(),
+            )
+        })
+    }
+
+    /// Lands the envelope on the durable replication queue, coalescing on the
+    /// `lock_key` its builder chose.
+    async fn enqueue_replication(
+        &self,
+        envelope: Result<JobEnvelope, JobStoreError>,
+    ) -> Result<(), Error> {
+        let envelope = envelope.map_err(|e| {
+            record_reconcile_outcome("failed");
+            Error::Replication(format!("failed to build replication envelope: {e}"))
+        })?;
+        self.job_store.enqueue(envelope).await.map_err(|e| {
+            record_reconcile_outcome("failed");
+            Error::Replication(format!("failed to enqueue replication job: {e}"))
+        })?;
+        record_reconcile_outcome("enqueued");
+        Ok(())
+    }
+
     /// [`object_younger_than_grace`] bound to this executor's grace period
     /// and error domain.
     async fn key_younger_than_grace(
@@ -226,7 +189,7 @@ impl Executor {
         store: &dyn ObjectStore,
         key: &str,
     ) -> Result<Option<bool>, Error> {
-        object_younger_than_grace(store, key, self.metadata_store.gc_grace_secs)
+        object_younger_than_grace(store, key, self.metadata_store.settings.gc_grace_secs)
             .await
             .map_err(|e| Error::from(RegistryError::from(e)))
     }
@@ -285,7 +248,14 @@ impl Executor {
             Err(RegistryError::BlobUnknown | RegistryError::NotFound) => false,
             Err(e) => return Err(Error::from(e)),
         };
-        if bytes_exist && self.entry_still_backed(&namespace, &link, &blob).await? {
+        // A blob self-grant is its own record.
+        if bytes_exist
+            && (matches!(link, LinkKind::Blob(_))
+                || self
+                    .metadata_store
+                    .reference_backed(&namespace, &link, &blob)
+                    .await?)
+        {
             info!("skipping blob-index removal: entry for '{namespace}/{blob}' is live again");
             return Ok(());
         }
@@ -309,24 +279,6 @@ impl Executor {
             .remove_reference(&namespace, &blob, &link)
             .await?;
         Ok(())
-    }
-
-    /// Whether the reference entry for `link` is still backed: a blob
-    /// self-grant is its own record, every other kind defers to
-    /// [`MetadataStore::reference_backed`].
-    async fn entry_still_backed(
-        &self,
-        namespace: &Namespace,
-        link: &LinkKind,
-        blob: &Digest,
-    ) -> Result<bool, Error> {
-        if matches!(link, LinkKind::Blob(_)) {
-            return Ok(true);
-        }
-        self.metadata_store
-            .reference_backed(namespace, link, blob)
-            .await
-            .map_err(Error::from)
     }
 
     /// Re-add a blob-index grant missing for a still-referenced blob. The
@@ -403,18 +355,6 @@ impl Executor {
         Ok(())
     }
 
-    async fn recreate_link(
-        &self,
-        namespace: Namespace,
-        link: LinkKind,
-        target: Digest,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .write_link(&namespace, &link, &target)
-            .await?;
-        Ok(())
-    }
-
     /// Retention tag deletion through the registry's standard delete path, so
     /// it emits the delete events and, per its internal actor, mirrors only to
     /// `prune = true` downstreams. A `target` is the digest the tag was judged
@@ -466,20 +406,6 @@ impl Executor {
         }
     }
 
-    /// Applies [`MetadataStore::demote_tag_entry`], which owns the `!hist/`
-    /// layout and the move's crash ordering.
-    async fn demote_tag_entry(
-        &self,
-        namespace: Namespace,
-        tag: Tag,
-        entry_name: String,
-    ) -> Result<(), Error> {
-        self.metadata_store
-            .demote_tag_entry(&namespace, &tag, &entry_name)
-            .await
-            .map_err(Error::from)
-    }
-
     /// Retention orphan-manifest deletion through the registry's standard
     /// delete path, which also reclaims the manifest's bytes once unreferenced.
     /// Age-gated like [`Self::delete_orphan_blob`]: every producer of this
@@ -527,40 +453,90 @@ impl Executor {
         Ok(())
     }
 
-    async fn enqueue_replication_push(
-        &self,
-        downstream: String,
-        namespace: Namespace,
-        tag: Tag,
-        digest: Digest,
-    ) -> Result<(), Error> {
-        // The handler stamps `source_ts` from the tag's `created_at` at execute
-        // time, so the push carries the same last-writer-wins version as the
-        // event path.
-        let job = ReplicationJob::Push {
-            target: ReplicationTarget {
+    async fn apply_job(&self, job: JobAction) -> Result<(), Error> {
+        match job {
+            // The handler stamps `source_ts` from the tag's `created_at` at
+            // execute time, so the push carries the same last-writer-wins
+            // version as the event path.
+            JobAction::EnqueueReplicationPush {
                 downstream,
                 namespace,
-                tag: Some(tag),
-                digest: Some(digest),
-                source_ts: None,
+                tag,
+                digest,
+            } => {
+                let job = ReplicationJob::Push {
+                    target: ReplicationTarget {
+                        downstream,
+                        namespace,
+                        tag: Some(tag),
+                        digest: Some(digest),
+                        source_ts: None,
+                    },
+                };
+                self.enqueue_replication(build_envelope(&job)).await
+            }
+            // The decision-time `source_ts` lets the receiver preserve a
+            // downstream tag dated after it. It does NOT make prune
+            // active-active safe: a peer's newer tag created before this run
+            // is still deleted.
+            JobAction::EnqueueReplicationDelete {
+                downstream,
+                namespace,
+                tag,
+            } => {
+                let job = ReplicationJob::Delete {
+                    target: ReplicationTarget {
+                        downstream,
+                        namespace,
+                        tag: Some(tag),
+                        digest: None,
+                        source_ts: Some(Utc::now()),
+                    },
+                    subject: None,
+                };
+                // Keyed on the bare reference so repeated runs coalesce
+                // instead of stacking one fresh-ts job each.
+                self.enqueue_replication(build_prune_delete_envelope(&job))
+                    .await
+            }
+            JobAction::EnqueueScan(scan) => {
+                let envelope = scan::build_envelope(&scan)
+                    .map_err(|e| Error::JobQueue(format!("failed to build scan envelope: {e}")))?;
+                self.job_store
+                    .enqueue(envelope)
+                    .await
+                    .map_err(|e| Error::JobQueue(format!("failed to enqueue scan job: {e}")))
+            }
+            JobAction::EnqueueIndex(index) => {
+                let envelope = layer::build_envelope(&index)
+                    .map_err(|e| Error::JobQueue(format!("failed to build index envelope: {e}")))?;
+                self.job_store
+                    .enqueue(envelope)
+                    .await
+                    .map_err(|e| Error::JobQueue(format!("failed to enqueue index job: {e}")))
+            }
+            JobAction::DeleteOrphanJob {
+                queue,
+                state,
+                storage_key,
+                ..
+            } => match self.job_store.delete_job(queue, state, &storage_key).await {
+                Ok(()) => Ok(()),
+                // A stale key means the job completed or was deleted concurrently.
+                Err(JobStoreError::NotFound) => {
+                    debug!("{queue} job '{storage_key}' already gone; nothing to delete");
+                    Ok(())
+                }
+                Err(e) => Err(Error::JobQueue(format!(
+                    "failed to delete {queue} job '{storage_key}': {e}"
+                ))),
             },
-        };
-        self.enqueue_replication(build_envelope(&job)).await
-    }
-
-    async fn enqueue_scan(&self, scan: ScanImagePayload) -> Result<(), Error> {
-        let envelope = scan::build_envelope(&scan)
-            .map_err(|e| Error::JobQueue(format!("failed to build scan envelope: {e}")))?;
-        self.job_store
-            .enqueue(envelope)
-            .await
-            .map_err(|e| Error::JobQueue(format!("failed to enqueue scan job: {e}")))
-    }
-
-    async fn ensure_catalog_index(&self, namespace: Namespace) -> Result<(), Error> {
-        self.metadata_store.index_namespace(&namespace).await;
-        Ok(())
+            JobAction::DeleteOrphanJobIndex {
+                queue,
+                key,
+                storage_key,
+            } => self.delete_orphan_job_index(queue, key, storage_key).await,
+        }
     }
 
     /// A key already gone is the outcome wanted, not a failure.
@@ -573,59 +549,6 @@ impl Executor {
         {
             Ok(()) | Err(StorageError::NotFound) => Ok(()),
             Err(e) => Err(Error::from(RegistryError::from(e))),
-        }
-    }
-
-    async fn enqueue_index(&self, index: IndexLayerPayload) -> Result<(), Error> {
-        let envelope = layer::build_envelope(&index)
-            .map_err(|e| Error::JobQueue(format!("failed to build index envelope: {e}")))?;
-        self.job_store
-            .enqueue(envelope)
-            .await
-            .map_err(|e| Error::JobQueue(format!("failed to enqueue index job: {e}")))
-    }
-
-    async fn enqueue_replication_delete(
-        &self,
-        downstream: String,
-        namespace: Namespace,
-        tag: Tag,
-    ) -> Result<(), Error> {
-        // The decision-time `source_ts` lets the receiver preserve a downstream
-        // tag dated after it. It does NOT make prune active-active safe: a
-        // peer's newer tag created before this run is still deleted.
-        let job = ReplicationJob::Delete {
-            target: ReplicationTarget {
-                downstream,
-                namespace,
-                tag: Some(tag),
-                digest: None,
-                source_ts: Some(Utc::now()),
-            },
-            subject: None,
-        };
-        // Keyed on the bare reference so repeated runs coalesce instead of
-        // stacking one fresh-ts job each.
-        self.enqueue_replication(build_prune_delete_envelope(&job))
-            .await
-    }
-
-    async fn delete_orphan_job(
-        &self,
-        queue: Queue,
-        state: JobState,
-        storage_key: String,
-    ) -> Result<(), Error> {
-        match self.job_store.delete_job(queue, state, &storage_key).await {
-            Ok(()) => Ok(()),
-            // A stale key means the job completed or was deleted concurrently.
-            Err(JobStoreError::NotFound) => {
-                debug!("{queue} job '{storage_key}' already gone; nothing to delete");
-                Ok(())
-            }
-            Err(e) => Err(Error::JobQueue(format!(
-                "failed to delete {queue} job '{storage_key}': {e}"
-            ))),
         }
     }
 
@@ -696,16 +619,6 @@ impl Executor {
         }
         Ok(())
     }
-
-    /// Delete an exact walked key: an expected-shape object with unreadable
-    /// content, or an unrecognized key under `--delete-unknown`.
-    async fn delete_walked_key(&self, store: WalkedStore, key: String) -> Result<(), Error> {
-        self.walked_object_store(store)
-            .delete(&key)
-            .await
-            .map_err(RegistryError::from)?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -725,7 +638,10 @@ impl ActionSink for Executor {
                 blob,
                 link,
             } => self.grant_blob_index_link(namespace, blob, link).await,
-            Action::EnsureCatalogIndex { namespace } => self.ensure_catalog_index(namespace).await,
+            Action::EnsureCatalogIndex { namespace } => {
+                self.metadata_store.index_namespace(&namespace).await;
+                Ok(())
+            }
             Action::ReapCatalogIndex { namespace } => self.reap_catalog_index(namespace).await,
             Action::RemoveOrphanBlobGrant { namespace, blob } => {
                 self.remove_orphan_blob_grant(namespace, blob).await
@@ -734,35 +650,37 @@ impl ActionSink for Executor {
                 namespace,
                 link,
                 target,
-            } => self.recreate_link(namespace, link, target).await,
+            } => Ok(self
+                .metadata_store
+                .write_link(&namespace, &link, &target)
+                .await?),
             Action::DeleteTag {
                 namespace,
                 tag,
                 target,
             } => self.delete_tag(namespace, tag, target).await,
+            // The metadata store owns the `!hist/` layout and the move's crash ordering.
             Action::DemoteTagEntry {
                 namespace,
                 tag,
                 entry_name,
-            } => self.demote_tag_entry(namespace, tag, entry_name).await,
-            // An upload-only namespace whose name fails `Namespace` validation
-            // is reclaimed by removing its upload subtree from the blob store.
-            Action::DeleteInvalidUploadNamespace { name } => self
-                .blob_store
-                .delete_namespace_directory(&name)
-                .await
-                .map_err(Error::from),
+            } => Ok(self
+                .metadata_store
+                .demote_tag_entry(&namespace, &tag, &entry_name)
+                .await?),
+            Action::DeleteInvalidUploadNamespace { name } => {
+                Ok(self.blob_store.delete_namespace_directory(&name).await?)
+            }
             Action::DeleteOrphanManifest { namespace, digest } => {
                 self.delete_orphan_manifest(namespace, digest).await
             }
             Action::DeleteExpiredUpload {
                 namespace,
                 session_id,
-            } => self
+            } => Ok(self
                 .blob_store
                 .delete_upload(&namespace, &session_id)
-                .await
-                .map_err(Error::from),
+                .await?),
             Action::DeleteOrphanReferrer {
                 namespace,
                 subject,
@@ -771,47 +689,21 @@ impl ActionSink for Executor {
                 .metadata_store
                 .delete_referrer(&namespace, &subject, &referrer)
                 .await?),
-            Action::AbortMultipartUpload { upload } => self
+            Action::AbortMultipartUpload { upload } => Ok(self
                 .blob_store
                 .abort_orphan_multipart_upload(&upload)
-                .await
-                .map_err(Error::from),
-            Action::Job(JobAction::EnqueueReplicationPush {
-                downstream,
-                namespace,
-                tag,
-                digest,
-            }) => {
-                self.enqueue_replication_push(downstream, namespace, tag, digest)
-                    .await
-            }
-            Action::Job(JobAction::EnqueueScan(scan)) => self.enqueue_scan(scan).await,
-            Action::Job(JobAction::EnqueueIndex(index)) => self.enqueue_index(index).await,
+                .await?),
+            Action::Job(job) => self.apply_job(job).await,
             Action::ReclaimListing(digest) => {
                 Ok(self.metadata_store.delete_listing(&digest).await?)
             }
-            Action::Job(JobAction::EnqueueReplicationDelete {
-                downstream,
-                namespace,
-                tag,
-            }) => {
-                self.enqueue_replication_delete(downstream, namespace, tag)
-                    .await
-            }
-            Action::Job(JobAction::DeleteOrphanJob {
-                queue,
-                state,
-                storage_key,
-                ..
-            }) => self.delete_orphan_job(queue, state, storage_key).await,
-            Action::Job(JobAction::DeleteOrphanJobIndex {
-                queue,
-                key,
-                storage_key,
-            }) => self.delete_orphan_job_index(queue, key, storage_key).await,
             Action::QuarantineKey { store, key } => self.quarantine_key(store, key).await,
             Action::DeleteCorruptObject { store, key }
-            | Action::DeleteUnknownKey { store, key } => self.delete_walked_key(store, key).await,
+            | Action::DeleteUnknownKey { store, key } => Ok(self
+                .walked_object_store(store)
+                .delete(&key)
+                .await
+                .map_err(RegistryError::from)?),
             Action::CompactAtime(compaction) => self.compact_atime(compaction).await,
         }
     }
@@ -835,6 +727,8 @@ mod tests {
 
     use super::*;
     use crate::cache_fill::{CACHE_FETCH_BLOB_KIND, CacheFetchBlobPayload};
+    use crate::command::maintenance::test_helper::test_executor;
+    use crate::jobs::JobState;
     use crate::jobs::store::{ClaimMode, FailOutcome};
     use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
     use crate::registry::test_utils::{
@@ -849,7 +743,7 @@ mod tests {
     /// the job and race the assertion.
     fn standalone_job_store(worker_id: &str) -> (Arc<JobStore>, TempDir) {
         let dir = TempDir::new().expect("temp dir");
-        let raw = Arc::new(StorageFsBackend::builder(dir.path()).build());
+        let raw = Arc::new(StorageFsBackend::new(dir.path(), false));
         (
             Arc::new(JobStore::new(
                 &metadata_store_over(raw),
@@ -861,27 +755,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_dry_run_does_not_delete_blob() {
-        for_each_backend(async |test_case| {
-            let blob_store = test_case.blob_store();
-
-            let orphan_content = b"executor dry-run test";
-            let orphan_digest = put_blob_direct(&blob_store, orphan_content).await;
-
-            let sink = DryRunSink;
-            sink.apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
-                .await
-                .unwrap();
-
-            assert!(
-                blob_store.read(&orphan_digest).await.is_ok(),
-                "dry-run must not delete the blob"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn executor_real_run_deletes_blob() {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
@@ -890,7 +763,7 @@ mod tests {
             let orphan_content = b"executor real-run test";
             let orphan_digest = put_blob_direct(&blob_store, orphan_content).await;
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store);
+            let executor = test_executor(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(orphan_digest.clone()))
@@ -915,7 +788,7 @@ mod tests {
                 store.put(&key, Bytes::from_static(b"{}")).await.unwrap();
             }
 
-            let executor = Executor::new_for_test(test_case.blob_store(), metadata_store.clone());
+            let executor = test_executor(test_case.blob_store(), metadata_store.clone());
             executor
                 .apply(Action::ReclaimListing(layer.clone()))
                 .await
@@ -945,7 +818,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            let executor = test_executor(blob_store, metadata_store.clone());
             executor
                 .apply(Action::RemoveBlobIndexLink {
                     namespace: namespace.clone(),
@@ -980,7 +853,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            let executor = test_executor(blob_store, metadata_store.clone());
             executor
                 .apply(Action::RemoveBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1029,7 +902,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            let executor = test_executor(blob_store, metadata_store.clone());
             executor
                 .apply(Action::RemoveBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1067,7 +940,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store, metadata_store.clone());
+            let executor = test_executor(blob_store, metadata_store.clone());
             executor
                 .apply(Action::RemoveBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1106,15 +979,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Same stores, but an executor whose grace period is real.
-            let graced = Arc::new(MetadataStore::new(
-                metadata_store.object_store().clone(),
-                Settings {
-                    gc_grace_secs: 300,
-                    ..Settings::default()
-                },
-            ));
-            let executor = Executor::new_for_test(blob_store, graced);
+            let executor = test_executor(blob_store, graced(&metadata_store));
             executor
                 .apply(Action::RemoveBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1150,14 +1015,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let graced = Arc::new(MetadataStore::new(
-                metadata_store.object_store().clone(),
-                Settings {
-                    gc_grace_secs: 300,
-                    ..Settings::default()
-                },
-            ));
-            let executor = Executor::new_for_test(blob_store, graced);
+            let executor = test_executor(blob_store, graced(&metadata_store));
             executor
                 .apply(Action::RemoveOrphanBlobGrant {
                     namespace: namespace.clone(),
@@ -1236,7 +1094,7 @@ mod tests {
                 fired: AtomicBool::new(false),
             },
         )));
-        Executor::new_for_test(blob_store, hooked)
+        test_executor(blob_store, hooked)
             .apply(Action::DeleteTag {
                 namespace: namespace.clone(),
                 tag: tag.clone(),
@@ -1277,7 +1135,7 @@ mod tests {
                 .unwrap();
         }
 
-        let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+        let executor = test_executor(blob_store.clone(), metadata_store.clone());
         executor
             .apply(Action::DeleteTag {
                 namespace: namespace.clone(),
@@ -1336,7 +1194,7 @@ mod tests {
         .await
         .unwrap();
 
-        let executor = Executor::new_for_test(blob_store.clone(), graced(&metadata_store));
+        let executor = test_executor(blob_store.clone(), graced(&metadata_store));
 
         executor
             .apply(Action::DeleteOrphanManifest {
@@ -1411,7 +1269,7 @@ mod tests {
         .await
         .unwrap();
 
-        Executor::new_for_test(case.blob_store(), graced(&metadata_store))
+        test_executor(case.blob_store(), graced(&metadata_store))
             .apply(Action::DeleteOrphanManifest {
                 namespace: namespace.clone(),
                 digest: digest.clone(),
@@ -1454,7 +1312,7 @@ mod tests {
         .unwrap();
         age(&case, &digest.blob_ref_path(&namespace, &tag));
 
-        Executor::new_for_test(case.blob_store(), graced(&metadata_store))
+        test_executor(case.blob_store(), graced(&metadata_store))
             .apply(Action::DeleteOrphanManifest {
                 namespace: namespace.clone(),
                 digest: digest.clone(),
@@ -1480,85 +1338,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_delete_orphan_manifest_missing_blob_still_removes_digest_link() {
+    async fn executor_delete_orphan_manifest_missing_blob_still_removes_links() {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-
             let namespace = Namespace::new("test-repo/app").unwrap();
-
-            // Write manifest blob and create a digest link, then delete the blob.
-            let content = b"orphan manifest content for missing-blob test";
-            let digest = put_blob_direct(&blob_store, content).await;
-            seed_links(
-                &metadata_store,
-                &namespace,
-                &[(LinkKind::Digest(digest.clone()), digest.clone())],
-            )
-            .await
-            .unwrap();
-            blob_store.delete_blob(&digest).await.unwrap();
-
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
-
-            executor
-                .apply(Action::DeleteOrphanManifest {
-                    namespace: namespace.clone(),
-                    digest: digest.clone(),
-                })
-                .await
-                .unwrap();
-
-            assert!(
-                metadata_store
-                    .read_link(&namespace, &LinkKind::Digest(digest.clone()))
-                    .await
-                    .is_err(),
-                "digest link must be removed even when the blob is missing"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn executor_delete_orphan_manifest_missing_blob_removes_tag_link() {
-        for_each_backend(async |test_case| {
-            let blob_store = test_case.blob_store();
-            let metadata_store = test_case.metadata_store();
-
-            let namespace = Namespace::new("test-repo/app").unwrap();
-
-            let content = b"orphan manifest with tag - missing blob";
-            let digest = put_blob_direct(&blob_store, content).await;
+            let digest = put_blob_direct(&blob_store, b"orphan manifest, missing blob").await;
+            let revision = LinkKind::Digest(digest.clone());
+            let tag = LinkKind::Tag(Tag::new("dangling").unwrap());
             seed_links(
                 &metadata_store,
                 &namespace,
                 &[
-                    (LinkKind::Digest(digest.clone()), digest.clone()),
-                    (LinkKind::Tag(Tag::new("dangling").unwrap()), digest.clone()),
+                    (revision.clone(), digest.clone()),
+                    (tag.clone(), digest.clone()),
                 ],
             )
             .await
             .unwrap();
             blob_store.delete_blob(&digest).await.unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
-
-            executor
+            test_executor(blob_store, metadata_store.clone())
                 .apply(Action::DeleteOrphanManifest {
                     namespace: namespace.clone(),
-                    digest: digest.clone(),
+                    digest,
                 })
                 .await
                 .unwrap();
 
-            assert!(
-                metadata_store
-                    .read_link(&namespace, &LinkKind::Tag(Tag::new("dangling").unwrap()))
-                    .await
-                    .is_err(),
-                "tag link pointing at missing-blob digest must be removed"
-            );
+            for link in [revision, tag] {
+                assert!(
+                    metadata_store.read_link(&namespace, &link).await.is_err(),
+                    "{link} must be removed even when the blob is missing"
+                );
+            }
         })
         .await;
     }
@@ -1582,7 +1395,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store);
+            let executor = test_executor(blob_store.clone(), metadata_store);
 
             executor
                 .apply(Action::DeleteOrphanBlob(digest.clone()))
@@ -1606,7 +1419,7 @@ mod tests {
             let namespace = Namespace::new("test-repo/app").unwrap();
             let digest = put_blob_direct(&blob_store, b"granted layer").await;
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
             executor
                 .apply(Action::GrantBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1643,7 +1456,7 @@ mod tests {
             )
             .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
             executor
                 .apply(Action::GrantBlobIndexLink {
                     namespace: namespace.clone(),
@@ -1669,70 +1482,34 @@ mod tests {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-
             let namespace = Namespace::new("test-repo/referrer-exec").unwrap();
-
-            let subject_digest = put_blob_direct(&blob_store, b"subject for referrer exec").await;
-            let referrer_digest = put_blob_direct(&blob_store, b"referrer for referrer exec").await;
-
+            let subject = put_blob_direct(&blob_store, b"subject for referrer exec").await;
+            let referrer = put_blob_direct(&blob_store, b"referrer for referrer exec").await;
+            let link = LinkKind::Referrer {
+                subject: subject.clone(),
+                referrer: referrer.clone(),
+            };
             seed_links(
                 &metadata_store,
                 &namespace,
                 &[
-                    (
-                        LinkKind::Digest(subject_digest.clone()),
-                        subject_digest.clone(),
-                    ),
-                    (
-                        LinkKind::Referrer {
-                            subject: subject_digest.clone(),
-                            referrer: referrer_digest.clone(),
-                        },
-                        referrer_digest.clone(),
-                    ),
+                    (LinkKind::Digest(subject.clone()), subject.clone()),
+                    (link.clone(), referrer.clone()),
                 ],
             )
             .await
             .unwrap();
 
-            assert!(
-                metadata_store
-                    .read_link(
-                        &namespace,
-                        &LinkKind::Referrer {
-                            subject: subject_digest.clone(),
-                            referrer: referrer_digest.clone()
-                        }
-                    )
-                    .await
-                    .is_ok(),
-                "Referrer link must exist before applying the action"
-            );
-
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
-
-            executor
+            test_executor(blob_store, metadata_store.clone())
                 .apply(Action::DeleteOrphanReferrer {
                     namespace: namespace.clone(),
-                    subject: subject_digest.clone(),
-                    referrer: referrer_digest.clone(),
+                    subject,
+                    referrer,
                 })
                 .await
                 .unwrap();
 
-            assert!(
-                metadata_store
-                    .read_link(
-                        &namespace,
-                        &LinkKind::Referrer {
-                            subject: subject_digest.clone(),
-                            referrer: referrer_digest.clone()
-                        }
-                    )
-                    .await
-                    .is_err(),
-                "Referrer link must be removed after applying the action"
-            );
+            assert!(metadata_store.read_link(&namespace, &link).await.is_err());
         })
         .await;
     }
@@ -1745,7 +1522,7 @@ mod tests {
 
             let (job_store, _job_dir) = standalone_job_store("scrub-source-ts");
 
-            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone(), None);
 
             executor
                 .apply(Action::Job(JobAction::EnqueueReplicationDelete {
@@ -1788,7 +1565,7 @@ mod tests {
 
             let (job_store, _job_dir) = standalone_job_store("scrub-prune-coalesce");
 
-            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone(), None);
 
             for _ in 0..2 {
                 executor
@@ -1861,7 +1638,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let (job_store, _job_dir) = standalone_job_store("scrub-orphan");
 
-            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone(), None);
 
             for (queue, envelope) in [
                 (Queue::Replication, orphan_push_envelope()),
@@ -1897,7 +1674,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let (job_store, _job_dir) = standalone_job_store("scrub-orphan");
 
-            let executor = Executor::new(blob_store, metadata_store, job_store.clone());
+            let executor = Executor::new(blob_store, metadata_store, job_store.clone(), None);
 
             for (queue, mut envelope) in [
                 (Queue::Replication, orphan_push_envelope()),
@@ -1953,7 +1730,7 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let (job_store, _job_dir) = standalone_job_store("scrub-orphan");
 
-            let executor = Executor::new(blob_store, metadata_store, job_store);
+            let executor = Executor::new(blob_store, metadata_store, job_store, None);
 
             for queue in [Queue::Replication, Queue::Cache] {
                 for state in [JobState::Pending, JobState::Failed] {
@@ -1976,7 +1753,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
 
             let key = "junk/unexpected-object";
             metadata_store
@@ -2012,7 +1789,7 @@ mod tests {
         for_each_backend(async |test_case| {
             let blob_store = test_case.blob_store();
             let metadata_store = test_case.metadata_store();
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
 
             let key = "v2/repositories/junk-ns/_manifests/tags/x/current/link";
             blob_store
@@ -2030,40 +1807,6 @@ mod tests {
                 .unwrap();
 
             assert!(blob_store.object_store().get(key).await.is_err());
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn delete_unknown_key_removes_key_without_quarantining() {
-        for_each_backend(async |test_case| {
-            let blob_store = test_case.blob_store();
-            let metadata_store = test_case.metadata_store();
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
-
-            let key = "junk/unexpected-object";
-            let objects = metadata_store.object_store();
-            objects
-                .put(key, Bytes::from_static(b"alien"))
-                .await
-                .unwrap();
-
-            executor
-                .apply(Action::DeleteUnknownKey {
-                    store: WalkedStore::Metadata,
-                    key: key.to_string(),
-                })
-                .await
-                .unwrap();
-
-            assert!(objects.get(key).await.is_err());
-            assert!(
-                objects
-                    .get(&format!("{LOST_AND_FOUND_PREFIX}/{key}"))
-                    .await
-                    .is_err(),
-                "a deleted unknown key must leave no quarantined copy"
-            );
         })
         .await;
     }

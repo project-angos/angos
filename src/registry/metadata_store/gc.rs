@@ -43,11 +43,11 @@ const WRITER_BACKOFF: Backoff =
 /// `Digest` ordering matches the lexical order of its `algo:hash` string, so
 /// the range covers exactly the stored keys between its bounds.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct GcRun {
-    pub start: Digest,
-    pub end: Digest,
-    pub expires_at: DateTime<Utc>,
-    pub instance: String,
+struct GcRun {
+    start: Digest,
+    end: Digest,
+    expires_at: DateTime<Utc>,
+    instance: String,
 }
 
 /// A held claim: the marker key plus the token that proves ownership on
@@ -167,16 +167,12 @@ impl MetadataStore {
         Ok(true)
     }
 
-    /// Expire the claim once the range is done, rather than removing it: a
-    /// writer whose reference key landed after this run's last liveness
-    /// listing must still find the marker and back off. The linger has to
-    /// outlast the gap between a writer's reference wave and its collector
-    /// check, which is one listing plus the backoff budget above; writers reap
-    /// what they read expired.
+    /// Expire the claim rather than remove it (see the module docs). The
+    /// linger must outlast one listing plus a writer's backoff budget.
     async fn gc_release(&self, claim: GcClaim) -> Result<(), Error> {
         let body = self.gc_run_body(
             &claim,
-            Some(Utc::now() + Duration::milliseconds(self.release_linger_ms)),
+            Some(Utc::now() + Duration::milliseconds(self.settings.release_linger_ms)),
         )?;
         self.object_store()
             .put(&claim.key, body)
@@ -196,7 +192,7 @@ impl MetadataStore {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<Bytes, Error> {
         let expires_at = expires_at.unwrap_or_else(|| {
-            let ttl = i64::try_from(self.gc_grace_secs)
+            let ttl = i64::try_from(self.settings.gc_grace_secs)
                 .unwrap_or(i64::MAX)
                 .saturating_mul(2)
                 .clamp(60, 86_400);
@@ -215,32 +211,25 @@ impl MetadataStore {
 mod tests {
     use std::time::Duration;
 
-    use bytes::Bytes;
     use tokio::time::sleep;
 
     use angos_oci::{Digest, MediaType, Namespace, Reference, Tag, UploadSessionId};
 
     use crate::command::maintenance::action::Action;
-    use crate::command::maintenance::executor::{ActionSink, Executor};
+    use crate::command::maintenance::executor::ActionSink;
+    use crate::command::maintenance::test_helper::test_executor;
     use crate::registry::Error;
     use crate::registry::blob_ownership::{GrantOutcome, grant_existing, promote_and_grant};
-    use crate::registry::keys::{DigestExt, GC_ROOT, NamespaceExt};
+    use crate::registry::keys::{GC_ROOT, NamespaceExt};
     use crate::registry::metadata_store::{LinkKind, MetadataStore, Settings};
-    use crate::registry::test_utils::{FSRegistryTestCase, RegistryTestCase, upload_blob};
+    use crate::registry::test_utils::{
+        FSRegistryTestCase, RegistryTestCase, put_blob_direct, put_manifest_direct, upload_blob,
+    };
+
     /// How long a released marker keeps blocking `store`, as a std duration
     /// to sleep on.
     fn linger(store: &MetadataStore) -> Duration {
-        Duration::from_millis(u64::try_from(store.release_linger_ms).unwrap_or(0))
-    }
-
-    async fn seed_blob(case: &FSRegistryTestCase, content: &[u8]) -> Digest {
-        let digest = Digest::sha256_of_bytes(content);
-        case.blob_store()
-            .object_store()
-            .put(&digest.blob_path(), Bytes::copy_from_slice(content))
-            .await
-            .unwrap();
-        digest
+        Duration::from_millis(u64::try_from(store.settings.release_linger_ms).unwrap_or(0))
     }
 
     /// An ownership key pins a blob unconditionally; only once it is revoked
@@ -250,13 +239,13 @@ mod tests {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
         let namespace = Namespace::new("gc-referenced").unwrap();
-        let digest = seed_blob(&case, b"gc-referenced-bytes").await;
+        let digest = put_blob_direct(&case.blob_store(), b"gc-referenced-bytes").await;
         store
             .insert_reference(&namespace, &digest, &LinkKind::Blob(digest.clone()))
             .await
             .unwrap();
 
-        let executor = Executor::new_for_test(case.blob_store(), store.clone());
+        let executor = test_executor(case.blob_store(), store.clone());
         executor
             .apply(Action::DeleteOrphanBlob(digest.clone()))
             .await
@@ -290,7 +279,7 @@ mod tests {
     async fn a_push_backs_off_while_a_collector_run_covers_its_blob() {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
-        let digest = seed_blob(&case, b"gc-covered-bytes").await;
+        let digest = put_blob_direct(&case.blob_store(), b"gc-covered-bytes").await;
 
         let claim = store.gc_claim(&digest, &digest).await.unwrap();
         assert!(
@@ -353,17 +342,12 @@ mod tests {
         let case = FSRegistryTestCase::new();
         let store = case.metadata_store();
         let namespace = Namespace::new("gc-blocked-grant").unwrap();
-        let digest = seed_blob(&case, b"gc-blocked-grant-bytes").await;
+        let digest = put_blob_direct(&case.blob_store(), b"gc-blocked-grant-bytes").await;
 
         let claim = store.gc_claim(&digest, &digest).await.unwrap();
-        let outcome = grant_existing(
-            &case.blob_store(),
-            case.registry().metadata_store(),
-            &namespace,
-            &digest,
-        )
-        .await
-        .unwrap();
+        let outcome = grant_existing(&case.blob_store(), &store, &namespace, &digest)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             GrantOutcome::ReclaimBlocked,
@@ -391,15 +375,14 @@ mod tests {
     #[tokio::test]
     async fn a_guarded_grant_never_returns_a_reclaimed_blob() {
         let case = FSRegistryTestCase::new();
-        let registry = case.registry();
         let namespace = Namespace::new("gc-mount").unwrap();
-        let digest = seed_blob(&case, b"gc-mount-bytes").await;
+        let digest = put_blob_direct(&case.blob_store(), b"gc-mount-bytes").await;
 
         // The sweep wins the race.
         case.blob_store().delete_blob(&digest).await.unwrap();
         let outcome = grant_existing(
             &case.blob_store(),
-            registry.metadata_store(),
+            &case.metadata_store(),
             &namespace,
             &digest,
         )
@@ -434,16 +417,16 @@ mod tests {
             "layers": []
         }))
         .unwrap();
-        let digest = registry
-            .put_manifest_direct(
-                &namespace,
-                &Reference::Tag(Tag::new("latest").unwrap()),
-                Some(&media_type),
-                &content,
-            )
-            .await
-            .unwrap()
-            .digest;
+        let digest = put_manifest_direct(
+            registry,
+            &namespace,
+            &Reference::Tag(Tag::new("latest").unwrap()),
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .unwrap()
+        .digest;
 
         // Rewind wave D.
         store
@@ -510,10 +493,15 @@ mod tests {
             .gc_claim(&config_digest, &config_digest)
             .await
             .unwrap();
-        let error = registry
-            .put_manifest_direct(&namespace, &reference, Some(&media_type), &content)
-            .await
-            .err();
+        let error = put_manifest_direct(
+            registry,
+            &namespace,
+            &reference,
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .err();
         assert!(
             matches!(error, Some(Error::ReclamationInProgress(_))),
             "a push referencing a covered blob must fail closed with the reclamation conflict, got {error:?}"
@@ -521,10 +509,15 @@ mod tests {
 
         store.gc_release(claim).await.unwrap();
         sleep(linger(&store) * 2).await;
-        registry
-            .put_manifest_direct(&namespace, &reference, Some(&media_type), &content)
-            .await
-            .expect("a retry past the released run's linger must succeed");
+        put_manifest_direct(
+            registry,
+            &namespace,
+            &reference,
+            Some(&media_type),
+            &content,
+        )
+        .await
+        .expect("a retry past the released run's linger must succeed");
     }
 
     /// The marker's TTL is clamped, so a grace period no chrono duration can hold

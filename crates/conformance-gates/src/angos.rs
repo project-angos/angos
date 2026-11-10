@@ -58,7 +58,6 @@ impl AngosRunner {
         Ok(Self { mode, config })
     }
 
-    /// The config file every run uses unless overridden.
     pub fn config_path(&self) -> &str {
         &self.config
     }
@@ -231,8 +230,7 @@ impl FromStr for ScrubSummary {
 impl ScrubSummary {
     /// Whether the run proposed or performed no action at all.
     pub fn is_all_zero(&self) -> bool {
-        let total = self.repairs + self.quarantined + self.corrupt + self.failures;
-        total == 0
+        self.repairs + self.quarantined + self.corrupt + self.failures == 0
     }
 }
 

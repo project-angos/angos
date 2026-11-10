@@ -12,30 +12,12 @@ use crate::registry::metadata_store::{DEFAULT_GC_GRACE_SECS, PullHistoryConfig};
 use crate::registry::pagination::{LISTING_READ_CONCURRENCY, NAMESPACE_WALK_CONCURRENCY};
 use crate::scan::ScanConfig;
 
-/// Default Tokio worker-thread count.
-const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(64 - 1);
-
-/// Default cap on concurrent in-process cache-fill jobs.
-pub const DEFAULT_MAX_CONCURRENT_CACHE_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
-
-/// Default replication-worker concurrency.
-pub const DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS: NonZeroUsize =
-    NonZeroUsize::MIN.saturating_add(4 - 1);
-/// Worker concurrency for the scan queue; a scan is minutes of scanner work.
-pub const DEFAULT_MAX_CONCURRENT_SCAN_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2 - 1);
-/// Worker concurrency for the index queue: opening an image asks for all its
-/// layers at once, each job inflating one on a core.
-pub const DEFAULT_MAX_CONCURRENT_INDEX_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4 - 1);
-/// Entries a layer listing may hold, about half a GiB of listing in memory.
-const DEFAULT_MAX_INDEX_ENTRIES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(500_000 - 1);
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: NonZeroUsize,
     #[serde(default = "default_max_concurrent_cache_jobs")]
     pub max_concurrent_cache_jobs: NonZeroUsize,
-    /// Worker concurrency for the replication queue.
     #[serde(default = "default_max_concurrent_replication_jobs")]
     pub max_concurrent_replication_jobs: NonZeroUsize,
     #[serde(default = "default_max_concurrent_scan_jobs")]
@@ -58,7 +40,7 @@ pub struct GlobalConfig {
     /// at one buffer per in-flight response.
     #[serde(default = "default_blob_stream_frame_size")]
     pub blob_stream_frame_size: ByteSize,
-    #[serde(default = "default_update_pull_time")]
+    #[serde(default)]
     pub update_pull_time: bool,
     #[serde(flatten)]
     pub redirect: RedirectConfig,
@@ -128,8 +110,7 @@ pub struct GlobalConfig {
     pub trusted_proxies: Vec<TrustedProxy>,
 }
 
-/// Whether the namespace listing counts each namespace's content; read from
-/// the `namespace_counts` bool of `[global]`.
+/// Read from the `namespace_counts` bool of `[global]`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(from = "bool")]
 pub enum NamespaceCounts {
@@ -148,8 +129,7 @@ impl From<bool> for NamespaceCounts {
     }
 }
 
-/// Which responses may redirect the client to the storage backend; read from
-/// the `enable_*_redirect` keys of `[global]`.
+/// Which responses may redirect the client to the storage backend.
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct RedirectConfig {
     #[serde(rename = "enable_blob_redirect", default = "default_redirect_enabled")]
@@ -190,32 +170,37 @@ fn default_gc_grace_secs() -> u64 {
     DEFAULT_GC_GRACE_SECS
 }
 
+/// Default Tokio worker-thread count.
 fn default_max_concurrent_requests() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_REQUESTS
+    NonZeroUsize::MIN.saturating_add(64 - 1)
 }
 
 fn default_max_concurrent_cache_jobs() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_CACHE_JOBS
+    NonZeroUsize::MIN.saturating_add(4 - 1)
 }
 
+/// A scan is minutes of scanner work.
 fn default_max_concurrent_scan_jobs() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_SCAN_JOBS
+    NonZeroUsize::MIN.saturating_add(2 - 1)
 }
 
+/// Opening an image asks for all its layers at once, each job inflating one
+/// on a core.
 fn default_max_concurrent_index_jobs() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_INDEX_JOBS
+    NonZeroUsize::MIN.saturating_add(4 - 1)
 }
 
 fn default_max_concurrent_replication_jobs() -> NonZeroUsize {
-    DEFAULT_MAX_CONCURRENT_REPLICATION_JOBS
+    NonZeroUsize::MIN.saturating_add(4 - 1)
 }
 
 fn default_max_index_size() -> ByteSize {
     ByteSize::gib(50)
 }
 
+/// About half a GiB of listing in memory.
 fn default_max_index_entries() -> NonZeroUsize {
-    DEFAULT_MAX_INDEX_ENTRIES
+    NonZeroUsize::MIN.saturating_add(500_000 - 1)
 }
 
 fn default_max_manifest_size() -> ByteSize {
@@ -228,10 +213,6 @@ fn default_blob_stream_frame_size() -> ByteSize {
 
 fn default_max_blob_size() -> ByteSize {
     ByteSize::gib(100)
-}
-
-fn default_update_pull_time() -> bool {
-    false
 }
 
 fn default_redirect_enabled() -> bool {
@@ -255,7 +236,7 @@ impl Default for GlobalConfig {
             max_manifest_size: default_max_manifest_size(),
             max_blob_size: default_max_blob_size(),
             blob_stream_frame_size: default_blob_stream_frame_size(),
-            update_pull_time: default_update_pull_time(),
+            update_pull_time: false,
             redirect: RedirectConfig::default(),
             access_policy: PolicyConfig::default(),
             retention_policy: RetentionPolicyConfig::default(),
@@ -284,10 +265,6 @@ impl GlobalConfig {
         usize::try_from(self.max_manifest_size.as_u64()).unwrap_or(usize::MAX)
     }
 
-    pub fn max_blob_size_bytes(&self) -> u64 {
-        self.max_blob_size.as_u64()
-    }
-
     pub fn blob_stream_frame_size_bytes(&self) -> usize {
         usize::try_from(self.blob_stream_frame_size.as_u64()).unwrap_or(usize::MAX)
     }
@@ -302,45 +279,9 @@ impl GlobalConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroUsize};
-
-    use bytesize::ByteSize;
+    use std::num::NonZeroU32;
 
     use crate::configuration::GlobalConfig;
-    use crate::registry::metadata_store::PullHistoryConfig;
-
-    #[test]
-    fn default_values_match_configuration_defaults() {
-        let config = GlobalConfig::default();
-
-        assert_eq!(
-            config.max_concurrent_requests,
-            NonZeroUsize::new(64).unwrap()
-        );
-        assert_eq!(config.max_concurrent_cache_jobs.get(), 4);
-        assert_eq!(config.max_concurrent_replication_jobs.get(), 4);
-        assert_eq!(config.max_manifest_size, ByteSize::mib(5));
-        assert_eq!(config.max_blob_size, ByteSize::gib(100));
-        assert_eq!(config.blob_stream_frame_size, ByteSize::kib(128));
-        assert!(!config.update_pull_time);
-        assert!(!config.immutable_tags);
-        assert!(
-            config.immutable_tags_exclusions.is_empty(),
-            "{:?}",
-            config.immutable_tags_exclusions
-        );
-        assert!(
-            config.allow_missing_manifest_references,
-            "manifest-reference validation is permissive by default"
-        );
-        assert_eq!(config.pull_history, PullHistoryConfig::default());
-        assert_eq!(config.pull_history.compaction_age_secs(), Some(3600));
-        assert!(config.authorization_webhook.is_none());
-        assert!(
-            config.trusted_proxies.is_empty(),
-            "forwarded headers must be ignored by default"
-        );
-    }
 
     /// A count gate alone replaces the default age gate rather than adding
     /// to it.

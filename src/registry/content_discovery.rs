@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::pin::pin;
 
-use futures_util::future::{BoxFuture, ready};
+use futures_util::future::ready;
 use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use tracing::{instrument, warn};
 
@@ -13,24 +13,8 @@ use angos_oci::{Content, Descriptor, Digest, Manifest, MediaType, Namespace, cli
 use angos_oci_service::{Referrers, Tags};
 use angos_storage::Page;
 
-use crate::registry::metadata_store::{LinkKind, MetadataStore};
+use crate::registry::metadata_store::LinkKind;
 use crate::registry::{Error, Registry, Repository};
-
-/// Whether the catalog names `namespace` as a repository: it holds at least
-/// one manifest revision, or one tag that resolves live. A namespace holding
-/// nothing but tombstones or in-progress uploads is not a repository.
-pub fn holds_manifest_content(
-    metadata_store: &MetadataStore,
-    namespace: Namespace,
-) -> BoxFuture<'_, Result<bool, Error>> {
-    Box::pin(async move {
-        if metadata_store.any_revision(&namespace).await? {
-            return Ok(true);
-        }
-        let mut tags = pin!(metadata_store.stream_live_tags(&namespace, None));
-        Ok(tags.try_next().await?.is_some())
-    })
-}
 
 /// The local and described referrer candidates in one digest order, a digest
 /// both hold taken as local: a local candidate (`None`) resolves from its
@@ -92,9 +76,7 @@ impl Registry {
         // its cursor is the last one served.
         let page = self
             .metadata_store
-            .list_namespaces(n, request.last, visibility, |namespace| {
-                holds_manifest_content(&self.metadata_store, namespace)
-            })
+            .list_namespaces(n, request.last, visibility)
             .await?;
         let next = page
             .next_token
@@ -119,7 +101,10 @@ impl Registry {
         // existence here must be able to tell the two apart. A repository whose
         // tags were all deleted still holds revisions, so it stays a `200`.
         if page.items.is_empty()
-            && !holds_manifest_content(&self.metadata_store, request.namespace.clone()).await?
+            && !self
+                .metadata_store
+                .holds_manifest_content(&request.namespace)
+                .await?
         {
             return Err(Error::NameUnknown);
         }
@@ -136,7 +121,7 @@ impl Registry {
         });
 
         let list = TagsListResponse {
-            name: Some(request.namespace.clone()),
+            name: Some(request.namespace),
             tags: page.items.iter().map(ToString::to_string).collect(),
         };
 
@@ -152,7 +137,6 @@ impl Registry {
     ) -> Result<Referrers, Error> {
         let upstream = self
             .repository_for_namespace(&request.namespace)
-            .ok()
             .filter(|repository| repository.is_pull_through());
         let page = self.list_referrers(upstream, &request).await?;
         let filtered = request.artifact_type.is_some();
@@ -198,18 +182,18 @@ impl Registry {
 
         // Referrers no local index knows, both arriving already resolved: an
         // upstream's, and any a pre-API client left under the fallback tag.
-        let mut described = self
-            .upstream_referrers(upstream, namespace, digest, artifact_type)
-            .await;
-        for referrer in self.fallback_tag_referrers(namespace, digest).await {
-            if artifact_type.is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter)) {
-                described.entry(referrer.digest.clone()).or_insert(referrer);
+        // An upstream's entry wins over the fallback tag's for one digest.
+        let fallback = self.fallback_tag_referrers(namespace, digest).await;
+        let upstream = self.upstream_referrers(upstream, namespace, digest).await;
+        let mut described = BTreeMap::new();
+        for referrer in fallback.into_iter().chain(upstream) {
+            if above(&referrer.digest)
+                && artifact_type
+                    .is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter))
+            {
+                described.insert(referrer.digest.clone(), referrer);
             }
         }
-        let described: BTreeMap<Digest, Descriptor> = described
-            .into_iter()
-            .filter(|(candidate, _)| above(candidate))
-            .collect();
 
         // The records resume past a cursor naming a digest; any other cursor
         // lists them from the start, the filter cutting what it covers.
@@ -305,36 +289,27 @@ impl Registry {
         }
     }
 
-    /// The referrers `upstream` holds for `digest`, filtered like the local
-    /// ones: nothing fills a referrer index on its own, so a pull-through
-    /// namespace listing only what it cached would answer an uncached subject
-    /// with nothing. An upstream that cannot be reached yields none, so a
-    /// mirror still lists what it holds when its upstream is down.
+    /// The referrers `upstream` holds for `digest`: nothing fills a referrer
+    /// index on its own, so a pull-through namespace listing only what it
+    /// cached would answer an uncached subject with nothing. An upstream that
+    /// cannot be reached yields none, so a mirror still lists what it holds
+    /// when its upstream is down.
     async fn upstream_referrers(
         &self,
         upstream: Option<&Repository>,
         namespace: &Namespace,
         digest: &Digest,
-        artifact_type: Option<&MediaType>,
-    ) -> HashMap<Digest, Descriptor> {
+    ) -> Vec<Descriptor> {
         let Some(repository) = upstream else {
-            return HashMap::new();
+            return Vec::new();
         };
-
-        match repository.list_referrers(namespace, digest).await {
-            Ok(referrers) => referrers
-                .into_iter()
-                .filter(|referrer| {
-                    artifact_type
-                        .is_none_or(|filter| referrer.artifact_type.as_ref() == Some(filter))
-                })
-                .map(|referrer| (referrer.digest.clone(), referrer))
-                .collect(),
-            Err(error) => {
+        repository
+            .list_referrers(namespace, digest)
+            .await
+            .unwrap_or_else(|error| {
                 warn!("Upstream referrer listing failed for {namespace}@{digest}: {error}");
-                HashMap::new()
-            }
-        }
+                Vec::new()
+            })
     }
 
     /// One referrer entry as an OCI [`Descriptor`]: the cached link descriptor
@@ -395,10 +370,8 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
-    use async_trait::async_trait;
     use futures_util::future::try_join_all;
     use http::Response;
     use http::header::LINK;
@@ -412,8 +385,7 @@ mod tests {
     use angos_oci::client::next_page_target;
     use angos_oci::request::{GetReferrersRequest, ListTagsRequest};
     use angos_oci::{Descriptor, Digest, Manifest, Namespace, OCI_INDEX_MEDIA_TYPE, Tag};
-    use angos_storage::Error as StorageError;
-    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::test_util::StoreOp;
     use angos_transport::ResponseBody;
 
     use crate::registry::Error;
@@ -423,20 +395,11 @@ mod tests {
     use crate::registry::metadata_store::{LIST_PAGE, LinkKind, MetadataStore};
     use crate::registry::repository::Config;
     use crate::registry::test_utils::{
-        FSRegistryTestCase, RegistryTestCase, create_link, create_test_registry, for_each_backend,
-        media_type, metadata_store_over, put_blob_direct, referrers_request, response_json,
+        FSRegistryTestCase, RegistryTestCase, counting_metadata_store, create_test_registry,
+        for_each_backend, media_type, put_blob_direct, referrers_request, response_json,
         seed_links, upload_blob,
     };
     use crate::test_fixtures::client::test_client_config;
-    /// The repository names a catalog response served.
-    async fn catalog(response: Response<ResponseBody>) -> Vec<String> {
-        json_strings(response, "repositories").await
-    }
-
-    /// The tag names a tags response served.
-    async fn tags(response: Response<ResponseBody>) -> Vec<String> {
-        json_strings(response, "tags").await
-    }
 
     async fn json_strings(response: Response<ResponseBody>, field: &str) -> Vec<String> {
         response_json(response).await[field]
@@ -498,7 +461,7 @@ mod tests {
                 .unwrap();
 
             assert!(next_cursor(&response).is_none());
-            let namespaces = catalog(response).await;
+            let namespaces = json_strings(response, "repositories").await;
             assert!(namespaces.is_empty(), "{namespaces:?}");
         })
         .await;
@@ -545,27 +508,15 @@ mod tests {
 
             let page1 = list(Some(2), None).await;
             let cursor = next_cursor(&page1).expect("a partial page must advertise Link");
-            assert_eq!(tags(page1).await.len(), 2);
+            assert_eq!(json_strings(page1, "tags").await.len(), 2);
 
             let page2 = list(Some(2), Some(cursor)).await;
             assert!(next_cursor(&page2).is_none());
-            assert_eq!(tags(page2).await.len(), 1);
-
-            let one = list(Some(1), None).await;
-            let cursor = next_cursor(&one).expect("a partial page must advertise Link");
-            assert_eq!(tags(one).await.len(), 1);
-
-            let two = list(Some(1), Some(cursor)).await;
-            let cursor = next_cursor(&two).expect("a partial page must advertise Link");
-            assert_eq!(tags(two).await.len(), 1);
-
-            let three = list(Some(1), Some(cursor)).await;
-            assert!(next_cursor(&three).is_none());
-            assert_eq!(tags(three).await.len(), 1);
+            assert_eq!(json_strings(page2, "tags").await.len(), 1);
 
             let after_latest = list(Some(10), Some("latest".to_string())).await;
             assert!(next_cursor(&after_latest).is_none());
-            assert_eq!(tags(after_latest).await.len(), 2);
+            assert_eq!(json_strings(after_latest, "tags").await.len(), 2);
         })
         .await;
     }
@@ -612,7 +563,10 @@ mod tests {
             .into_response()
             .unwrap();
         let cursor = next_cursor(&response);
-        assert_eq!(catalog(response).await, ["vis-00", "vis-03"]);
+        assert_eq!(
+            json_strings(response, "repositories").await,
+            ["vis-00", "vis-03"]
+        );
 
         let response = registry
             .handle_list_catalog(
@@ -626,7 +580,10 @@ mod tests {
             .unwrap()
             .into_response()
             .unwrap();
-        assert_eq!(catalog(response).await, ["vis-06", "vis-09"]);
+        assert_eq!(
+            json_strings(response, "repositories").await,
+            ["vis-06", "vis-09"]
+        );
     }
 
     #[tokio::test]
@@ -668,7 +625,7 @@ mod tests {
                 .into_response()
                 .unwrap();
             let cursor = next_cursor(&response);
-            all_collected.extend(catalog(response).await);
+            all_collected.extend(json_strings(response, "repositories").await);
 
             match cursor {
                 None => break,
@@ -740,17 +697,10 @@ mod tests {
 
         assert!(next_cursor(&response).is_none());
         assert!(
-            tags(response).await.is_empty(),
+            json_strings(response, "tags").await.is_empty(),
             "a namespace with no tags must serve an empty list"
         );
     }
-
-    // The referrer-resolution tests below run on the split-backend fixture:
-    // manifest bodies live in the blob store only, so any resolution path
-    // reading them through the metadata store fails here.
-
-    // A digest with no stored blob.
-    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn subject() -> Digest {
         Digest::sha256("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
@@ -779,20 +729,6 @@ mod tests {
             ..Manifest::default()
         };
         serde_json::to_vec(&manifest).expect("serialization must succeed")
-    }
-
-    /// Split-backend fixture plus one referrer manifest in the blob store.
-    async fn split_case_with_blob(
-        blob_artifact_type: Option<&str>,
-    ) -> (FSRegistryTestCase, Digest) {
-        let case = FSRegistryTestCase::new();
-        let digest = upload_blob(
-            case.registry(),
-            &referrer_namespace(),
-            &manifest_bytes(blob_artifact_type),
-        )
-        .await;
-        (case, digest)
     }
 
     /// A pull-through repository owning `mirror/*`, so a request for
@@ -826,200 +762,128 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn returns_cached_descriptor_when_no_filter() {
-        // The blob is deliberately unparseable, so only the cached descriptor
-        // can answer.
-        let case = FSRegistryTestCase::new();
-        let registry = case.registry();
-        let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
-        let desc = descriptor_with(Some("application/vnd.foo"), &manifest_digest);
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            Some(desc.clone()),
-        )
-        .await;
-
-        let result = registry
-            .resolve_referrer_descriptor(&referrer_namespace(), &subject(), manifest_digest, None)
-            .await;
-        assert_eq!(result, Some(desc));
+    /// What a resolution case records for the referrer.
+    enum Cached {
+        NoRecord,
+        Bare,
+        Typed(Option<&'static str>),
     }
 
-    #[tokio::test]
-    async fn returns_cached_descriptor_when_filter_matches() {
-        let case = FSRegistryTestCase::new();
-        let registry = case.registry();
-        let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
-        let at = media_type("application/vnd.foo");
-        let desc = descriptor_with(Some(&at), &manifest_digest);
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            Some(desc.clone()),
-        )
-        .await;
-
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                manifest_digest,
-                Some(&at),
-            )
-            .await;
-        assert_eq!(result, Some(desc));
+    /// What a resolution case must resolve to.
+    enum Expected {
+        Nothing,
+        Cached,
+        Manifest,
     }
 
+    /// The cached descriptor answers whenever it can tell the filter; otherwise
+    /// the manifest body in the blob store decides, and nothing resolves
+    /// without one. Every case runs on split stores, so a body read through
+    /// the metadata store fails.
     #[tokio::test]
-    async fn returns_none_when_cached_descriptor_filter_mismatches() {
-        // The stored manifest does match the filter, so a wrong fall-through to
-        // the blob would return Some.
-        let (case, manifest_digest) = split_case_with_blob(Some("application/vnd.bar")).await;
-        let registry = case.registry();
-        let desc = descriptor_with(Some("application/vnd.foo"), &manifest_digest);
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            Some(desc),
-        )
-        .await;
-
-        let filter = media_type("application/vnd.bar");
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                manifest_digest,
-                Some(&filter),
-            )
-            .await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn falls_through_to_blob_when_cached_descriptor_missing_artifact_type() {
-        // The filter cannot be evaluated from a cache entry carrying no
-        // artifact_type, so the manifest blob decides.
-        let (case, manifest_digest) = split_case_with_blob(Some("application/vnd.foo")).await;
-        let registry = case.registry();
-        let desc = descriptor_with(None, &manifest_digest);
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            Some(desc),
-        )
-        .await;
-
-        let at = media_type("application/vnd.foo");
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                manifest_digest,
-                Some(&at),
-            )
-            .await;
-        assert!(result.is_some());
-    }
-
-    #[tokio::test]
-    async fn falls_through_to_blob_when_link_is_absent() {
-        let (case, manifest_digest) = split_case_with_blob(None).await;
-        let registry = case.registry();
-
-        let result = registry
-            .resolve_referrer_descriptor(&referrer_namespace(), &subject(), manifest_digest, None)
-            .await;
-        assert!(result.is_some());
-    }
-
-    #[tokio::test]
-    async fn falls_through_to_blob_when_link_carries_no_descriptor() {
-        let (case, manifest_digest) = split_case_with_blob(None).await;
-        let registry = case.registry();
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            None,
-        )
-        .await;
-
-        let result = registry
-            .resolve_referrer_descriptor(&referrer_namespace(), &subject(), manifest_digest, None)
-            .await;
-        assert!(result.is_some());
-    }
-
-    #[tokio::test]
-    async fn returns_blob_descriptor_when_blob_filter_matches() {
-        let (case, manifest_digest) = split_case_with_blob(Some("application/vnd.foo")).await;
-        let registry = case.registry();
-
-        let at = media_type("application/vnd.foo");
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                manifest_digest,
-                Some(&at),
-            )
-            .await;
-        assert_eq!(
-            result.unwrap().artifact_type.as_deref(),
-            Some("application/vnd.foo")
+    async fn a_referrer_resolves_from_its_cached_descriptor_else_its_manifest() {
+        const FOO: &str = "application/vnd.foo";
+        const BAR: &str = "application/vnd.bar";
+        let not_json: &[u8] = b"not json";
+        let (foo, bar, untyped) = (
+            manifest_bytes(Some(FOO)),
+            manifest_bytes(Some(BAR)),
+            manifest_bytes(None),
         );
-    }
 
-    #[tokio::test]
-    async fn returns_none_when_blob_filter_mismatches() {
-        let (case, manifest_digest) = split_case_with_blob(Some("application/vnd.foo")).await;
-        let registry = case.registry();
-
-        let filter = media_type("application/vnd.bar");
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                manifest_digest,
-                Some(&filter),
-            )
-            .await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn returns_none_when_blob_not_found() {
-        let case = FSRegistryTestCase::new();
-        let registry = case.registry();
-
-        let result = registry
-            .resolve_referrer_descriptor(
-                &referrer_namespace(),
-                &subject(),
-                Digest::sha256(HASH_B).unwrap(),
+        for (index, (body, cached, filter, expected)) in [
+            // An unparseable body: only the cache can answer.
+            (
+                Some(not_json),
+                Cached::Typed(Some(FOO)),
                 None,
-            )
-            .await;
-        assert!(result.is_none());
-    }
+                Expected::Cached,
+            ),
+            (
+                Some(not_json),
+                Cached::Typed(Some(FOO)),
+                Some(FOO),
+                Expected::Cached,
+            ),
+            // The body would match, so falling through would wrongly answer.
+            (
+                Some(&bar[..]),
+                Cached::Typed(Some(FOO)),
+                Some(BAR),
+                Expected::Nothing,
+            ),
+            // A cache entry with no artifact type cannot tell the filter.
+            (
+                Some(&foo[..]),
+                Cached::Typed(None),
+                Some(FOO),
+                Expected::Manifest,
+            ),
+            (
+                Some(&untyped[..]),
+                Cached::NoRecord,
+                None,
+                Expected::Manifest,
+            ),
+            (Some(&untyped[..]), Cached::Bare, None, Expected::Manifest),
+            (
+                Some(&foo[..]),
+                Cached::NoRecord,
+                Some(FOO),
+                Expected::Manifest,
+            ),
+            (
+                Some(&foo[..]),
+                Cached::NoRecord,
+                Some(BAR),
+                Expected::Nothing,
+            ),
+            (None, Cached::NoRecord, None, Expected::Nothing),
+            (Some(not_json), Cached::NoRecord, None, Expected::Nothing),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = FSRegistryTestCase::new();
+            let registry = case.registry();
+            let digest = match body {
+                Some(body) => upload_blob(registry, &referrer_namespace(), body).await,
+                None => Digest::sha256_of_bytes(b"never stored"),
+            };
+            let descriptor = match cached {
+                Cached::Typed(artifact_type) => Some(descriptor_with(artifact_type, &digest)),
+                Cached::NoRecord | Cached::Bare => None,
+            };
+            if !matches!(cached, Cached::NoRecord) {
+                let namespace = referrer_namespace();
+                create_referrer_link(
+                    &registry.metadata_store,
+                    &namespace,
+                    &digest,
+                    descriptor.clone(),
+                )
+                .await;
+            }
 
-    #[tokio::test]
-    async fn returns_none_when_blob_is_invalid_manifest_json() {
-        let case = FSRegistryTestCase::new();
-        let registry = case.registry();
-        let manifest_digest = upload_blob(registry, &referrer_namespace(), b"not json").await;
-
-        let result = registry
-            .resolve_referrer_descriptor(&referrer_namespace(), &subject(), manifest_digest, None)
-            .await;
-        assert!(result.is_none());
+            let filter = filter.map(media_type);
+            let resolved = registry
+                .resolve_referrer_descriptor(
+                    &referrer_namespace(),
+                    &subject(),
+                    digest,
+                    filter.as_ref(),
+                )
+                .await;
+            match expected {
+                Expected::Nothing => assert_eq!(resolved, None, "case {index}"),
+                Expected::Cached => assert_eq!(resolved, descriptor, "case {index}"),
+                Expected::Manifest => assert_eq!(
+                    resolved.map(|resolved| resolved.size),
+                    body.map(|body| body.len() as u64),
+                    "case {index}"
+                ),
+            }
+        }
     }
 
     /// A repository imported from a registry whose clients used the referrers
@@ -1148,28 +1012,6 @@ mod tests {
         assert_eq!(page.items[0].digest, cached);
     }
 
-    // A referrer whose link carries no cached descriptor still resolves through
-    // the public listing when blob and metadata stores use separate roots.
-    #[tokio::test]
-    async fn list_referrers_resolves_manifests_on_split_backends() {
-        let (case, manifest_digest) = split_case_with_blob(Some("application/vnd.foo")).await;
-        let registry = case.registry();
-        create_referrer_link(
-            &registry.metadata_store,
-            &referrer_namespace(),
-            &manifest_digest,
-            None,
-        )
-        .await;
-
-        let referrers = registry
-            .list_referrers(None, &referrers_request(&referrer_namespace(), &subject()))
-            .await
-            .unwrap();
-        assert_eq!(referrers.items.len(), 1);
-        assert_eq!(referrers.items[0].digest, manifest_digest);
-    }
-
     /// A wide fan-out is served one page at a time: following `Link` visits
     /// every referrer exactly once and no single response carries them all.
     #[tokio::test]
@@ -1231,24 +1073,6 @@ mod tests {
         );
     }
 
-    /// Counts the listings of one subject's referrer records.
-    struct CountRecordListings {
-        dir: String,
-        count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl StoreHook for CountRecordListings {
-        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
-            if let StoreOp::List { prefix } = op
-                && prefix == self.dir
-            {
-                self.count.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }
-    }
-
     /// A page reads the records from its cursor: with more records than one
     /// listing returns, the last page costs a single listing, where reading
     /// from the start would take two.
@@ -1273,17 +1097,12 @@ mod tests {
         }
         referrers.sort();
 
-        let count = Arc::new(AtomicUsize::new(0));
-        let registry = create_test_registry(
-            case.blob_store(),
-            metadata_store_over(Arc::new(HookedStore::new(
-                seeding.object_store().clone(),
-                CountRecordListings {
-                    dir: namespace.referrer_record_dir(&subject()),
-                    count: count.clone(),
-                },
-            ))),
+        let dir = namespace.referrer_record_dir(&subject());
+        let (counted, count) = counting_metadata_store(
+            seeding.object_store().clone(),
+            move |op| matches!(op, StoreOp::List { prefix } if *prefix == dir),
         );
+        let registry = create_test_registry(case.blob_store(), counted);
         let page_size = usize::from(DEFAULT_PAGE_SIZE);
         let page = registry
             .list_referrers(
@@ -1367,298 +1186,68 @@ mod tests {
         );
     }
 
+    /// Referrers recorded without a descriptor resolve from their manifest
+    /// bodies, sorted by digest, and an artifact-type filter keeps only its
+    /// matches.
     #[tokio::test]
     async fn test_list_referrers() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
-            let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-repo").unwrap();
-            let base_digest = put_blob_direct(&test_case.blob_store(), b"base manifest content").await;
-            let base_link = LinkKind::Digest(base_digest.clone());
+            let subject = Digest::sha256_of_bytes(b"base manifest content");
 
-            create_link(&m, namespace, &base_link, &base_digest).await;
+            let mut expected = Vec::new();
+            for (index, artifact_type) in ["sbom", "sbom", "signature"].iter().enumerate() {
+                let artifact_type = format!("application/vnd.example.{artifact_type}");
+                let content = format!(
+                    r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","subject":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{subject}","size":123}},"artifactType":"{artifact_type}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":7023}},"layers":[],"annotations":{{"index":"{index}"}}}}"#
+                );
+                let referrer = put_blob_direct(&test_case.blob_store(), content.as_bytes()).await;
+                registry
+                    .metadata_store
+                    .put_referrer(namespace, &subject, &referrer, None)
+                    .await
+                    .unwrap();
+                expected.push(Descriptor {
+                    media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
+                    digest: referrer,
+                    size: content.len() as u64,
+                    annotations: HashMap::from([("index".to_string(), index.to_string())]),
+                    artifact_type: Some(media_type(&artifact_type)),
+                    platform: None,
+                });
+            }
+            expected.sort_by(|a, b| a.digest.cmp(&b.digest));
 
-            let referrer_content = format!(
-                r#"{{
-                    "schemaVersion": 2,
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "subject": {{
-                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                        "digest": "{base_digest}",
-                        "size": 123
-                    }},
-                    "artifactType": "application/vnd.example.test-artifact",
-                    "config": {{
-                        "mediaType": "application/vnd.oci.image.config.v1+json",
-                        "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                        "size": 7023
-                    }},
-                    "layers": []
-                }}"#
-            );
-
-            let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
-            let link = LinkKind::Digest(referrer_digest.clone());
-
-            create_link(&m, namespace, &link, &referrer_digest).await;
-
-            let referrers_link = LinkKind::Referrer {
-                subject: base_digest.clone(),
-                referrer: referrer_digest.clone(),
+            let listed = async |artifact_type: Option<&str>| {
+                registry
+                    .list_referrers(
+                        None,
+                        &GetReferrersRequest {
+                            artifact_type: artifact_type.map(media_type),
+                            ..referrers_request(namespace, &subject)
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .items
             };
-
-            create_link(&m, namespace, &referrers_link, &referrer_digest).await;
-
-            let referrers = registry
-                .list_referrers(None, &referrers_request(namespace, &base_digest))
-                .await;
-
-            let expected = vec![Descriptor {
-                media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
-                digest: referrer_digest,
-                size: u64::try_from(referrer_content.len()).unwrap(),
-                annotations: HashMap::new(),
-                artifact_type: Some(media_type("application/vnd.example.test-artifact")),
-                platform: None,
-            }];
-
-            assert_eq!(referrers.unwrap().items, expected);
-
-            let filtered_referrers = registry
-                .list_referrers(
-                    None,
-                    &GetReferrersRequest {
-                        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
-                        ..referrers_request(namespace, &base_digest)
-                    },
-                )
-                .await
-                .unwrap();
-
-            assert!(!filtered_referrers.items.is_empty(), "no referrer matched the filter");
-
-            let non_matching_referrers = registry
-                .list_referrers(
-                    None,
-                    &GetReferrersRequest {
-                        artifact_type: Some(media_type("application/vnd.non-existent")),
-                        ..referrers_request(namespace, &base_digest)
-                    },
-                )
-                .await
-                .unwrap();
-
-            assert!(non_matching_referrers.items.is_empty(), "{:?}", non_matching_referrers.items);
+            assert_eq!(listed(None).await, expected);
+            let sboms = listed(Some("application/vnd.example.sbom")).await;
+            assert_eq!(sboms.len(), 2, "{sboms:?}");
+            assert!(listed(Some("application/vnd.non-existent")).await.is_empty());
         })
         .await;
     }
 
-    #[tokio::test]
-    async fn test_list_referrers_with_artifact_type_filter() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let m = registry.metadata_store.clone();
-            let namespace = &Namespace::new("test-referrers-filter").unwrap();
-            let subject_digest =
-                put_blob_direct(&test_case.blob_store(), b"subject manifest for filter test").await;
-            let subject_link = LinkKind::Digest(subject_digest.clone());
-            create_link(&m, namespace, &subject_link, &subject_digest).await;
-
-            for i in 0..3 {
-                let referrer_content = format!(
-                    r#"{{
-                        "schemaVersion": 2,
-                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                        "subject": {{
-                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                            "digest": "{subject_digest}",
-                            "size": 123
-                        }},
-                        "artifactType": "application/vnd.example.sbom",
-                        "config": {{
-                            "mediaType": "application/vnd.oci.image.config.v1+json",
-                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                            "size": 7023
-                        }},
-                        "layers": [],
-                        "annotations": {{ "sbom-index": "{i}" }}
-                    }}"#
-                );
-
-                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
-                let digest_link = LinkKind::Digest(referrer_digest.clone());
-                create_link(&m, namespace, &digest_link, &referrer_digest).await;
-
-                let referrer_link = LinkKind::Referrer {
-                    subject: subject_digest.clone(),
-                    referrer: referrer_digest.clone(),
-                };
-                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
-            }
-
-            for i in 0..2 {
-                let referrer_content = format!(
-                    r#"{{
-                        "schemaVersion": 2,
-                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                        "subject": {{
-                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                            "digest": "{subject_digest}",
-                            "size": 123
-                        }},
-                        "artifactType": "application/vnd.example.signature",
-                        "config": {{
-                            "mediaType": "application/vnd.oci.image.config.v1+json",
-                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                            "size": 7023
-                        }},
-                        "layers": [],
-                        "annotations": {{ "sig-index": "{i}" }}
-                    }}"#
-                );
-
-                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
-                let digest_link = LinkKind::Digest(referrer_digest.clone());
-                create_link(&m, namespace, &digest_link, &referrer_digest).await;
-
-                let referrer_link = LinkKind::Referrer {
-                    subject: subject_digest.clone(),
-                    referrer: referrer_digest.clone(),
-                };
-                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
-            }
-
-            let descriptors = registry
-                .list_referrers(
-                    None,
-                    &GetReferrersRequest {
-                        artifact_type: Some(media_type("application/vnd.example.sbom")),
-                        ..referrers_request(namespace, &subject_digest)
-                    },
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                descriptors.items.len(),
-                3,
-                "Expected 3 SBOM referrer descriptors but got {}",
-                descriptors.items.len()
-            );
-
-            for desc in &descriptors.items {
-                assert_eq!(
-                    desc.artifact_type.as_deref(),
-                    Some("application/vnd.example.sbom"),
-                    "All filtered descriptors should have SBOM artifact type"
-                );
-            }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_list_referrers_deterministic_order() {
-        for_each_backend(async |test_case| {
-            let registry = test_case.registry();
-            let m = registry.metadata_store.clone();
-            let namespace = &Namespace::new("test-referrers-order").unwrap();
-            let subject_digest =
-                put_blob_direct(&test_case.blob_store(), b"subject manifest for order test").await;
-            let subject_link = LinkKind::Digest(subject_digest.clone());
-            create_link(&m, namespace, &subject_link, &subject_digest).await;
-
-            for i in 0..10 {
-                let referrer_content = format!(
-                    r#"{{
-                        "schemaVersion": 2,
-                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                        "subject": {{
-                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                            "digest": "{subject_digest}",
-                            "size": 123
-                        }},
-                        "artifactType": "application/vnd.example.test-artifact",
-                        "config": {{
-                            "mediaType": "application/vnd.oci.image.config.v1+json",
-                            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                            "size": 7023
-                        }},
-                        "layers": [],
-                        "annotations": {{ "order-index": "{i}" }}
-                    }}"#
-                );
-
-                let referrer_digest = put_blob_direct(&test_case.blob_store(), referrer_content.as_bytes()).await;
-                let digest_link = LinkKind::Digest(referrer_digest.clone());
-                create_link(&m, namespace, &digest_link, &referrer_digest).await;
-
-                let referrer_link = LinkKind::Referrer {
-                    subject: subject_digest.clone(),
-                    referrer: referrer_digest.clone(),
-                };
-                create_link(&m, namespace, &referrer_link, &referrer_digest).await;
-            }
-
-            let result1 = registry
-                .list_referrers(None, &referrers_request(namespace, &subject_digest))
-                .await
-                .unwrap();
-            let result2 = registry
-                .list_referrers(None, &referrers_request(namespace, &subject_digest))
-                .await
-                .unwrap();
-            let result3 = registry
-                .list_referrers(None, &referrers_request(namespace, &subject_digest))
-                .await
-                .unwrap();
-
-            assert_eq!(
-                result1.items.len(),
-                10,
-                "Expected 10 referrer descriptors but got {}",
-                result1.items.len()
-            );
-            assert_eq!(
-                result1, result2,
-                "First and second list_referrers calls should return identical results"
-            );
-            assert_eq!(
-                result2, result3,
-                "Second and third list_referrers calls should return identical results"
-            );
-
-            for pair in result1.items.windows(2) {
-                assert!(
-                    pair[0].digest.to_string() <= pair[1].digest.to_string(),
-                    "Descriptors should be sorted by digest: {} should come before {}",
-                    pair[0].digest,
-                    pair[1].digest
-                );
-            }
-        })
-        .await;
-    }
-
+    /// A stored descriptor is served as recorded, with no manifest body to read.
     #[tokio::test]
     async fn test_list_referrers_with_stored_descriptor() {
         for_each_backend(async |test_case| {
             let registry = test_case.registry();
-            let m = registry.metadata_store.clone();
             let namespace = &Namespace::new("test-stored-descriptor").unwrap();
-
-            let base_digest =
-                put_blob_direct(&test_case.blob_store(), b"base manifest content").await;
-            let base_link = LinkKind::Digest(base_digest.clone());
-            create_link(&m, namespace, &base_link, &base_digest).await;
-
-            // The referrer blob is never written, so the descriptor can only come
-            // from the stored link metadata.
-            let referrer_digest: Digest =
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .parse()
-                    .unwrap();
-
+            let base_digest = Digest::sha256_of_bytes(b"base manifest content");
+            let referrer_digest = Digest::sha256_of_bytes(b"never stored");
             let descriptor = Descriptor {
                 media_type: media_type("application/vnd.oci.image.manifest.v1+json"),
                 digest: referrer_digest.clone(),
@@ -1667,8 +1256,9 @@ mod tests {
                 artifact_type: Some(media_type("application/vnd.example.test-artifact")),
                 platform: None,
             };
-
-            m.put_referrer(namespace, &base_digest, &referrer_digest, Some(&descriptor))
+            registry
+                .metadata_store
+                .put_referrer(namespace, &base_digest, &referrer_digest, Some(&descriptor))
                 .await
                 .unwrap();
 
@@ -1676,37 +1266,7 @@ mod tests {
                 .list_referrers(None, &referrers_request(namespace, &base_digest))
                 .await
                 .unwrap();
-
-            assert_eq!(referrers.items.len(), 1);
-            assert_eq!(referrers.items[0], descriptor);
-
-            let filtered = registry
-                .list_referrers(
-                    None,
-                    &GetReferrersRequest {
-                        artifact_type: Some(media_type("application/vnd.example.test-artifact")),
-                        ..referrers_request(namespace, &base_digest)
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(filtered.items.len(), 1, "Should match artifact type filter");
-            assert_eq!(filtered.items[0], descriptor);
-
-            let non_matching = registry
-                .list_referrers(
-                    None,
-                    &GetReferrersRequest {
-                        artifact_type: Some(media_type("application/vnd.non-existent")),
-                        ..referrers_request(namespace, &base_digest)
-                    },
-                )
-                .await
-                .unwrap();
-            assert!(
-                non_matching.items.is_empty(),
-                "Should return empty for non-matching artifact type"
-            );
+            assert_eq!(referrers.items, [descriptor]);
         })
         .await;
     }

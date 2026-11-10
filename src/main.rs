@@ -64,8 +64,9 @@ fn set_tracing(
             .with_timeout(Duration::from_secs(10))
             .build()
         else {
-            let msg = "Failed to create OTLP exporter".to_string();
-            return Err(configuration::Error::Initialization(msg));
+            return Err(configuration::Error::Initialization(
+                "Failed to create OTLP exporter".to_string(),
+            ));
         };
 
         let tracer_provider = SdkTracerProvider::builder()
@@ -98,8 +99,6 @@ fn set_tracing(
     Ok(provider)
 }
 
-const DEFAULT_CONFIG_PATH: &str = "config.toml";
-
 #[derive(FromArgs, PartialEq, Debug)]
 /// An OCI-compliant and docker-compatible registry service
 struct GlobalArguments {
@@ -110,14 +109,6 @@ struct GlobalArguments {
 
     #[argh(subcommand)]
     subcommand: SubCommand,
-}
-
-/// The configuration files to load, in merge order.
-fn config_paths(arguments: &GlobalArguments) -> Vec<String> {
-    if arguments.config.is_empty() {
-        return vec![DEFAULT_CONFIG_PATH.to_string()];
-    }
-    arguments.config.clone()
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -138,10 +129,14 @@ fn main() {
         exit(1);
     }
 
-    let cli_args: GlobalArguments = argh::from_env();
-    let config_paths = config_paths(&cli_args);
+    let GlobalArguments { config, subcommand } = argh::from_env();
+    let config_paths = if config.is_empty() {
+        vec!["config.toml".to_string()]
+    } else {
+        config
+    };
     initialize_metrics();
-    let exit_code = match cli_args.subcommand {
+    let exit_code = match subcommand {
         SubCommand::Scanner(options) => scanner_main(&options, &config_paths),
         subcommand => registry_main(subcommand, &config_paths),
     };
@@ -252,7 +247,6 @@ async fn run_command(
     }
 }
 
-/// Log a failed subcommand under `label` and map the result to an exit code.
 fn report(label: &str, result: Result<(), impl Display>) -> i32 {
     match result {
         Ok(()) => 0,

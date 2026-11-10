@@ -1,27 +1,5 @@
-//! Retention policy evaluation for manifest cleanup.
-//!
-//! This module provides CEL-based retention policies for automatic manifest cleanup.
-//! Policies are pre-compiled at configuration load time for performance.
-//!
-//! # Policy Evaluation
-//!
-//! Retention policies determine which manifests should be kept. If any rule
-//! matches, the manifest is retained. Otherwise, it is eligible for deletion.
-//!
-//! # Available Variables
-//!
-//! CEL expressions have access to:
-//! - `image`: Manifest information (`namespace`, `tag`, `pushed_at`,
-//!   `last_pulled_at`, `scanned_at`)
-//!
-//! # Helper Functions
-//!
-//! - `now()`: Current timestamp in seconds since epoch
-//! - `days(n)`: Convert days to seconds
-//! - `hours(n)`: Convert hours to seconds
-//! - `minutes(n)`: Convert minutes to seconds
-//! - `top_pushed(n)`: Check if tag is in top N most recently pushed
-//! - `top_pulled(n)`: Check if tag is in top N most recently pulled
+//! CEL retention policies: a manifest any rule matches is retained, the rest
+//! are eligible for deletion.
 
 use std::sync::Arc;
 
@@ -32,10 +10,9 @@ use tracing::{debug, warn};
 
 use angos_oci::Namespace;
 
-use crate::policy::clock::Clock;
+use crate::policy::clock::{Clock, SystemClock};
 use crate::policy::{CelRule, Error, RuleOutcome, evaluate_rules};
 
-/// Configuration for retention policies.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct RetentionPolicyConfig {
     #[serde(default)]
@@ -50,7 +27,7 @@ pub fn rules_use_pull_time(rules: &[CelRule]) -> bool {
         .any(|rule| rule.source.contains("last_pulled_at") || rule.source.contains("top_pulled"))
 }
 
-/// Manifest image information used in retention decisions.
+/// The `image` object CEL rules read.
 #[derive(Debug, Default, Serialize)]
 pub struct ManifestImage {
     pub namespace: String,
@@ -87,23 +64,17 @@ impl ManifestImage {
     }
 }
 
-/// Retention policy engine.
-///
-/// Evaluates CEL expressions to determine if manifests should be retained.
-/// Rules are pre-compiled at configuration time for better performance.
 pub struct RetentionPolicy {
     rules: Vec<CelRule>,
+    /// The `now()` rules read: the system clock, frozen by this module's tests.
     clock: Arc<dyn Clock>,
 }
 
 impl RetentionPolicy {
-    /// Creates a new retention policy from configuration.
-    ///
-    /// Rules are already compiled; this constructor is infallible.
-    pub fn new(config: &RetentionPolicyConfig, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(rules: Vec<CelRule>) -> Self {
         Self {
-            rules: config.rules.clone(),
-            clock,
+            rules,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -111,34 +82,10 @@ impl RetentionPolicy {
         !self.rules.is_empty()
     }
 
-    /// Evaluates whether a manifest should be retained.
-    ///
-    /// Rules are evaluated in order; the first matching rule (returning `true`) causes the
-    /// manifest to be kept. If no rule matches, the manifest is eligible for deletion.
-    ///
-    /// # Fail-open semantics (data safety)
-    ///
-    /// Retention policies are **fail-open**: unexpected rule outcomes default to keeping the
-    /// manifest. This is the safer choice: it is better to retain a manifest that should have
-    /// been deleted than to silently delete one that should have been kept.
-    ///
-    /// | Outcome                        | Behaviour          | Log level |
-    /// |--------------------------------|--------------------|-----------|
-    /// | `bool(true)`                   | retain             | `debug`   |
-    /// | `bool(false)`                  | continue to next rule | none   |
-    /// | non-boolean value (misconfiguration) | retain (fail-open) | `warn` |
-    /// | evaluation error               | retain (fail-open) | `warn`   |
-    /// | no rules matched               | delete             | none      |
-    ///
-    /// # Arguments
-    /// * `manifest` - The manifest image information
-    /// * `last_pushed` - List of recently pushed tags (most recent first)
-    /// * `last_pulled` - List of recently pulled tags (most recent first)
-    ///
-    /// # Returns
-    /// * `Ok(true)` if the manifest should be retained
-    /// * `Ok(false)` if the manifest can be deleted
-    /// * `Err` if context construction fails (rule execution errors are handled internally)
+    /// Whether `manifest` is kept. No rules keep everything, and an
+    /// indeterminate rule keeps it too, since keeping a manifest by mistake
+    /// beats deleting one. `last_pushed` and `last_pulled` rank tags most
+    /// recent first.
     pub fn should_retain(
         &self,
         manifest: &ManifestImage,
@@ -156,7 +103,6 @@ impl RetentionPolicy {
             }
             RuleOutcome::NoMatch => Ok(false),
             RuleOutcome::Indeterminate { index, message } => {
-                // Fail-open: a misconfigured or failing rule retains (data safety).
                 warn!(
                     "Retention rule {index} is indeterminate: {message}; \
                      treating as 'retain' (fail-open)"
@@ -166,70 +112,44 @@ impl RetentionPolicy {
         }
     }
 
-    /// Runs the rules over `manifest` and answers the raw outcome, for a
-    /// caller whose reading of an indeterminate rule differs from retention's.
+    /// The raw outcome, for a caller reading an indeterminate rule
+    /// differently. `Err` only when the context cannot be built.
     pub fn evaluate(
         &self,
         manifest: &ManifestImage,
         last_pushed: &[String],
         last_pulled: &[String],
     ) -> Result<RuleOutcome, Error> {
-        let context = self.build_context(manifest, last_pushed, last_pulled)?;
-        Ok(evaluate_rules(&self.rules, &context))
-    }
-
-    fn build_context<'a>(
-        &self,
-        manifest: &'a ManifestImage,
-        last_pushed: &'a [String],
-        last_pulled: &'a [String],
-    ) -> Result<Context<'a>, Error> {
         let mut context = Context::default();
-
         context.add_variable("image", manifest)?;
-
-        let clock_for_now = self.clock.clone();
-        context.add_function("now", move || clock_for_now.now().timestamp());
-        context.add_function("days", days);
-        context.add_function("hours", hours);
-        context.add_function("minutes", minutes);
-
+        let clock = self.clock.clone();
+        context.add_function("now", move || clock.now().timestamp());
+        context.add_function("days", |d: i64| d.saturating_mul(86400));
+        context.add_function("hours", |h: i64| h.saturating_mul(3600));
+        context.add_function("minutes", |m: i64| m.saturating_mul(60));
         context.add_function(
             "top_pushed",
-            Self::build_top_fn(manifest.tag.clone(), last_pushed.to_vec()),
+            top_fn(manifest.tag.clone(), last_pushed.to_vec()),
         );
         context.add_function(
             "top_pulled",
-            Self::build_top_fn(manifest.tag.clone(), last_pulled.to_vec()),
+            top_fn(manifest.tag.clone(), last_pulled.to_vec()),
         );
-
-        Ok(context)
-    }
-
-    /// Builds a `top_pushed`/`top_pulled` CEL function over a tag ranking.
-    /// Untagged subjects never match: this is what lets a count-only policy
-    /// reclaim the revisions its own tag deletions orphan.
-    fn build_top_fn(tag: Option<String>, list: Vec<String>) -> impl Fn(i64) -> bool + Send + Sync {
-        move |count: i64| {
-            let Some(ref tag) = tag else {
-                return false;
-            };
-            let limit = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
-            list.iter().take(limit).any(|t| t == tag)
-        }
+        Ok(evaluate_rules(&self.rules, &context))
     }
 }
 
-fn days(d: i64) -> i64 {
-    d.saturating_mul(86400)
-}
-
-fn hours(h: i64) -> i64 {
-    h.saturating_mul(3600)
-}
-
-fn minutes(m: i64) -> i64 {
-    m.saturating_mul(60)
+/// A `top_pushed`/`top_pulled` function over a tag ranking. Untagged subjects
+/// never match, which lets a count-only policy reclaim the revisions its own
+/// tag deletions orphan.
+fn top_fn(tag: Option<String>, ranking: Vec<String>) -> impl Fn(i64) -> bool + Send + Sync {
+    move |count: i64| {
+        let Some(ref tag) = tag else {
+            return false;
+        };
+        let limit = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+        ranking.iter().take(limit).any(|t| t == tag)
+    }
 }
 
 #[cfg(test)]
@@ -237,7 +157,6 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
 
     use super::*;
-    use crate::policy::clock::SystemClock;
 
     struct FixedClock(DateTime<Utc>);
 
@@ -247,23 +166,23 @@ mod tests {
         }
     }
 
-    /// Builds a policy over compiled CEL rule sources, driven by `clock`.
-    fn policy_with_clock(rules: &[&str], clock: Arc<dyn Clock>) -> RetentionPolicy {
-        let rules = rules
-            .iter()
-            .map(|source| CelRule::compile(source).unwrap())
-            .collect();
-        RetentionPolicy::new(&RetentionPolicyConfig { rules }, clock)
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
     }
 
-    /// Builds a policy over CEL rule sources, driven by the system clock.
     fn policy(rules: &[&str]) -> RetentionPolicy {
-        policy_with_clock(rules, Arc::new(SystemClock))
+        let rules = rules.iter().map(|s| CelRule::compile(s).unwrap()).collect();
+        RetentionPolicy {
+            clock: Arc::new(FixedClock(fixed_now())),
+            ..RetentionPolicy::new(rules)
+        }
     }
 
-    /// Builds a policy over CEL rule sources, driven by a clock frozen at `now`.
-    fn policy_at(now: DateTime<Utc>, rules: &[&str]) -> RetentionPolicy {
-        policy_with_clock(rules, Arc::new(FixedClock(now)))
+    fn tagged(tag: Option<&str>) -> ManifestImage {
+        ManifestImage {
+            tag: tag.map(str::to_string),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -282,254 +201,98 @@ mod tests {
         assert!(!policy.should_retain(&image("dev/api"), &[], &[]).unwrap());
     }
 
-    fn fixed_now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    #[test]
+    fn top_n_matches_the_tag_ranking() {
+        let pushed = ["v3".to_string(), "v2".to_string(), "v1".to_string()];
+        let pulled = ["v1".to_string(), "v2".to_string()];
+        for (rule, tag, retained) in [
+            ("top_pushed(2)", Some("v2"), true),
+            ("top_pushed(2)", Some("v1"), false),
+            ("top_pushed(10)", None, false),
+            ("top_pushed(-5)", Some("v3"), false),
+            ("top_pulled(1)", Some("v1"), true),
+            ("top_pulled(1)", Some("v3"), false),
+        ] {
+            let kept = policy(&[rule])
+                .should_retain(&tagged(tag), &pushed, &pulled)
+                .unwrap();
+            assert_eq!(kept, retained, "{rule} on {tag:?}");
+        }
     }
 
     #[test]
-    fn test_top_pushed_in_top_n() {
-        let policy = policy(&["top_pushed(3)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v2".to_string()),
+    fn now_reads_the_injected_clock() {
+        let policy = policy(&["image.last_pulled_at > now() - hours(1)"]);
+        let pulled_at = |offset: i64| ManifestImage {
+            last_pulled_at: fixed_now().timestamp() - offset,
             ..Default::default()
         };
-        let last_pushed = vec!["v3".to_string(), "v2".to_string(), "v1".to_string()];
-
-        assert!(policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
-    }
-
-    #[test]
-    fn test_top_pushed_not_in_top_n() {
-        let policy = policy(&["top_pushed(2)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        let last_pushed = vec!["v3".to_string(), "v2".to_string(), "v1".to_string()];
-
-        assert!(!policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
-    }
-
-    #[test]
-    fn test_top_pushed_orphan_manifest() {
-        let policy = policy(&["top_pushed(10)"]);
-
-        let manifest = ManifestImage {
-            tag: None,
-            ..Default::default()
-        };
-        let last_pushed = vec!["v1".to_string()];
-
-        assert!(!policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
-    }
-
-    #[test]
-    fn test_top_pulled_in_top_n() {
-        let policy = policy(&["top_pulled(2)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        let last_pulled = vec!["v1".to_string(), "v2".to_string()];
-
-        assert!(policy.should_retain(&manifest, &[], &last_pulled).unwrap());
-    }
-
-    #[test]
-    fn test_last_pulled_at_recent() {
-        let now = fixed_now();
-        let policy = policy_at(now, &["image.last_pulled_at > now() - hours(1)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            last_pulled_at: now.timestamp(),
-            ..Default::default()
-        };
-
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn test_last_pulled_at_old() {
-        let now = fixed_now();
-        let policy = policy_at(now, &["image.last_pulled_at > now() - hours(1)"]);
-
-        let manifest = ManifestImage {
-            tag: Some("v2".to_string()),
-            last_pulled_at: now.timestamp() - 2 * 3600,
-            ..Default::default()
-        };
-
-        assert!(!policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn negative_timestamp_saturates_to_zero() {
-        let pre_epoch = DateTime::from_timestamp(-100, 0).unwrap();
-        let image = ManifestImage::new(
-            &Namespace::new("app").unwrap(),
-            None,
-            Some(pre_epoch),
-            Some(pre_epoch),
-            fixed_now(),
-        );
-        assert_eq!((image.pushed_at, image.last_pulled_at), (0, 0));
-    }
-
-    #[test]
-    fn non_boolean_rule_retains_fail_open() {
-        // A rule that returns an integer instead of a bool is a misconfiguration.
-        // The evaluator must treat this as "retain" (fail-open) without panicking.
-        let policy = policy(&["42"]);
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn failed_rule_evaluation_retains_fail_open() {
-        // A rule that references an unbound variable fails at execution time
-        // (not compile time).  The evaluator must treat this as "retain" (fail-open).
-        let policy = policy(&["nonexistent_var"]);
-        let manifest = ManifestImage::default();
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    /// Empty rules list means no retention criteria are configured.
-    /// `should_retain` returns `true` immediately so that manifests are never
-    /// deleted when the operator has not expressed an intent to delete anything.
-    #[test]
-    fn empty_rules_retain_all() {
-        let policy = policy(&[]);
-        let tagged = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        let orphan = ManifestImage {
-            tag: None,
-            ..Default::default()
-        };
-        assert!(policy.should_retain(&tagged, &[], &[]).unwrap());
-        assert!(policy.should_retain(&orphan, &[], &[]).unwrap());
-    }
-
-    /// `top_pushed(-n)` clamps the count to 0 via `count.max(0)`, so the
-    /// effective window is empty and no tag can ever match.  The manifest is
-    /// eligible for deletion rather than being retained.
-    #[test]
-    fn top_pushed_with_negative_count_clamps_to_zero() {
-        let policy = policy(&["top_pushed(-5)"]);
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        let last_pushed = vec!["v1".to_string(), "v2".to_string()];
-        assert!(!policy.should_retain(&manifest, &last_pushed, &[]).unwrap());
-    }
-
-    /// Rules are evaluated in OR fashion: the first rule that returns `true`
-    /// causes immediate retention.  When rule 1 returns `false` and rule 2
-    /// returns `true`, the manifest is still retained.
-    #[test]
-    fn multiple_rules_first_false_then_true_retains() {
-        let policy = policy(&["false", "true"]);
-        let manifest = ManifestImage {
-            tag: Some("v1".to_string()),
-            ..Default::default()
-        };
-        assert!(policy.should_retain(&manifest, &[], &[]).unwrap());
-    }
-
-    #[test]
-    fn injected_clock_is_observed_by_now_function() {
-        let fixed = fixed_now();
-        let policy = policy_at(fixed, &["image.pushed_at == now()"]);
-
-        let matching = ManifestImage {
-            tag: Some("v1".to_string()),
-            pushed_at: fixed.timestamp(),
-            ..Default::default()
-        };
+        assert!(policy.should_retain(&pulled_at(0), &[], &[]).unwrap());
         assert!(
-            policy.should_retain(&matching, &[], &[]).unwrap(),
-            "manifest pushed exactly at the fixed clock time should be retained"
-        );
-
-        let one_second_later = ManifestImage {
-            tag: Some("v1".to_string()),
-            pushed_at: fixed.timestamp() + 1,
-            ..Default::default()
-        };
-        assert!(
-            !policy.should_retain(&one_second_later, &[], &[]).unwrap(),
-            "manifest pushed one second after the fixed clock time should not be retained"
+            !policy
+                .should_retain(&pulled_at(2 * 3600), &[], &[])
+                .unwrap()
         );
     }
 
     #[test]
-    fn days_overflow_saturates() {
-        assert_eq!(days(i64::MAX), i64::MAX);
+    fn duration_helpers_saturate() {
+        let policy =
+            policy(&["days(7) == 604800 && days(9223372036854775807) == 9223372036854775807"]);
+        assert!(matches!(
+            policy.evaluate(&tagged(None), &[], &[]).unwrap(),
+            RuleOutcome::Matched(1)
+        ));
     }
 
     #[test]
-    fn days_normal_value() {
-        assert_eq!(days(7), 7 * 86400);
+    fn rule_outcomes_decide_retention() {
+        for (rules, retained) in [
+            (&[][..], true),
+            (&["false", "true"][..], true),
+            (&["false"][..], false),
+            // Fail open on a non-boolean or an evaluation error.
+            (&["42"][..], true),
+            (&["nonexistent_var"][..], true),
+        ] {
+            let kept = policy(rules)
+                .should_retain(&tagged(Some("v1")), &[], &[])
+                .unwrap();
+            assert_eq!(kept, retained, "{rules:?}");
+        }
     }
 
     #[test]
     fn uses_pull_time_detects_pull_dependent_rules() {
-        for source in ["top_pulled(5)", "image.last_pulled_at > now() - days(7)"] {
-            let config = RetentionPolicyConfig {
-                rules: vec![CelRule::compile(source).unwrap()],
-            };
-            assert!(
-                rules_use_pull_time(&config.rules),
-                "{source} must be detected"
-            );
-        }
-
-        let push_only = RetentionPolicyConfig {
-            rules: vec![
-                CelRule::compile("top_pushed(3)").unwrap(),
-                CelRule::compile("image.pushed_at > now() - days(30)").unwrap(),
-            ],
+        let compile = |sources: &[&str]| -> Vec<CelRule> {
+            sources
+                .iter()
+                .map(|s| CelRule::compile(s).unwrap())
+                .collect()
         };
-        assert!(!rules_use_pull_time(&push_only.rules));
+        assert!(rules_use_pull_time(&compile(&["top_pulled(5)"])));
+        assert!(rules_use_pull_time(&compile(&[
+            "image.last_pulled_at > now() - days(7)"
+        ])));
+        assert!(!rules_use_pull_time(&compile(&[
+            "top_pushed(3)",
+            "image.pushed_at > now() - days(30)"
+        ])));
     }
 
-    /// The two absences resolve differently and both are operator-visible:
-    /// `doc/reference/cel-expressions.md` documents `last_pulled_at` as "0 if
-    /// never pulled", while an unknown push time must not read as 1970.
+    /// An unknown push time must not read as 1970, and `last_pulled_at` is
+    /// documented as `0` if never pulled; pre-epoch dates saturate to `0`.
     #[test]
-    fn absent_timestamps_resolve_to_now_and_zero() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-
-        let never_pulled =
-            ManifestImage::new(&Namespace::new("app").unwrap(), None, None, None, now);
+    fn new_resolves_absent_and_pre_epoch_timestamps() {
+        let app = Namespace::new("app").unwrap();
+        let absent = ManifestImage::new(&app, None, None, None, fixed_now());
         assert_eq!(
-            never_pulled.last_pulled_at, 0,
-            "never pulled must be an absence, not a timestamp at the epoch"
+            (absent.pushed_at, absent.last_pulled_at),
+            (fixed_now().timestamp(), 0)
         );
-        let unknown = serde_json::to_value(never_pulled).unwrap();
-        assert_eq!(unknown["pushed_at"], now.timestamp());
-        assert_eq!(unknown["last_pulled_at"], 0);
 
-        let pushed = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
-        let pulled = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
-        let known = serde_json::to_value(ManifestImage::new(
-            &Namespace::new("app").unwrap(),
-            None,
-            Some(pushed),
-            Some(pulled),
-            now,
-        ))
-        .unwrap();
-        assert_eq!(known["pushed_at"], pushed.timestamp());
-        assert_eq!(known["last_pulled_at"], pulled.timestamp());
+        let pre_epoch = DateTime::from_timestamp(-100, 0).unwrap();
+        let old = ManifestImage::new(&app, None, Some(pre_epoch), Some(pre_epoch), fixed_now());
+        assert_eq!((old.pushed_at, old.last_pulled_at), (0, 0));
     }
 }

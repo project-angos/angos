@@ -14,7 +14,6 @@ use crate::command::maintenance::Error;
 use crate::command::maintenance::action::Action;
 use crate::command::maintenance::executor::ActionSink;
 use crate::registry::blob_store::BlobStore;
-use crate::registry::content_discovery::holds_manifest_content;
 use crate::registry::metadata_store::{LIST_PAGE, MetadataStore};
 use crate::registry::repository_resolver::RepositoryResolver;
 
@@ -38,12 +37,7 @@ pub async fn sweep_orphan_namespaces(
     // Ownership is resolved in the walk, so a namespace a repository claims
     // costs no content probe at all.
     let unowned = |namespace: &Namespace| resolver.resolve(namespace).is_none();
-    let mut orphans = pin!(metadata_store.stream_namespaces(
-        None,
-        LIST_PAGE,
-        &unowned,
-        |namespace| holds_manifest_content(metadata_store, namespace)
-    ));
+    let mut orphans = pin!(metadata_store.stream_namespaces(None, LIST_PAGE, &unowned));
     while let Some(namespace) = orphans.try_next().await? {
         if let Err(e) = clear_namespace(metadata_store, &namespace, sink).await {
             error!("prune: failed to clear orphan namespace '{namespace}': {e}");
@@ -117,8 +111,7 @@ mod tests {
     use angos_oci::UploadSessionId;
 
     use super::*;
-    use crate::command::maintenance::executor::Executor;
-    use crate::registry::repository_resolver::RepositoryResolver;
+    use crate::command::maintenance::test_helper::test_executor;
     use crate::registry::test_utils::{create_test_repositories, for_each_backend, seed_manifest};
 
     fn resolver() -> Arc<RepositoryResolver> {
@@ -144,7 +137,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
             sweep_orphan_namespaces(&blob_store, &metadata_store, &resolver(), &executor)
                 .await
                 .unwrap();
@@ -186,7 +179,7 @@ mod tests {
             let empty = Arc::new(
                 RepositoryResolver::new(Arc::new(HashMap::new())).expect("empty resolver"),
             );
-            let executor = Executor::new_for_test(blob_store.clone(), metadata_store.clone());
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
             sweep_orphan_namespaces(&blob_store, &metadata_store, &empty, &executor)
                 .await
                 .unwrap();

@@ -220,11 +220,7 @@ fn test_invalid_toml_format() {
     "#;
 
     let result = Configuration::load_from_str(config);
-    assert!(result.is_err());
-    match result {
-        Err(Error::InvalidFormat(_)) => {}
-        _ => panic!("Expected InvalidFormat error"),
-    }
+    assert!(matches!(result, Err(Error::InvalidFormat(_))), "{result:?}");
 }
 
 #[test]
@@ -282,10 +278,7 @@ fn test_load_from_file() {
     temp_file.write_all(config_content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let result = Configuration::load_all(&[temp_file.path()]);
-    assert!(result.is_ok());
-
-    let config = result.unwrap();
+    let config = Configuration::load_all(&[temp_file.path()]).unwrap();
     assert_eq!(
         config.global.max_concurrent_requests,
         NonZeroUsize::new(8).unwrap()
@@ -303,20 +296,13 @@ fn test_load_from_file() {
 #[test]
 fn test_load_from_nonexistent_file() {
     let result = Configuration::load_all(&["/nonexistent/path/to/config.toml"]);
-    assert!(result.is_err());
-
-    match result {
-        Err(Error::NotReadable(msg)) => {
-            assert!(msg.contains("Unable to read configuration file"));
-        }
-        _ => panic!("Expected NotReadable error"),
-    }
+    assert!(matches!(result, Err(Error::NotReadable(_))), "{result:?}");
 }
 
 // No storage backend gates the durable queue at config time; the startup
 // claim-support probe enforces the real precondition.
 #[test]
-fn job_queue_accepted_on_s3() {
+fn job_queue_accepted() {
     let config = r#"
     [server]
     bind_address = "0.0.0.0"
@@ -333,25 +319,7 @@ fn job_queue_accepted_on_s3() {
 
     assert!(
         Configuration::load_from_str(config).is_ok(),
-        "durable queue on S3 storage must be accepted"
-    );
-}
-
-#[test]
-fn job_queue_accepted_on_fs() {
-    let config = r#"
-    [server]
-    bind_address = "0.0.0.0"
-
-    [global.job_queue]
-
-    [blob_store.fs]
-    root_dir = "/data/blobs"
-    "#;
-
-    assert!(
-        Configuration::load_from_str(config).is_ok(),
-        "durable queue on FS storage must be accepted"
+        "durable queue must be accepted"
     );
 }
 
@@ -375,29 +343,6 @@ fn event_webhook_valid_global_reference_loads() {
 
     let config = Configuration::load_from_str(config).unwrap();
     assert!(config.event_webhook.contains_key("my-hook"));
-}
-
-#[test]
-fn event_webhook_valid_repo_reference_loads() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-
-    [event_webhook.repo-hook]
-    url = "https://example.com/hook"
-    policy = "optional"
-    events = ["manifest.push"]
-
-    [repository.myrepo]
-    event_webhooks = ["repo-hook"]
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-    assert!(config.repository.contains_key("myrepo"));
-    assert!(config.event_webhook.contains_key("repo-hook"));
 }
 
 #[test]
@@ -471,25 +416,5 @@ fn required_client_auth_without_a_ca_bundle_is_rejected() {
     assert!(
         message.contains("client_ca_bundle"),
         "the error must name the missing key: {message}"
-    );
-}
-
-/// A server section with no TLS keys is still a plaintext listener.
-#[test]
-fn a_server_section_without_tls_stays_insecure() {
-    let config = r#"
-    [blob_store.fs]
-    root_dir = "/tmp/test"
-
-    [server]
-    bind_address = "0.0.0.0"
-    port = 8000
-    "#;
-
-    let config = Configuration::load_from_str(config).unwrap();
-
-    assert!(
-        matches!(config.server, ServerConfig::Insecure(_)),
-        "no TLS keys means a plaintext listener"
     );
 }

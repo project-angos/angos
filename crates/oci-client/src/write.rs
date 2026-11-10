@@ -1,10 +1,4 @@
 //! Write methods for [`RegistryClient`].
-//!
-//! Byte-bodied requests reuse [`RegistryClient::send_with_auth_retry_capturing`]'s
-//! cached-token-then-single-refresh orchestration. The single-use stream in
-//! [`RegistryClient::put_upload`] cannot be replayed, so it reuses the auth
-//! header resolved when the session was opened ([`UploadSession::auth`]) and
-//! surfaces a `401` as an error instead of retrying.
 
 use bytes::Bytes;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
@@ -25,33 +19,16 @@ use angos_oci::{Digest, MediaType};
 
 use crate::{Error, RegistryClient, denied_if_forbidden, parse_header, without_query};
 
-/// An open downstream blob-upload session: the server-assigned continuation
-/// URL plus the auth header that opened it.
-///
-/// The streamed upload `PUT` reuses [`Self::auth`] because the session URL never
-/// issues its own auth challenge and a single-use body cannot be replayed to
-/// refresh a token on a `401`. Not `Debug`: `auth` carries a bearer/basic
-/// credential.
+/// A downstream upload session and the auth header that opened it, which the
+/// streamed `PUT` reuses since the session URL never challenges and a consumed
+/// body cannot be replayed. Not `Debug`: `auth` is a credential.
 pub struct UploadSession {
     pub url: String,
     pub auth: Option<String>,
 }
 
-/// Returns the first OCI error `code` from a `{"errors":[{"code":"..."}]}`
-/// response body, or `None` when the body is malformed or absent.
-async fn parse_oci_error_code(response: Response) -> Option<String> {
-    let bytes = response.bytes().await.ok()?;
-    serde_json::from_slice::<ErrorResponse>(&bytes)
-        .ok()?
-        .first_code()
-        .map(ToString::to_string)
-}
-
-/// The digest a write response advertises. `Ok(None)` means the remote sent no
-/// `Docker-Content-Digest`, which the OCI spec states as optional. A header
-/// that is present but not a digest is a protocol fault the caller reports,
-/// never an absent one, so the checks fed by this value cannot be skipped by
-/// sending garbage.
+/// `Ok(None)` when the optional `Docker-Content-Digest` is absent; a garbage
+/// value is an error, so the checks fed by it cannot be skipped.
 fn advertised_digest(response: &Response) -> Result<Option<Digest>, Error> {
     if !response.headers().contains_key(DOCKER_CONTENT_DIGEST) {
         return Ok(None);
@@ -59,21 +36,12 @@ fn advertised_digest(response: &Response) -> Result<Option<Digest>, Error> {
     parse_header(response, DOCKER_CONTENT_DIGEST).map(Some)
 }
 
-/// Classifies a failed (non-2xx) write response. A `403` is a terminal
-/// authorization denial that no retry can clear; anything else is a retryable
-/// failure. Mirrors the `send_stream` mapping so every write path agrees.
+/// A `403` never gets here: the send helpers already turned it into `Denied`.
 fn write_failure(op: &str, status: StatusCode) -> Error {
-    if status == StatusCode::FORBIDDEN {
-        Error::Denied(format!("{op} rejected with 403"))
-    } else {
-        Error::Internal(format!("{op} failed with status {status}"))
-    }
+    Error::Internal(format!("{op} failed with status {status}"))
 }
 
 impl RegistryClient {
-    /// Sends a replayable body under the auth retry, also returning the
-    /// resolved auth header so an upload-session opener can reuse it for the
-    /// single-use streamed upload `PUT`.
     async fn send_body_with_auth(
         &self,
         method: &Method,
@@ -88,93 +56,23 @@ impl RegistryClient {
         let body = Bytes::from(body);
 
         self.send_with_auth_retry_capturing(location, |auth| {
-            // The closure may run twice (cached token, then 401 refresh), so
-            // clone the refcounted body per attempt.
-            let body = body.clone();
+            let mut request = self
+                .build_request(method, &[], location, auth.as_deref(), None)
+                .body(body.clone());
+            if let Some(content_type) = content_type {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            if let Some(source_ts) = source_ts {
+                request = request.header(X_ANGOS_SOURCE_TIMESTAMP, source_ts);
+            }
             async move {
-                self.send_body_once(
-                    method,
-                    location,
-                    content_type,
-                    body,
-                    auth.as_deref(),
-                    source_ts,
-                )
-                .await
+                request
+                    .send()
+                    .await
+                    .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
             }
         })
         .await
-    }
-
-    async fn send_body_once(
-        &self,
-        method: &Method,
-        location: &str,
-        content_type: Option<&str>,
-        body: Bytes,
-        auth_header: Option<&str>,
-        source_ts: Option<&str>,
-    ) -> Result<Response, Error> {
-        let mut request = self
-            .build_request(method, &[], location, auth_header, None)
-            .body(body);
-        if let Some(content_type) = content_type {
-            request = request.header(CONTENT_TYPE, content_type);
-        }
-        if let Some(source_ts) = source_ts {
-            request = request.header(X_ANGOS_SOURCE_TIMESTAMP, source_ts);
-        }
-        request
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))
-    }
-
-    /// Sends a request whose body is a single-use stream.
-    ///
-    /// The consumed stream cannot be replayed, so a `401` is surfaced as an
-    /// error instead of a token-refresh retry. `auth_header` is the credential
-    /// resolved when the session was opened; a cached lookup keyed on
-    /// `location` is the anonymous-or-direct-call fallback.
-    async fn send_stream<S>(
-        &self,
-        method: &Method,
-        location: &str,
-        auth_header: Option<&str>,
-        content_length: u64,
-        stream: S,
-    ) -> Result<Response, Error>
-    where
-        S: AsyncRead + Unpin + Send + Sync + 'static,
-    {
-        debug!(
-            "Streaming to upstream: {method} {}",
-            without_query(location)
-        );
-
-        let auth = match auth_header {
-            Some(header) => Some(header.to_string()),
-            None => self.cached_auth_header(location).await,
-        };
-        let body = Body::wrap_stream(ReaderStream::new(stream));
-        let response = self
-            .build_request(method, &[], location, auth.as_deref(), None)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .header(CONTENT_LENGTH, content_length)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))?;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(Error::Unauthorized(
-                "upload stream rejected with 401 (token cannot be replayed for a consumed stream)"
-                    .to_string(),
-            ));
-        }
-        denied_if_forbidden(&response)?;
-
-        Ok(response)
     }
 
     /// Reads the `Location` response header, resolving a relative value (which
@@ -260,8 +158,7 @@ impl RegistryClient {
         // A 201 means mounted; an advertised digest must match the request or
         // the blob would be falsely marked converged.
         if response.status() == StatusCode::CREATED {
-            let advertised = advertised_digest(&response)?;
-            if let Some(advertised) = advertised
+            if let Some(advertised) = advertised_digest(&response)?
                 && &advertised != mount
             {
                 return Err(Error::Internal(format!(
@@ -283,6 +180,9 @@ impl RegistryClient {
 
     /// Streams the whole blob into an upload session with the final `PUT`
     /// (`?digest=` appended), uploading and committing it in one request.
+    /// A consumed stream cannot be replayed, so a `401` is an error rather
+    /// than a token refresh. Without `auth_header` the cached token for the
+    /// session is used.
     ///
     /// # Errors
     ///
@@ -301,10 +201,28 @@ impl RegistryClient {
         S: AsyncRead + Unpin + Send + Sync + 'static,
     {
         let location = append_query(session_url, &format!("digest={digest}"));
-        let response = self
-            .send_stream(&Method::PUT, &location, auth_header, content_length, stream)
-            .await?;
+        debug!("Streaming to upstream: PUT {}", without_query(&location));
 
+        let auth = match auth_header {
+            Some(header) => Some(header.to_string()),
+            None => self.cached_auth_header(&location).await,
+        };
+        let response = self
+            .build_request(&Method::PUT, &[], &location, auth.as_deref(), None)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, content_length)
+            .body(Body::wrap_stream(ReaderStream::new(stream)))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("HTTP request failed: {e}")))?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(Error::Unauthorized(
+                "upload stream rejected with 401 (token cannot be replayed for a consumed stream)"
+                    .to_string(),
+            ));
+        }
+        denied_if_forbidden(&response)?;
         if !response.status().is_success() {
             return Err(write_failure("put_upload", response.status()));
         }
@@ -328,14 +246,10 @@ impl RegistryClient {
             .await?
             .0;
 
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(());
+        let status = response.status();
+        if !status.is_success() && status != StatusCode::NOT_FOUND {
+            return Err(write_failure("delete_upload", status));
         }
-
-        if !response.status().is_success() {
-            return Err(write_failure("delete_upload", response.status()));
-        }
-
         Ok(())
     }
 
@@ -343,7 +257,10 @@ impl RegistryClient {
     /// rejection ([`REPLICATION_SUPERSEDED_CODE`], convergence), [`Error`] for
     /// any other 409 so the job retries or dead-letters.
     async fn classify_conflict(response: Response, op: &str) -> Result<(), Error> {
-        match parse_oci_error_code(response).await.as_deref() {
+        let body = response.bytes().await.ok();
+        let parsed: Option<ErrorResponse> =
+            body.and_then(|body| serde_json::from_slice(&body).ok());
+        match parsed.as_ref().and_then(ErrorResponse::first_code) {
             Some(REPLICATION_SUPERSEDED_CODE) => Ok(()),
             other => Err(Error::Internal(format!(
                 "{op} rejected with 409 (code {})",

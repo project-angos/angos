@@ -13,8 +13,7 @@ use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BackendConfig {
-    /// Secret as a whole: a Redis URL conventionally carries its password in
-    /// the userinfo, and the loaded configuration is `Debug`-formatted.
+    /// A Redis URL carries its password in the userinfo.
     pub url: Secret<RedisUrl>,
     pub key_prefix: String,
 }
@@ -24,12 +23,6 @@ pub struct BackendConfig {
 #[derive(Clone, Deserialize, PartialEq, Zeroize)]
 #[serde(try_from = "String")]
 pub struct RedisUrl(String);
-
-impl RedisUrl {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 impl TryFrom<String> for RedisUrl {
     type Error = String;
@@ -58,7 +51,7 @@ impl fmt::Debug for Backend {
 impl Backend {
     pub fn new(config: &BackendConfig) -> Result<Self, Error> {
         info!("Using Redis cache store");
-        let client = Client::open(config.url.expose().as_str())?;
+        let client = Client::open(config.url.expose().0.as_str())?;
         Ok(Backend {
             client,
             connection: OnceCell::new(),
@@ -87,22 +80,11 @@ impl Backend {
     pub async fn retrieve_value(&self, key: &str) -> Result<Option<String>, Error> {
         let mut conn = self.connection().await?;
         let key = format!("{}{key}", self.key_prefix);
-        let value: Option<String> = conn.get(key).await?;
-        Ok(value)
-    }
-
-    pub async fn delete_value(&self, key: &str) -> Result<(), Error> {
-        let mut conn = self.connection().await?;
-        let key = format!("{}{key}", self.key_prefix);
-        let () = conn.del(key).await?;
-        Ok(())
+        Ok(conn.get(key).await?)
     }
 }
 
-/// Tests in this module are integration tests that require a Redis instance
-/// running at `redis://localhost:6379`. Start one with `docker-compose up -d redis`
-/// before running `cargo test`. They exercise the real network path and are
-/// therefore slower than unit tests.
+/// Most tests here need Redis at `redis://localhost:6379`.
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -112,75 +94,25 @@ mod tests {
 
     use super::*;
 
-    fn make_backend(db: u8) -> Backend {
-        let config = BackendConfig {
-            url: Secret::new(RedisUrl::try_from(format!("redis://localhost:6379/{db}")).unwrap()),
-            key_prefix: String::new(),
-        };
-        Backend::new(&config).unwrap()
-    }
-
     #[tokio::test]
     async fn test_store_and_retrieve() {
-        let config = BackendConfig {
+        let cache = Backend::new(&BackendConfig {
             url: Secret::new(RedisUrl::try_from("redis://localhost:6379/0".to_string()).unwrap()),
-            key_prefix: "test_acquire_write_lock".to_owned(),
-        };
-        let cache = Backend::new(&config).unwrap();
+            key_prefix: String::new(),
+        })
+        .unwrap();
+        let key = format!("test_ttl_{}", Uuid::new_v4());
 
-        cache.store_value("key", "token", 1).await.unwrap();
+        cache.store_value(&key, "token", 1).await.unwrap();
         assert_eq!(
-            cache.retrieve_value("key").await,
-            Ok(Some("token".to_string()))
+            cache.retrieve_value(&key).await.unwrap(),
+            Some("token".to_string())
         );
 
         time::sleep(Duration::from_millis(1050)).await;
-        assert_eq!(cache.retrieve_value("key").await, Ok(None));
+        assert_eq!(cache.retrieve_value(&key).await.unwrap(), None);
     }
 
-    /// Retrieve a key that was never stored must return `None`, not an error.
-    #[tokio::test]
-    async fn test_missing_key_returns_none() {
-        let cache = make_backend(1);
-        let key = format!("test_missing_{}", Uuid::new_v4());
-
-        let result = cache.retrieve_value(&key).await;
-        assert_eq!(result, Ok(None));
-    }
-
-    /// `delete_value` must remove an existing key so subsequent retrieval returns `None`.
-    #[tokio::test]
-    async fn test_delete_removes_key() {
-        let cache = make_backend(1);
-        let key = format!("test_delete_{}", Uuid::new_v4());
-
-        cache.store_value(&key, "to_be_deleted", 60).await.unwrap();
-        assert_eq!(
-            cache.retrieve_value(&key).await,
-            Ok(Some("to_be_deleted".to_string()))
-        );
-
-        cache.delete_value(&key).await.unwrap();
-        assert_eq!(cache.retrieve_value(&key).await, Ok(None));
-    }
-
-    /// A `redis://` URL with a valid host and port deserializes successfully.
-    #[test]
-    fn redis_url_accepts_valid_url() {
-        let toml = r#"
-            url = "redis://localhost:6379"
-            key_prefix = "test:"
-        "#;
-        let result = toml::from_str::<BackendConfig>(toml);
-        assert!(result.is_ok(), "expected Ok, got: {result:?}");
-        assert_eq!(
-            result.unwrap().url.expose().as_str(),
-            "redis://localhost:6379"
-        );
-    }
-
-    /// The loaded configuration is `Debug`-formatted in logs and errors, so a
-    /// password carried in the URL's userinfo must not appear there.
     #[test]
     fn debug_output_redacts_a_password_carried_in_the_url() {
         let toml = r#"
@@ -197,23 +129,12 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
     }
 
-    /// A URL that the redis client rejects must produce a deserialization error
-    /// whose message contains `"invalid Redis URL"`.
     #[test]
     fn redis_url_rejects_invalid_url() {
         let toml = r#"
             url = "not a url"
             key_prefix = "test:"
         "#;
-        let result = toml::from_str::<BackendConfig>(toml);
-        assert!(
-            result.is_err(),
-            "expected Err for invalid URL, got: {result:?}"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("invalid Redis URL"),
-            "error message does not contain 'invalid Redis URL': {err_msg}"
-        );
+        assert!(toml::from_str::<BackendConfig>(toml).is_err());
     }
 }

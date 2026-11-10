@@ -28,31 +28,6 @@ pub struct TagWithMetadata {
     pub pulled_at: Option<DateTime<Utc>>,
 }
 
-/// Reads every live tag's link metadata and last pull, up to
-/// `TAG_METADATA_CONCURRENCY` at a time.
-pub async fn live_tags(
-    metadata_store: &MetadataStore,
-    namespace: &Namespace,
-) -> Result<Vec<TagWithMetadata>, Error> {
-    // The listing resolves each tag, so only the pull history is read.
-    metadata_store
-        .stream_live_tags(namespace, None)
-        .err_into::<Error>()
-        .map_ok(|(tag, metadata)| async move {
-            let pulled_at = metadata_store
-                .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
-                .await?;
-            Ok(TagWithMetadata {
-                name: tag,
-                metadata,
-                pulled_at,
-            })
-        })
-        .try_buffered(TAG_METADATA_CONCURRENCY)
-        .try_collect()
-        .await
-}
-
 /// Ranks tags most recent first, leaving out those carrying no such time.
 /// A never-pulled tag is not one of the "n most recently pulled", and
 /// ranking it would make `top_pulled(n)` retain untouched tags forever.
@@ -78,11 +53,29 @@ pub struct Rankings {
 }
 
 impl Rankings {
+    /// Reads every live tag's link metadata and last pull, up to
+    /// `TAG_METADATA_CONCURRENCY` at a time.
     pub async fn read(
         metadata_store: &MetadataStore,
         namespace: &Namespace,
     ) -> Result<Self, Error> {
-        let tags = live_tags(metadata_store, namespace).await?;
+        // The listing resolves each tag, so only the pull history is read.
+        let tags: Vec<TagWithMetadata> = metadata_store
+            .stream_live_tags(namespace, None)
+            .err_into::<Error>()
+            .map_ok(|(tag, metadata)| async move {
+                let pulled_at = metadata_store
+                    .read_access_time(namespace, &LinkKind::Tag(tag.clone()))
+                    .await?;
+                Ok(TagWithMetadata {
+                    name: tag,
+                    metadata,
+                    pulled_at,
+                })
+            })
+            .try_buffered(TAG_METADATA_CONCURRENCY)
+            .try_collect()
+            .await?;
         Ok(Self {
             last_pushed: rank_by(&tags, |t| t.metadata.created_at),
             last_pulled: rank_by(&tags, |t| t.pulled_at),

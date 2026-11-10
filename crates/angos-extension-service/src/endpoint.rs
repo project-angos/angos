@@ -1,12 +1,7 @@
-//! Parse an HTTP method and URL path into an [`Endpoint`] of the `_angos/`
-//! surface.
-//!
-//! These endpoints live under the extension namespace the distribution spec
-//! reserves: `_angos/<component>/<module>` for the registry as a whole, and
-//! `<name>/_angos/<component>/<module>` for one repository. A path this surface
-//! does not serve returns `None`, so a caller can try the next surface. The
-//! `_angos/ui/config` path is intentionally *not* claimed: it is the host's UI
-//! concern, not part of this service.
+//! Routing for the `_angos/` surface, under the extension namespace the
+//! distribution spec reserves: `_angos/<component>/<module>` for the registry,
+//! `<name>/_angos/<component>/<module>` for one repository. `_angos/ui/config`
+//! is the host's concern and deliberately not claimed.
 
 use std::num::NonZeroU16;
 
@@ -17,16 +12,14 @@ use angos_oci::path::API_PREFIX;
 use angos_oci::{Digest, Namespace, Reference, Tag};
 
 use crate::{
-    JobKey, JobState, ListNamespacesRequest, PageRequest, Queue, RevisionSelection, RevisionSort,
-    SortOrder,
+    DeleteJobRequest, JobKey, JobState, LayerFileDetailsRequest, ListJobsRequest,
+    ListNamespacesRequest, ListPullsRequest, PageRequest, Queue, RetryJobRequest,
+    RevisionSelection, RevisionSort, SortOrder,
 };
 
-/// The two forms the extension is reached under. The spec fixes the
-/// `_<extension>` shape; the name itself is angos's.
 const EXTENSION: &str = "_angos/";
 const REPOSITORY_EXTENSION: &str = "/_angos/";
 
-/// An `_angos/` operation and the values its path and query carry.
 #[derive(Clone, Debug)]
 pub enum Endpoint {
     /// `GET /v2/_angos/repositories/list?order=&offset=&n=`.
@@ -44,11 +37,7 @@ pub enum Endpoint {
         page: PageRequest,
     },
     /// `GET /v2/<name>/_angos/pulls/list?tag=|digest=&offset=&n=`.
-    ListPulls {
-        namespace: Namespace,
-        reference: Reference,
-        page: PageRequest,
-    },
+    ListPulls(ListPullsRequest),
     /// `GET /v2/<name>/_angos/layers/<digest>/entries`.
     ListLayerEntries {
         namespace: Namespace,
@@ -62,31 +51,15 @@ pub enum Endpoint {
         download: bool,
     },
     /// `GET /v2/<name>/_angos/layers/<digest>/details?path=`.
-    GetLayerFileDetails {
-        namespace: Namespace,
-        digest: Digest,
-        path: String,
-    },
+    GetLayerFileDetails(LayerFileDetailsRequest),
     /// `GET /v2/_angos/jobs/list`.
-    ListJobs {
-        queue: Queue,
-        n: Option<NonZeroU16>,
-        after: Option<String>,
-    },
+    ListJobs(ListJobsRequest),
     /// `GET /v2/_angos/jobs/failed`.
-    ListFailedJobs {
-        queue: Queue,
-        n: Option<NonZeroU16>,
-        after: Option<String>,
-    },
+    ListFailedJobs(ListJobsRequest),
     /// `POST /v2/_angos/jobs/failed?key=`.
-    RetryJob { queue: Queue, storage_key: JobKey },
+    RetryJob(RetryJobRequest),
     /// `DELETE /v2/_angos/jobs/{failed,pending}?key=`.
-    DeleteJob {
-        queue: Queue,
-        state: JobState,
-        storage_key: JobKey,
-    },
+    DeleteJob(DeleteJobRequest),
 }
 
 impl Endpoint {
@@ -98,23 +71,24 @@ impl Endpoint {
             Endpoint::ListNamespaces(_) => "list-namespaces",
             Endpoint::ListRevisions { .. } => "list-revisions",
             Endpoint::ListUploads { .. } => "list-uploads",
-            Endpoint::ListPulls { .. } => "list-pulls",
+            Endpoint::ListPulls(_) => "list-pulls",
             Endpoint::ListLayerEntries { .. } => "list-layer-entries",
             Endpoint::GetLayerFile { .. } => "get-layer-file",
-            Endpoint::GetLayerFileDetails { .. } => "get-layer-file-details",
-            Endpoint::ListJobs { .. } => "list-jobs",
-            Endpoint::ListFailedJobs { .. } => "list-failed-jobs",
-            Endpoint::RetryJob { .. } => "retry-job",
-            Endpoint::DeleteJob { .. } => "delete-job",
+            Endpoint::GetLayerFileDetails(_) => "get-layer-file-details",
+            Endpoint::ListJobs(_) => "list-jobs",
+            Endpoint::ListFailedJobs(_) => "list-failed-jobs",
+            Endpoint::RetryJob(_) => "retry-job",
+            Endpoint::DeleteJob(_) => "delete-job",
         }
     }
 }
 
-/// Parse `(method, path, query)` into an `_angos/` [`Endpoint`], or `None` when
-/// the path is not part of this surface. `query` is the raw query without `?`.
+/// `None` when the path is not part of this surface, so a caller can try the
+/// next one. `query` is the raw query without `?`.
 #[must_use]
 pub fn parse(method: &Method, path: &str, query: Option<&str>) -> Option<Endpoint> {
     let api_path = path.strip_prefix(API_PREFIX)?;
+    let query = query.unwrap_or_default();
 
     if let Some(rest) = api_path.strip_prefix(EXTENSION) {
         return registry_extension(method, rest, query);
@@ -132,7 +106,6 @@ struct NamespacesQuery {
     order: SortOrder,
 }
 
-/// The query of a listing sorted on one column.
 #[derive(Deserialize)]
 struct OrderQuery {
     #[serde(default)]
@@ -153,21 +126,14 @@ struct RevisionsQuery {
 struct JobsQuery {
     n: Option<NonZeroU16>,
     after: Option<String>,
-    #[serde(default = "default_jobs_queue")]
+    #[serde(default)]
     queue: Queue,
     /// The job a retry or delete addresses. An extension path ends at its
     /// module, so the storage key rides in the query rather than the path.
     key: Option<String>,
 }
 
-fn default_jobs_queue() -> Queue {
-    Queue::Cache
-}
-
-/// `_angos/<component>/<module>`: what the registry as a whole answers. The
-/// `ui/config` path is left to the host's UI, not claimed here.
-fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Option<Endpoint> {
-    let params = params.unwrap_or_default();
+fn registry_extension(method: &Method, path: &str, params: &str) -> Option<Endpoint> {
     match *method {
         Method::GET => match path {
             "repositories/list" => {
@@ -190,26 +156,25 @@ fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Opti
                     page: serde_html_form::from_str(params).ok()?,
                 }))
             }
-            "jobs/list" => {
+            "jobs/list" | "jobs/failed" => {
                 let JobsQuery {
                     n, after, queue, ..
                 } = serde_html_form::from_str(params).ok()?;
-                Some(Endpoint::ListJobs { queue, n, after })
-            }
-            "jobs/failed" => {
-                let JobsQuery {
-                    n, after, queue, ..
-                } = serde_html_form::from_str(params).ok()?;
-                Some(Endpoint::ListFailedJobs { queue, n, after })
+                let request = ListJobsRequest { queue, n, after };
+                Some(if path == "jobs/list" {
+                    Endpoint::ListJobs(request)
+                } else {
+                    Endpoint::ListFailedJobs(request)
+                })
             }
             _ => None,
         },
         Method::POST if path == "jobs/failed" => {
             let JobsQuery { queue, key, .. } = serde_html_form::from_str(params).ok()?;
-            Some(Endpoint::RetryJob {
+            Some(Endpoint::RetryJob(RetryJobRequest {
                 queue,
                 storage_key: JobKey::try_from(key?).ok()?,
-            })
+            }))
         }
         Method::DELETE => {
             let state = match path {
@@ -218,31 +183,26 @@ fn registry_extension(method: &Method, path: &str, params: Option<&str>) -> Opti
                 _ => return None,
             };
             let JobsQuery { queue, key, .. } = serde_html_form::from_str(params).ok()?;
-            Some(Endpoint::DeleteJob {
+            Some(Endpoint::DeleteJob(DeleteJobRequest {
                 queue,
                 state,
                 storage_key: JobKey::try_from(key?).ok()?,
-            })
+            }))
         }
         _ => None,
     }
 }
 
-/// `<name>/_angos/<component>/<module>`: what one namespace answers, `<name>`
-/// being the OCI repository name.
 fn repository_extension(
     method: &Method,
     namespace: Namespace,
     path: &str,
-    params: Option<&str>,
+    params: &str,
 ) -> Option<Endpoint> {
     if *method != Method::GET {
         return None;
     }
-    let params = params.unwrap_or_default();
 
-    // `layers/<digest>/entries`, `layers/<digest>/file?path=` and
-    // `layers/<digest>/details?path=`.
     if let Some(rest) = path.strip_prefix("layers/") {
         let (digest, module) = rest.split_once('/')?;
         let digest: Digest = digest.parse().ok()?;
@@ -259,11 +219,11 @@ fn repository_extension(
             }
             "details" => {
                 let LayerFileQuery { path, .. } = serde_html_form::from_str(params).ok()?;
-                Some(Endpoint::GetLayerFileDetails {
+                Some(Endpoint::GetLayerFileDetails(LayerFileDetailsRequest {
                     namespace,
                     digest,
                     path: path?,
-                })
+                }))
             }
             _ => None,
         };
@@ -294,12 +254,24 @@ fn repository_extension(
             page: serde_html_form::from_str(params).ok()?,
         }),
         "pulls/list" => {
-            let PullsQuery { tag, digest } = serde_html_form::from_str(params).ok()?;
-            Some(Endpoint::ListPulls {
+            // Strict: an unparseable or ambiguous target is refused rather than
+            // narrowed to one of the two.
+            let reference = match serde_html_form::from_str(params).ok()? {
+                PullsQuery {
+                    tag: Some(tag),
+                    digest: None,
+                } => Reference::Tag(tag),
+                PullsQuery {
+                    tag: None,
+                    digest: Some(digest),
+                } => Reference::Digest(digest),
+                _ => return None,
+            };
+            Some(Endpoint::ListPulls(ListPullsRequest {
                 namespace,
-                reference: pulls_reference(tag, digest)?,
+                reference,
                 page: serde_html_form::from_str(params).ok()?,
-            })
+            }))
         }
         _ => None,
     }
@@ -317,19 +289,11 @@ struct PullsQuery {
     digest: Option<Digest>,
 }
 
-/// Takes `?tag=`/`?digest=` strictly: an unparseable or ambiguous target is
-/// refused rather than silently narrowed to one of the two.
-fn pulls_reference(tag: Option<Tag>, digest: Option<Digest>) -> Option<Reference> {
-    match (tag, digest) {
-        (Some(tag), None) => Some(Reference::Tag(tag)),
-        (None, Some(digest)) => Some(Reference::Digest(digest)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const D: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[test]
     fn registry_listings() {
@@ -380,7 +344,6 @@ mod tests {
 
     #[test]
     fn revisions_select_a_page_or_one_digest() {
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert!(matches!(
             parse(
                 &Method::GET,
@@ -403,12 +366,12 @@ mod tests {
             parse(
                 &Method::GET,
                 "/v2/team/app/_angos/revisions/list",
-                Some(&format!("digest={d}&offset=5"))
+                Some(&format!("digest={D}&offset=5"))
             ),
             Some(Endpoint::ListRevisions {
                 selection: RevisionSelection::Digest(digest),
                 ..
-            }) if digest.to_string() == d
+            }) if digest.to_string() == D
         ));
     }
 
@@ -419,12 +382,15 @@ mod tests {
             ("/v2/_angos/repositories/list", "n=0"),
             ("/v2/_angos/namespaces/list", "repository=team&order=up"),
             ("/v2/_angos/namespaces/list", "repository=team&under=Team"),
+            ("/v2/_angos/namespaces/list", "repository=INVALID"),
             ("/v2/myrepo/_angos/revisions/list", "sort=size"),
             ("/v2/myrepo/_angos/revisions/list", "digest=sha256:abc"),
             ("/v2/myrepo/_angos/uploads/list", "offset=-1"),
-            ("/v2/myrepo/_angos/pulls/list", "tag=v1&n=0"),
             ("/v2/_angos/jobs/list", "n=0"),
-            ("/v2/_angos/jobs/failed", "n=0"),
+            ("/v2/_angos/jobs/list", "queue=bogus"),
+            // A lenient parse would reset the whole query and administer the
+            // default cache queue instead of the requested one.
+            ("/v2/_angos/jobs/list", "queue=replication&n=abc"),
         ] {
             assert!(
                 parse(&Method::GET, path, Some(query)).is_none(),
@@ -434,58 +400,11 @@ mod tests {
     }
 
     #[test]
-    fn jobs_default_queue_and_mutations() {
-        assert!(matches!(
-            parse(&Method::GET, "/v2/_angos/jobs/list", None),
-            Some(Endpoint::ListJobs {
-                queue: Queue::Cache,
-                ..
-            })
-        ));
+    fn layers() {
         assert!(matches!(
             parse(
                 &Method::GET,
-                "/v2/_angos/jobs/list",
-                Some("queue=replication")
-            ),
-            Some(Endpoint::ListJobs {
-                queue: Queue::Replication,
-                ..
-            })
-        ));
-        assert!(matches!(
-            parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=abc-123")),
-            Some(Endpoint::RetryJob { .. })
-        ));
-        assert!(matches!(
-            parse(
-                &Method::DELETE,
-                "/v2/_angos/jobs/pending",
-                Some("key=abc-123")
-            ),
-            Some(Endpoint::DeleteJob {
-                state: JobState::Pending,
-                ..
-            })
-        ));
-        // A key with a slash, or an empty one, is refused.
-        assert!(parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=a/b")).is_none());
-        assert!(parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=")).is_none());
-        assert!(JobKey::try_from(String::new()).is_err());
-        assert!(JobKey::try_from("a/b".to_string()).is_err());
-    }
-
-    #[test]
-    fn repository_listings_and_layers() {
-        assert!(matches!(
-            parse(&Method::GET, "/v2/team/app/_angos/revisions/list", None),
-            Some(Endpoint::ListRevisions { .. })
-        ));
-        let d = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(matches!(
-            parse(
-                &Method::GET,
-                &format!("/v2/app/_angos/layers/{d}/entries"),
+                &format!("/v2/app/_angos/layers/{D}/entries"),
                 None
             ),
             Some(Endpoint::ListLayerEntries { .. })
@@ -493,7 +412,7 @@ mod tests {
         assert!(matches!(
             parse(
                 &Method::GET,
-                &format!("/v2/app/_angos/layers/{d}/file"),
+                &format!("/v2/app/_angos/layers/{D}/file"),
                 Some("path=etc/hosts&download")
             ),
             Some(Endpoint::GetLayerFile { download: true, .. })
@@ -501,22 +420,27 @@ mod tests {
         assert!(matches!(
             parse(
                 &Method::GET,
-                &format!("/v2/app/_angos/layers/{d}/details"),
+                &format!("/v2/app/_angos/layers/{D}/details"),
                 Some("path=usr/bin/env")
             ),
-            Some(Endpoint::GetLayerFileDetails { .. })
+            Some(Endpoint::GetLayerFileDetails(_))
         ));
     }
 
     #[test]
-    fn ui_config_not_claimed() {
+    fn declines_foreign_surfaces_and_non_get_listings() {
         assert!(parse(&Method::GET, "/v2/_angos/ui/config", None).is_none());
-    }
-
-    #[test]
-    fn declines_foreign_surfaces() {
         assert!(parse(&Method::GET, "/v2/_catalog", None).is_none());
         assert!(parse(&Method::GET, "/v2/app/tags/list", None).is_none());
+        assert!(parse(&Method::POST, "/v2/myrepo/_angos/revisions/list", None).is_none());
+        assert!(
+            parse(
+                &Method::POST,
+                "/v2/_angos/namespaces/list",
+                Some("repository=myrepo")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -524,37 +448,15 @@ mod tests {
         match parse(
             &Method::GET,
             "/v2/myrepo/app/_angos/pulls/list",
-            Some("tag=v1"),
+            Some("tag=v1&offset=200&n=50"),
         ) {
-            Some(Endpoint::ListPulls {
+            Some(Endpoint::ListPulls(ListPullsRequest {
                 namespace,
                 reference,
                 page,
-            }) => {
+            })) => {
                 assert_eq!(namespace, "myrepo/app");
                 assert_eq!(reference.to_string(), "v1");
-                assert_eq!(page, PageRequest::default());
-            }
-            other => panic!("expected ListPulls, got {other:?}"),
-        }
-
-        let digest = format!("sha256:{}", "ab".repeat(32));
-        match parse(
-            &Method::GET,
-            "/v2/myrepo/_angos/pulls/list",
-            Some(&format!("digest={digest}")),
-        ) {
-            Some(Endpoint::ListPulls { reference, .. }) => {
-                assert_eq!(reference.to_string(), digest);
-            }
-            other => panic!("expected ListPulls, got {other:?}"),
-        }
-        match parse(
-            &Method::GET,
-            "/v2/myrepo/_angos/pulls/list",
-            Some("tag=v1&offset=200&n=50"),
-        ) {
-            Some(Endpoint::ListPulls { page, .. }) => {
                 assert_eq!(
                     page,
                     PageRequest {
@@ -565,14 +467,23 @@ mod tests {
             }
             other => panic!("expected ListPulls, got {other:?}"),
         }
+        match parse(
+            &Method::GET,
+            "/v2/myrepo/_angos/pulls/list",
+            Some(&format!("digest={D}")),
+        ) {
+            Some(Endpoint::ListPulls(ListPullsRequest { reference, .. })) => {
+                assert_eq!(reference.to_string(), D);
+            }
+            other => panic!("expected ListPulls, got {other:?}"),
+        }
     }
 
     /// The target must be named exactly once, and must parse; anything else is a
     /// 404 rather than a lenient guess.
     #[test]
     fn pulls_reject_a_missing_ambiguous_or_invalid_target() {
-        let digest = format!("sha256:{}", "ab".repeat(32));
-        let ambiguous = format!("tag=v1&digest={digest}");
+        let ambiguous = format!("tag=v1&digest={D}");
         for query in [
             None,
             Some(""),
@@ -591,121 +502,79 @@ mod tests {
     }
 
     #[test]
-    fn failed_jobs_listing_pagination_and_deletion() {
+    fn job_listings() {
         match parse(&Method::GET, "/v2/_angos/jobs/failed", None) {
-            Some(Endpoint::ListFailedJobs { queue, n, after }) => {
+            Some(Endpoint::ListFailedJobs(ListJobsRequest { queue, n, after })) => {
                 assert_eq!(queue, Queue::Cache);
                 assert_eq!(n, None);
                 assert_eq!(after, None);
             }
             other => panic!("expected ListFailedJobs, got {other:?}"),
         }
-
-        match parse(&Method::GET, "/v2/_angos/jobs/list", Some("n=10&after=abc")) {
-            Some(Endpoint::ListJobs { queue, n, after }) => {
-                assert_eq!(queue, Queue::Cache);
+        match parse(
+            &Method::GET,
+            "/v2/_angos/jobs/list",
+            Some("queue=replication&n=10&after=abc"),
+        ) {
+            Some(Endpoint::ListJobs(ListJobsRequest { queue, n, after })) => {
+                assert_eq!(queue, Queue::Replication);
                 assert_eq!(n, NonZeroU16::new(10));
                 assert_eq!(after.as_deref(), Some("abc"));
             }
             other => panic!("expected ListJobs, got {other:?}"),
         }
+    }
 
+    /// An extension path ends at its module, so a mutation names its job in
+    /// `?key=`.
+    #[test]
+    fn job_mutations() {
+        assert!(matches!(
+            parse(&Method::POST, "/v2/_angos/jobs/failed", Some("key=abc-123")),
+            Some(Endpoint::RetryJob(_))
+        ));
+        assert!(matches!(
+            parse(
+                &Method::DELETE,
+                "/v2/_angos/jobs/pending",
+                Some("key=abc-123")
+            ),
+            Some(Endpoint::DeleteJob(DeleteJobRequest {
+                state: JobState::Pending,
+                ..
+            }))
+        ));
         match parse(
             &Method::DELETE,
             "/v2/_angos/jobs/failed",
             Some("key=0000018b-abc"),
         ) {
-            Some(Endpoint::DeleteJob {
+            Some(Endpoint::DeleteJob(DeleteJobRequest {
                 queue,
                 state,
                 storage_key,
-            }) => {
+            })) => {
                 assert_eq!(queue, Queue::Cache);
                 assert_eq!(state, JobState::Failed);
                 assert_eq!(storage_key.as_str(), "0000018b-abc");
             }
             other => panic!("expected DeleteJob(Failed), got {other:?}"),
         }
-    }
 
-    #[test]
-    fn jobs_reject_unknown_queue_and_malformed_query() {
-        assert!(parse(&Method::GET, "/v2/_angos/jobs/list", Some("queue=bogus")).is_none());
-        assert!(
-            parse(
-                &Method::DELETE,
-                "/v2/_angos/jobs/failed",
-                Some("queue=bogus&key=0000018b-abc")
-            )
-            .is_none()
-        );
-
-        // A lenient parse would reset the whole query and administer the default
-        // cache queue instead of the requested one.
-        assert!(
-            parse(
-                &Method::GET,
-                "/v2/_angos/jobs/list",
-                Some("queue=replication&n=abc")
-            )
-            .is_none()
-        );
-        assert!(
-            parse(
-                &Method::GET,
-                "/v2/_angos/jobs/list",
-                Some("queue=replication&n=99999999")
-            )
-            .is_none()
-        );
-        assert!(
-            parse(
-                &Method::DELETE,
-                "/v2/_angos/jobs/failed",
-                Some("queue=replication&key=0000018b-abc&n=abc")
-            )
-            .is_none()
-        );
-    }
-
-    /// A retry names its job in `?key=`, since an extension path ends at its
-    /// module. Without one there is nothing to retry.
-    #[test]
-    fn retry_without_a_key_is_not_a_route() {
-        assert!(parse(&Method::POST, "/v2/_angos/jobs/failed", None).is_none());
-    }
-
-    #[test]
-    fn list_namespaces_rejects_invalid_repository() {
-        assert!(
-            parse(
-                &Method::GET,
-                "/v2/_angos/namespaces/list",
-                Some("repository=INVALID")
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn listings_reject_non_get_methods() {
-        assert!(parse(&Method::POST, "/v2/myrepo/_angos/revisions/list", None).is_none());
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/myrepo/_angos/pulls/list",
-                Some("tag=v1")
-            )
-            .is_none()
-        );
-        assert!(
-            parse(
-                &Method::POST,
-                "/v2/_angos/namespaces/list",
-                Some("repository=myrepo")
-            )
-            .is_none()
-        );
-        assert!(parse(&Method::POST, "/v2/_angos/jobs/list", None).is_none());
+        for (method, query) in [
+            (Method::POST, None),
+            (Method::POST, Some("key=a/b")),
+            (Method::POST, Some("key=")),
+            (Method::DELETE, Some("queue=bogus&key=0000018b-abc")),
+            (
+                Method::DELETE,
+                Some("queue=replication&key=0000018b-abc&n=abc"),
+            ),
+        ] {
+            assert!(
+                parse(&method, "/v2/_angos/jobs/failed", query).is_none(),
+                "{method} ?{query:?} must not route"
+            );
+        }
     }
 }

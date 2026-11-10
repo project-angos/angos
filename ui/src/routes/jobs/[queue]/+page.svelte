@@ -13,8 +13,7 @@
 		type FailedJobEntry,
 		type FailedJobsResponse,
 		type FetchResult,
-		type JobsResponse,
-		type JobState
+		type JobsResponse
 	} from '#lib/api.js';
 	import { formatTimeAgo } from '#lib/utils.js';
 	import Breadcrumb from '#lib/components/Breadcrumb.svelte';
@@ -43,13 +42,11 @@
 	let pendingMore = $state(false);
 	let failedMore = $state(false);
 
-	// storage_key currently being mutated (disables its row controls).
 	let busyKey: string | null = $state(null);
-	// storage_key whose delete is awaiting confirmation.
 	let confirmKey: string | null = $state(null);
 
 	// A failed first page leaves nothing to show; a failed next page keeps the list.
-	async function loadPending(reset: boolean, fetched?: FetchResult<JobsResponse>): Promise<void> {
+	async function loadPending(reset: boolean, fetched?: FetchResult<JobsResponse>) {
 		const token = loadToken;
 		const result = fetched ?? (await fetchJobs(queue, PAGE, reset ? undefined : pendingNext));
 		if (token !== loadToken) return;
@@ -63,7 +60,7 @@
 		}
 	}
 
-	async function loadFailed(reset: boolean, fetched?: FetchResult<FailedJobsResponse>): Promise<void> {
+	async function loadFailed(reset: boolean, fetched?: FetchResult<FailedJobsResponse>) {
 		const token = loadToken;
 		const result = fetched ?? (await fetchFailedJobs(queue, PAGE, reset ? undefined : failedNext));
 		if (token !== loadToken) return;
@@ -78,7 +75,7 @@
 	}
 
 	// Refreshes in place: the lists stay on screen until the new ones arrive.
-	async function refresh(): Promise<void> {
+	async function refresh() {
 		loadToken += 1;
 		loading = true;
 		error = null;
@@ -112,42 +109,27 @@
 		loadFailed(true, lists.failed);
 	}
 
-	async function onRetry(key: string): Promise<void> {
+	async function act(key: string, verb: 'retry' | 'delete', request: () => Promise<string | null>) {
 		busyKey = key;
 		actionError = null;
-		const err = await retryJob(queue, key);
+		const err = await request();
 		busyKey = null;
 		if (err) {
-			actionError = `Could not retry the job (${err}).`;
+			actionError = `Could not ${verb} the job (${err}).`;
 		}
 		await refresh();
 	}
 
-	async function onDelete(state: JobState, key: string): Promise<void> {
-		busyKey = key;
-		actionError = null;
-		const err = await deleteJob(queue, state, key);
-		busyKey = null;
-		if (err) {
-			actionError = `Could not delete the job (${err}).`;
-		}
-		await refresh();
-	}
-
-	async function loadMorePending(): Promise<void> {
+	async function loadMorePending() {
 		pendingMore = true;
 		await loadPending(false);
 		pendingMore = false;
 	}
 
-	async function loadMoreFailed(): Promise<void> {
+	async function loadMoreFailed() {
 		failedMore = true;
 		await loadFailed(false);
 		failedMore = false;
-	}
-
-	function backoffPending(job: JobEntry): boolean {
-		return new Date(job.not_before).getTime() > Date.now();
 	}
 </script>
 
@@ -199,7 +181,7 @@
 							<td class="mono">{job.lock_key}</td>
 							<td>
 								{job.attempts}/{job.max_attempts}
-								{#if backoffPending(job)}
+								{#if new Date(job.not_before).getTime() > Date.now()}
 									<span class="badge backoff">backoff</span>
 								{/if}
 							</td>
@@ -210,7 +192,7 @@
 									disabled={busyKey === job.storage_key}
 									onrequestconfirm={() => (confirmKey = job.storage_key)}
 									oncancel={() => (confirmKey = null)}
-									onconfirm={() => onDelete('pending', job.storage_key)}
+									onconfirm={() => act(job.storage_key, 'delete', () => deleteJob(queue, 'pending', job.storage_key))}
 								/>
 							</td>
 						</tr>
@@ -252,7 +234,7 @@
 								<div class="row-actions">
 									<button
 										class="secondary"
-										onclick={() => onRetry(job.storage_key)}
+										onclick={() => act(job.storage_key, 'retry', () => retryJob(queue, job.storage_key))}
 										disabled={busyKey === job.storage_key}
 									>
 										retry
@@ -262,7 +244,7 @@
 										disabled={busyKey === job.storage_key}
 										onrequestconfirm={() => (confirmKey = job.storage_key)}
 										oncancel={() => (confirmKey = null)}
-										onconfirm={() => onDelete('failed', job.storage_key)}
+										onconfirm={() => act(job.storage_key, 'delete', () => deleteJob(queue, 'failed', job.storage_key))}
 									/>
 								</div>
 							</td>
