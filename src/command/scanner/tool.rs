@@ -125,9 +125,9 @@ impl Scanner {
                     command.env("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true");
                 }
                 if let Some(auth) = credentials {
-                    command.env("SYFT_REGISTRY_AUTH_AUTHORITY", authority);
-                    command.env("SYFT_REGISTRY_AUTH_USERNAME", &auth.username);
-                    command.env("SYFT_REGISTRY_AUTH_PASSWORD", auth.password.expose());
+                    command.env("GRYPE_REGISTRY_AUTH_AUTHORITY", authority);
+                    command.env("GRYPE_REGISTRY_AUTH_USERNAME", &auth.username);
+                    command.env("GRYPE_REGISTRY_AUTH_PASSWORD", auth.password.expose());
                 }
             }
             Scanner::Trivy => {
@@ -191,10 +191,11 @@ mod tests {
         assert!("clair".parse::<Scanner>().is_err());
     }
 
-    /// Grype pulls through syft, which takes the registry authority alone; a
-    /// plain-HTTP registry needs its own switch.
+    /// Grype reads registry credentials from its own GRYPE_ variables, not
+    /// syft's, and takes the registry authority alone; a plain-HTTP registry
+    /// needs its own switch.
     #[test]
-    fn grype_gets_sarif_output_and_syft_registry_credentials() {
+    fn grype_gets_sarif_output_and_registry_credentials() {
         let scanner = Scanner::Grype;
         let mut command = Command::new(scanner.as_str());
         let image = "registry.example.com:8000/apps/web@sha256:abc";
@@ -221,15 +222,15 @@ mod tests {
             Some("true")
         );
         assert_eq!(
-            env(&command, "SYFT_REGISTRY_AUTH_AUTHORITY").as_deref(),
+            env(&command, "GRYPE_REGISTRY_AUTH_AUTHORITY").as_deref(),
             Some("registry.example.com:8000")
         );
         assert_eq!(
-            env(&command, "SYFT_REGISTRY_AUTH_USERNAME").as_deref(),
+            env(&command, "GRYPE_REGISTRY_AUTH_USERNAME").as_deref(),
             Some("scanner")
         );
         assert_eq!(
-            env(&command, "SYFT_REGISTRY_AUTH_PASSWORD").as_deref(),
+            env(&command, "GRYPE_REGISTRY_AUTH_PASSWORD").as_deref(),
             Some("pw")
         );
     }
