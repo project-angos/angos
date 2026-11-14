@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 angos-secret = { workspace = true }
-redis = { version = "1.8.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8.1", features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
