@@ -2,39 +2,56 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::select;
-use tokio::time::sleep;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use angos_backoff::Backoff;
 
 use crate::jobs::Queue;
 use crate::jobs::store::{
     ClaimOutcome, ClaimedJob, CompleteOutcome, Error, FailOutcome, JobHandler, JobStore,
 };
 
-/// Idle poll interval of an in-process claim loop; production polls once a
-/// second so an empty queue does not storm the object store with `LIST`s.
+/// Floor on the wait for a backed-off job due at a known instant.
 const IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// Wait between polls of an empty queue. Each poll is a `LIST`, so the wait
+/// grows while the queue stays empty; this process's enqueues cut it short.
+const IDLE_BACKOFF: Backoff =
+    Backoff::exponential(Duration::from_secs(1), Duration::from_secs(15)).with_jitter();
+
 /// One in-process claim loop over `queue`, where `handler` is the handler bound
-/// to it. Cancellation races only the claim, so a job already claimed runs to
-/// completion rather than being interrupted.
+/// to it. Cancellation races the claim and the idle wait only, so a job already
+/// claimed runs to completion rather than being interrupted.
 pub async fn claim_loop(
     consumer: Arc<JobStore>,
     handler: Arc<dyn JobHandler>,
     queue: Queue,
     shutdown: CancellationToken,
 ) {
+    let mut empty_polls: u32 = 0;
     loop {
-        select! {
+        let wait = select! {
             () = shutdown.cancelled() => return,
             outcome = consumer.claim_one(queue) => match outcome {
                 // `claim_one` self-throttles on a backend error; nothing to do.
-                Err(_) => {}
+                Err(_) => continue,
                 Ok(ClaimOutcome { claimed: Some(claimed), .. }) => {
+                    empty_polls = 0;
                     execute_one(consumer.as_ref(), handler.as_ref(), claimed).await;
+                    continue;
                 }
-                Ok(idle) => sleep(idle.idle_sleep(IDLE_POLL)).await,
+                Ok(idle) if idle.next_ready.is_some() => idle.idle_sleep(IDLE_POLL),
+                Ok(_) => {
+                    empty_polls = empty_polls.saturating_add(1);
+                    IDLE_BACKOFF.delay(empty_polls - 1)
+                }
             },
+        };
+        select! {
+            () = shutdown.cancelled() => return,
+            _ = timeout(wait, consumer.waker(queue).notified()) => {}
         }
     }
 }
@@ -103,21 +120,26 @@ pub async fn run_once(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::spawn;
-    use tokio::time::{sleep, timeout};
+    use tokio::sync::Barrier;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+    use tokio::task::JoinHandle;
+    use tokio::time::{Instant, sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
-    use angos_storage::ObjectStore;
+    use angos_backoff::Backoff;
     use angos_storage::fs::Backend as StorageFsBackend;
+    use angos_storage::test_util::{HookedStore, StoreHook, StoreOp};
+    use angos_storage::{Error as StorageError, ObjectStore};
 
     use crate::jobs::Queue;
-    use crate::jobs::runner::{execute_one, run_once};
+    use crate::jobs::runner::{claim_loop, execute_one, run_once};
     use crate::jobs::store::tests::claimed_job;
     use crate::jobs::store::{ClaimMode, Error, JobEnvelope, JobHandler, JobStore};
     use crate::metrics_provider;
@@ -139,6 +161,215 @@ mod tests {
             "test-worker",
             ClaimMode::Atomic,
         ))
+    }
+
+    /// Reports each executed job's lock key, after waiting on the barrier when
+    /// one is set.
+    struct ReportingHandler {
+        ran: UnboundedSender<String>,
+        barrier: Option<Barrier>,
+    }
+
+    #[async_trait]
+    impl JobHandler for ReportingHandler {
+        async fn execute(&self, envelope: &JobEnvelope) -> Result<(), Error> {
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            self.ran
+                .send(envelope.lock_key.to_string())
+                .expect("test receiver alive");
+            Ok(())
+        }
+    }
+
+    /// Records when each poll of a pending queue starts.
+    #[derive(Clone, Default)]
+    struct PollLog(Arc<Mutex<Vec<Instant>>>);
+
+    #[async_trait]
+    impl StoreHook for PollLog {
+        async fn before(&self, op: StoreOp<'_>) -> Result<(), StorageError> {
+            if let StoreOp::List { prefix } = op
+                && prefix.contains("/pending")
+            {
+                self.0.lock().expect("poll log").push(Instant::now());
+            }
+            Ok(())
+        }
+    }
+
+    fn spawn_loops(
+        store: &Arc<JobStore>,
+        handler: &Arc<ReportingHandler>,
+        count: usize,
+    ) -> (CancellationToken, Vec<JoinHandle<()>>) {
+        let shutdown = CancellationToken::new();
+        let tasks = (0..count)
+            .map(|_| {
+                spawn(claim_loop(
+                    store.clone(),
+                    handler.clone(),
+                    Queue::Cache,
+                    shutdown.clone(),
+                ))
+            })
+            .collect();
+        (shutdown, tasks)
+    }
+
+    async fn stop(shutdown: &CancellationToken, tasks: Vec<JoinHandle<()>>) {
+        shutdown.cancel();
+        for task in tasks {
+            task.await.expect("loop task");
+        }
+    }
+
+    /// Long enough for an idle loop's wait to reach the cap.
+    const SETTLE: Duration = Duration::from_mins(2);
+
+    // Under paused time the clock moves only once every task is parked, so
+    // a job a woken loop claims runs at the instant of the wake.
+
+    #[tokio::test(start_paused = true)]
+    async fn local_enqueue_wakes_a_backed_off_loop() {
+        metrics_provider::initialize_metrics();
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let (ran, mut reports) = unbounded_channel();
+        let handler = Arc::new(ReportingHandler { ran, barrier: None });
+        let (shutdown, tasks) = spawn_loops(&store, &handler, 1);
+
+        sleep(SETTLE).await;
+        store
+            .enqueue(
+                JobEnvelope::new(Queue::Cache, "test.noop", "cache.ns:sha256:woken", &())
+                    .expect("envelope"),
+            )
+            .await
+            .expect("enqueue");
+
+        let ran = timeout(Duration::from_millis(1), reports.recv())
+            .await
+            .expect("a local enqueue must wake the loop, not wait for its next poll");
+        assert_eq!(ran.as_deref(), Some("cache.ns:sha256:woken"));
+        stop(&shutdown, tasks).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_polls_back_off_find_a_peer_job_and_reset_on_a_claim() {
+        metrics_provider::initialize_metrics();
+        let dir = TempDir::new().expect("temp dir");
+        let log = PollLog::default();
+        let object: Arc<dyn ObjectStore> = Arc::new(HookedStore::new(
+            Arc::new(StorageFsBackend::new(dir.path(), false)),
+            log.clone(),
+        ));
+        let store = Arc::new(JobStore::new(
+            &metadata_store_over(object),
+            "test-worker",
+            ClaimMode::Atomic,
+        ));
+        // A second store over the same backend stands in for another replica,
+        // whose enqueue wakes nothing here.
+        let peer = make_store(&dir);
+        let (ran, mut reports) = unbounded_channel();
+        let handler = Arc::new(ReportingHandler { ran, barrier: None });
+        let (shutdown, tasks) = spawn_loops(&store, &handler, 1);
+
+        sleep(SETTLE).await;
+        let unjittered = Backoff::exponential(Duration::from_secs(1), Duration::from_secs(15));
+        let polls = log.0.lock().expect("poll log").clone();
+        for (attempt, pair) in (0..).zip(polls.windows(2)) {
+            let gap = pair[1] - pair[0];
+            let step = unjittered.delay(attempt);
+            assert!(
+                (step..step * 2).contains(&gap),
+                "poll gap {attempt} was {gap:?}, expected jittered {step:?}"
+            );
+        }
+
+        peer.enqueue(
+            JobEnvelope::new(Queue::Cache, "test.noop", "cache.ns:sha256:peer", &())
+                .expect("envelope"),
+        )
+        .await
+        .expect("enqueue");
+        let ran = timeout(Duration::from_secs(30), reports.recv())
+            .await
+            .expect("the next poll must claim a peer's job");
+        assert_eq!(ran.as_deref(), Some("cache.ns:sha256:peer"));
+
+        // The claim is followed at once by an empty poll, then the first step.
+        let claimed_at = Instant::now();
+        sleep(Duration::from_secs(10)).await;
+        let next_poll = *log
+            .0
+            .lock()
+            .expect("poll log")
+            .iter()
+            .find(|&&poll| poll > claimed_at + Duration::from_millis(1))
+            .expect("a poll after the claim");
+        let next_wait = next_poll - claimed_at;
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(2)).contains(&next_wait),
+            "a claim must restart the backoff, next poll came after {next_wait:?}"
+        );
+        stop(&shutdown, tasks).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_wakes_a_sibling_so_a_polled_burst_runs_at_full_concurrency() {
+        const LOOPS: usize = 3;
+        metrics_provider::initialize_metrics();
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let peer = make_store(&dir);
+        let (ran, mut reports) = unbounded_channel();
+        let handler = Arc::new(ReportingHandler {
+            ran,
+            barrier: Some(Barrier::new(LOOPS)),
+        });
+        let (shutdown, tasks) = spawn_loops(&store, &handler, LOOPS);
+
+        sleep(SETTLE).await;
+        for i in 0..LOOPS {
+            peer.enqueue(
+                JobEnvelope::new(
+                    Queue::Cache,
+                    "test.noop",
+                    &format!("cache.ns:sha256:{i}"),
+                    &(),
+                )
+                .expect("envelope"),
+            )
+            .await
+            .expect("enqueue");
+        }
+        // One wake, as from a single local enqueue; the claims pass it on.
+        store.waker(Queue::Cache).notify_one();
+
+        for _ in 0..LOOPS {
+            timeout(Duration::from_millis(1), reports.recv())
+                .await
+                .expect("every loop must join the burst before its next poll");
+        }
+        stop(&shutdown, tasks).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backed_off_loop_stops_at_shutdown() {
+        metrics_provider::initialize_metrics();
+        let dir = TempDir::new().expect("temp dir");
+        let store = make_store(&dir);
+        let (ran, _reports) = unbounded_channel();
+        let handler = Arc::new(ReportingHandler { ran, barrier: None });
+        let (shutdown, tasks) = spawn_loops(&store, &handler, 1);
+
+        sleep(SETTLE).await;
+        timeout(Duration::from_millis(1), stop(&shutdown, tasks))
+            .await
+            .expect("an idle loop must stop at shutdown, not at the end of its wait");
     }
 
     #[tokio::test]

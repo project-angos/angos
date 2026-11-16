@@ -17,7 +17,9 @@ By default (when `[global.job_queue]` is absent) the `angos server` process
 drains the queue itself, in-process: a client request enqueues a cache-fill job
 and an in-process claim loop runs it. Pending jobs persist to the store and are
 picked back up after a restart, but there is no cross-replica coordination and
-no externally observable queue-depth gauge.
+no externally observable queue-depth gauge. An idle loop waits up to 15 seconds
+(plus jitter) between polls, so a job another replica enqueued can wait that
+long.
 
 Adding `[global.job_queue]` switches draining to one or more separate `angos
 worker` processes that you run alongside `angos server`, and turns on the
