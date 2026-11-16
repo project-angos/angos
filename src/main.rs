@@ -137,6 +137,13 @@ fn main() {
     };
     initialize_metrics();
     let exit_code = match subcommand {
+        SubCommand::Argon(_) => match argon::run() {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("Argon error: {err}");
+                1
+            }
+        },
         SubCommand::Scanner(options) => scanner_main(&options, &config_paths),
         subcommand => registry_main(subcommand, &config_paths),
     };
@@ -145,7 +152,7 @@ fn main() {
     }
 }
 
-/// Every subcommand but the scanner service runs against a registry's whole
+/// Every subcommand but password hashing and the scanner service runs against a registry's whole
 /// configuration, on a runtime sized by it.
 fn registry_main(subcommand: SubCommand, config_paths: &[String]) -> i32 {
     let config = match Configuration::load_all(config_paths) {
@@ -229,7 +236,6 @@ async fn run_command(
     config_paths: &[String],
 ) -> i32 {
     match subcommand {
-        SubCommand::Argon(_) => report("Argon", argon::run()),
         SubCommand::Prune(prune_options) => {
             report("Prune", prune::run(&prune_options, &config).await)
         }
@@ -239,7 +245,7 @@ async fn run_command(
         ),
         SubCommand::Scrub(scrub_options) => report("Scrub", run_scrub(scrub_options, config).await),
         SubCommand::Serve(_) => report("Server", run_server(config_paths, config).await),
-        SubCommand::Scanner(_) => 0,
+        SubCommand::Argon(_) | SubCommand::Scanner(_) => 0,
         SubCommand::Worker(worker_options) => report(
             "Worker",
             run_worker(config_paths, worker_options, config).await,

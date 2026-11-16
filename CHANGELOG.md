@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - The `grype` scanner pulls with the registry credentials it is configured with, instead of anonymously, so it scans images on a registry that refuses anonymous reads instead of failing with `UNAUTHORIZED`.
+- `angos argon` hashes a password without loading a configuration file, instead of failing when none is present.
 
 ## 1.12.5
 
