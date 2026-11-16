@@ -430,8 +430,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A spawned loop idles at 10 ms under cfg(test), so one would have
-        // claimed the job many times over within 500 ms.
+        // The enqueue wakes any loop idling on the queue, so one would have
+        // claimed the job well within 500 ms.
         sleep(Duration::from_millis(500)).await;
 
         assert_eq!(

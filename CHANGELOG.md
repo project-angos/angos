@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.13.0 - Unreleased
 
+### Changed
+
+- An idle in-process job loop (no `[global.job_queue]`) backs off from 1 to 15 seconds instead of polling every second; a local enqueue still wakes it at once.
+
 ### Fixed
 
 - The `grype` scanner pulls with the registry credentials it is configured with, instead of anonymously, so it scans images on a registry that refuses anonymous reads instead of failing with `UNAUTHORIZED`.

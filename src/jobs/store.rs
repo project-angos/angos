@@ -21,6 +21,7 @@ use serde::de::{DeserializeOwned, Error as DeError};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, sleep};
 use tokio::{select, spawn};
@@ -571,6 +572,18 @@ pub struct JobStore {
     /// Without it every local loop walks the same queue head, paying a body
     /// read and a failed claim per job a sibling already holds.
     in_flight: Arc<Mutex<HashSet<String>>>,
+    wakers: QueueWakers,
+}
+
+/// A wake signal per queue for this process's idle claim loops. `notify_one`
+/// keeps a permit while no loop waits, so an enqueue landing between a loop's
+/// poll and its wait is not lost.
+#[derive(Default)]
+struct QueueWakers {
+    cache: Notify,
+    replication: Notify,
+    scan: Notify,
+    index: Notify,
 }
 
 impl JobStore {
@@ -613,6 +626,18 @@ impl JobStore {
                 .unwrap_or(i64::MAX)
                 .clamp(1, 86_400),
             in_flight: Arc::default(),
+            wakers: QueueWakers::default(),
+        }
+    }
+
+    /// Signalled when this process queues claimable work on `queue`; another
+    /// process's enqueue is only seen by the next poll.
+    pub fn waker(&self, queue: Queue) -> &Notify {
+        match queue {
+            Queue::Cache => &self.wakers.cache,
+            Queue::Replication => &self.wakers.replication,
+            Queue::Scan => &self.wakers.scan,
+            Queue::Index => &self.wakers.index,
         }
     }
 
@@ -995,6 +1020,7 @@ impl JobStore {
             self.store
                 .create_if_absent(&pending_path, pending_body)
                 .await?;
+            self.waker(envelope.queue).notify_one();
             "miss"
         } else {
             "hit"
@@ -1057,7 +1083,8 @@ impl JobStore {
     /// Walk the ready pending keys and claim the first one that is free, the
     /// oldest [`CLAIM_SPREAD`] from a random offset so concurrent claimants do
     /// not all race for the queue head. The first key scheduled in the future
-    /// ends the walk and is reported as `next_ready`.
+    /// ends the walk and is reported as `next_ready`. A claim that leaves other
+    /// ready keys wakes a sibling loop, so a burst found by polling ramps up.
     async fn try_claim_one(&self, queue: Queue) -> Result<ClaimOutcome, Error> {
         let now = Utc::now();
         let mut keys = self.list_pending(queue, MAX_SCAN).await?;
@@ -1111,6 +1138,9 @@ impl JobStore {
                     worker_id = self.worker_id.as_str(),
                     "Claimed job"
                 );
+                if ready > 1 {
+                    self.waker(queue).notify_one();
+                }
                 return Ok(ClaimOutcome {
                     claimed: Some(ClaimedJob {
                         envelope,
@@ -1301,6 +1331,7 @@ impl JobStore {
             .create_if_absent(&pending_path, pending_body)
             .await?;
         self.store.delete(&failed_path).await?;
+        self.waker(queue).notify_one();
         Ok(())
     }
 

@@ -157,6 +157,10 @@ enqueues jobs and publishes the queue-depth gauge on `/metrics`, and one or
 more `angos worker` processes drain it. Either way, jobs persist under the
 `[metadata_store]` backend's `_jobs/` prefix and survive restarts.
 
+An idle in-process drain polls its queue at a wait that grows from 1 to 15
+seconds, plus jitter. A job the server enqueues itself starts at once; one
+enqueued by another replica, or left by a crashed one, waits for the next poll.
+
 The queue does not have its own storage backend. Durable jobs are written to
 the **same backend configured for `[metadata_store]`** (filesystem or S3,
 whichever metadata uses), under a hardcoded top-level `_jobs/` prefix. There is
