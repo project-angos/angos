@@ -52,7 +52,7 @@ URLs follow Docker reference format:
 
 | URL                                  | View             | Description                 |
 |--------------------------------------|------------------|-----------------------------|
-| `/`                                  | Repository list  | All configured repositories |
+| `/`                                  | Repository list  | All configured repositories, or every first path segment when none is configured |
 | `/{repository}`                      | Namespace list   | Images within a repository  |
 | `/{repository}/{namespace}`          | Manifest list    | All manifests for an image  |
 | `/{repository}/{namespace}:{tag}`    | Manifest details | Manifest by tag             |

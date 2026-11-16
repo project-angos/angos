@@ -98,8 +98,14 @@ impl RepositoryResolver {
             .map(|(_, repo)| repo)
     }
 
-    pub fn len(&self) -> usize {
-        self.inner.len()
+    /// The name of the repository `namespace` is listed under: its configured
+    /// repository's key, or its first path segment when none is configured,
+    /// since prune then keeps every namespace and nothing is an orphan.
+    pub fn owner<'a>(&'a self, namespace: &'a str) -> Option<&'a str> {
+        if self.inner.is_empty() {
+            return namespace.split('/').next();
+        }
+        self.keys().find(|key| namespace_belongs_to(namespace, key))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -112,10 +118,6 @@ impl RepositoryResolver {
 
     pub fn values(&self) -> impl Iterator<Item = &Repository> {
         self.inner.values()
-    }
-
-    pub fn contains_key(&self, name: &str) -> bool {
-        self.inner.contains_key(name)
     }
 
     pub fn get(&self, name: &str) -> Option<&Repository> {

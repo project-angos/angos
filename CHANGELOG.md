@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - An idle in-process job loop (no `[global.job_queue]`) backs off from 1 to 15 seconds instead of polling every second; a local enqueue still wakes it at once.
+- With no `[repository]` configured, the web UI lists every namespace, grouped by its first path segment, instead of showing nothing.
 
 ### Fixed
 

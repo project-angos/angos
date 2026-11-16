@@ -287,17 +287,19 @@ impl Registry {
         // whole store once per configured repository.
         let all_namespaces = self.collect_namespaces(None).await?;
 
-        let mut repositories = Vec::with_capacity(self.resolver.len());
-        for name in self.resolver.keys() {
-            let namespace_count = all_namespaces
-                .iter()
-                .filter(|ns| namespace_belongs_to(ns, name) && visibility(ns))
-                .count();
-            // Visible content is the whole criterion: testing the repository's
-            // own name would read a namespace policy against a name that is none.
-            if namespace_count == 0 {
-                continue;
+        // Visible content is the whole criterion: testing the repository's own
+        // name would read a namespace policy against a name that is none.
+        let mut namespace_counts: HashMap<&str, usize> = HashMap::new();
+        for namespace in &all_namespaces {
+            if let Some(name) = self.resolver.owner(namespace)
+                && visibility(namespace)
+            {
+                *namespace_counts.entry(name).or_default() += 1;
             }
+        }
+
+        let mut repositories = Vec::with_capacity(namespace_counts.len());
+        for (name, namespace_count) in namespace_counts {
             let config = self.repository_config(name);
             repositories.push(RepositoryInfo {
                 name: name.to_string(),
@@ -336,7 +338,7 @@ impl Registry {
         if !namespace_belongs_to(scope.as_ref(), repository) {
             return Err(Error::NameUnknown);
         }
-        if !self.resolver.contains_key(repository) {
+        if self.resolver.owner(repository) != Some(repository) {
             return Err(Error::NameUnknown);
         }
         let namespace_names = self.collect_namespaces(Some(scope.as_ref())).await?;
@@ -1434,6 +1436,54 @@ mod tests {
             assert_eq!(
                 body["repositories"][0]["name"], "test-repo",
                 "the repository holding that content must list too; got: {body}"
+            );
+        })
+        .await;
+    }
+
+    /// With no repository configured, prune keeps every namespace, so the
+    /// listings group them by first path segment instead of hiding them all.
+    #[tokio::test]
+    async fn listings_group_by_first_segment_without_configured_repositories() {
+        for_each_backend(async |test_case| {
+            let metadata_store = test_case.metadata_store();
+            let registry = Registry::new(
+                test_case.blob_store(),
+                metadata_store.clone(),
+                Arc::new(RepositoryResolver::new(Arc::new(HashMap::new())).unwrap()),
+                RegistryConfig::new(test_job_store(&metadata_store)),
+            );
+            for name in ["solo", "team-a/app", "team-a/lib/x", "team-b/svc"] {
+                let namespace = Namespace::new(name).unwrap();
+                seed_tagged_revision(&metadata_store, &namespace, &digest("d1"), &["v1"]).await;
+            }
+
+            let body = registry
+                .handle_list_repositories(SortOrder::Asc, PageRequest::default(), &ALL_VISIBLE)
+                .await
+                .unwrap();
+            let repositories: Vec<(&str, usize)> = body
+                .repositories
+                .iter()
+                .map(|repository| (repository.name.as_str(), repository.namespace_count))
+                .collect();
+            assert_eq!(repositories, [("solo", 1), ("team-a", 2), ("team-b", 1)]);
+
+            let body = registry
+                .handle_list_namespaces(namespaces_of("team-a"), &ALL_VISIBLE)
+                .await
+                .unwrap();
+            let names: Vec<&str> = body.namespaces.iter().map(|ns| ns.name.as_str()).collect();
+            assert_eq!(names, ["team-a/app", "team-a/lib/x"]);
+
+            assert!(
+                matches!(
+                    registry
+                        .handle_list_namespaces(namespaces_of("team-a/lib"), &ALL_VISIBLE)
+                        .await,
+                    Err(RegistryError::NameUnknown)
+                ),
+                "only a first segment names an unconfigured repository"
             );
         })
         .await;
