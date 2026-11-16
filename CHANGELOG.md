@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.13.0 - Unreleased
+
+### Fixed
+
+- The `grype` scanner pulls with the registry credentials it is configured with, instead of anonymously, so it scans images on a registry that refuses anonymous reads instead of failing with `UNAUTHORIZED`.
+
 ## 1.12.5
 
 ### Added
