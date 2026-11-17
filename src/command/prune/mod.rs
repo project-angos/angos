@@ -94,12 +94,11 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
         repositories,
     } = bootstrap::maintenance_context(config).await?;
 
-    let global_policy = global_retention_policy(&config.global.retention_policy);
     let checker = RetentionChecker::new(
         blob_backend.clone(),
         metadata_store.clone(),
         repositories.clone(),
-        global_policy.clone(),
+        global_retention_policy(&config.global.retention_policy),
     );
     let mut registry = None;
     let sink = run_sink(options.dry_run, || {
@@ -130,22 +129,21 @@ pub async fn run(options: &Options, config: &Configuration) -> Result<(), Error>
             &blob_backend,
             &metadata_store,
             &repositories,
+            config.global.prune_orphan_namespaces,
             sink.as_ref(),
         )
         .await,
         uploads::sweep_upload_sessions(&blob_backend, window, sink.as_ref(), options.concurrency)
             .await,
         uploads::sweep_orphan_multiparts(blob_backend.as_ref(), window, sink.as_ref()).await,
-        checker::sweep_orphan_grants(
-            &blob_backend,
-            &metadata_store,
-            &repositories,
-            global_policy.as_deref(),
-            window,
-            sink.as_ref(),
-            options.concurrency,
-        )
-        .await,
+        checker
+            .sweep_orphan_grants(
+                config.global.prune_orphan_namespaces,
+                window,
+                sink.as_ref(),
+                options.concurrency,
+            )
+            .await,
         uploads::sweep_byteless_refs(
             &blob_backend,
             &metadata_store,

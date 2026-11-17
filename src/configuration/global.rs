@@ -93,6 +93,9 @@ pub struct GlobalConfig {
     /// and uploads, three enumerations per namespace it returns.
     #[serde(default)]
     pub namespace_counts: NamespaceCounts,
+    /// Whether prune clears the namespaces no configured repository owns.
+    #[serde(default)]
+    pub prune_orphan_namespaces: OrphanNamespaces,
     /// Reclamation grace period in seconds: scrub leaves unreferenced blobs,
     /// dangling reference keys and stale index entries younger than this alone,
     /// so it cannot race an in-flight push or upload. Lower it only for offline
@@ -126,6 +129,21 @@ impl From<bool> for NamespaceCounts {
         } else {
             Self::Omitted
         }
+    }
+}
+
+/// Read from the `prune_orphan_namespaces` bool of `[global]`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(from = "bool")]
+pub enum OrphanNamespaces {
+    #[default]
+    Cleared,
+    Kept,
+}
+
+impl From<bool> for OrphanNamespaces {
+    fn from(cleared: bool) -> Self {
+        if cleared { Self::Cleared } else { Self::Kept }
     }
 }
 
@@ -253,6 +271,7 @@ impl Default for GlobalConfig {
             listing_read_concurrency: default_listing_read_concurrency(),
             revision_cache_entries: default_revision_cache_entries(),
             namespace_counts: NamespaceCounts::default(),
+            prune_orphan_namespaces: OrphanNamespaces::default(),
             gc_grace_secs: default_gc_grace_secs(),
             pull_history: PullHistoryConfig::default(),
             trusted_proxies: Vec::new(),

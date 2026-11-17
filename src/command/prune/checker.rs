@@ -14,6 +14,7 @@ use crate::command::maintenance::action::Action;
 use crate::command::maintenance::check::NamespaceChecker;
 use crate::command::maintenance::executor::{ActionSink, object_younger_than_grace};
 use crate::command::maintenance::tags::Rankings;
+use crate::configuration::global::OrphanNamespaces;
 use crate::policy::{ManifestImage, RetentionPolicy};
 use crate::registry::blob_store::BlobStore;
 use crate::registry::keys::DigestExt;
@@ -54,44 +55,47 @@ fn retained(
     })
 }
 
-/// Revoke per-namespace blob-ownership grants with no manifest reference. The
-/// retention policies decide, with the bytes' mtime as `pushed_at` and no tag,
-/// so an unconfigured registry retains the grant like an orphan manifest.
-///
-/// `in_flight_window` guards the push race, not the decision: a push grants
-/// ownership before it links the manifest, so neither bytes nor a grant
-/// younger than the window is considered. The executor re-checks the
-/// references and the own key's age at apply time before revoking.
-pub async fn sweep_orphan_grants(
-    blob_store: &Arc<BlobStore>,
-    metadata_store: &Arc<MetadataStore>,
-    resolver: &Arc<RepositoryResolver>,
-    global_policy: Option<&RetentionPolicy>,
-    in_flight_window: Duration,
-    sink: &dyn ActionSink,
-    concurrency: usize,
-) -> Result<(), Error> {
-    let ctx = GrantSweep {
-        blob_store,
-        metadata_store,
-        resolver,
-        global_policy,
-        in_flight_window,
-        in_flight_window_secs: u64::try_from(in_flight_window.num_seconds()).unwrap_or(0),
-        now: Utc::now(),
-        sink,
-    };
-    let ctx = &ctx;
-    blob_store
-        .stream_blobs()
-        .err_into()
-        .try_for_each_concurrent(concurrency, |blob| async move {
-            if let Err(e) = sweep_grants_for_blob(ctx, &blob).await {
-                error!("prune: failed to check grants for blob {blob}: {e}");
-            }
-            Ok(())
-        })
-        .await
+impl RetentionChecker {
+    /// Revoke per-namespace blob-ownership grants with no manifest reference.
+    /// The retention policies decide, with the bytes' mtime as `pushed_at` and
+    /// no tag, so an unconfigured registry retains the grant like an orphan
+    /// manifest. A namespace no repository owns loses its grants outright
+    /// while `orphans` clears it.
+    ///
+    /// `in_flight_window` guards the push race, not the decision: a push grants
+    /// ownership before it links the manifest, so neither bytes nor a grant
+    /// younger than the window is considered. The executor re-checks the
+    /// references and the own key's age at apply time before revoking.
+    pub async fn sweep_orphan_grants(
+        &self,
+        orphans: OrphanNamespaces,
+        in_flight_window: Duration,
+        sink: &dyn ActionSink,
+        concurrency: usize,
+    ) -> Result<(), Error> {
+        let ctx = GrantSweep {
+            blob_store: &self.blob_store,
+            metadata_store: &self.metadata_store,
+            resolver: &self.resolver,
+            global_policy: self.global_retention_policy.as_deref(),
+            orphans,
+            in_flight_window,
+            in_flight_window_secs: u64::try_from(in_flight_window.num_seconds()).unwrap_or(0),
+            now: Utc::now(),
+            sink,
+        };
+        let ctx = &ctx;
+        self.blob_store
+            .stream_blobs()
+            .err_into()
+            .try_for_each_concurrent(concurrency, |blob| async move {
+                if let Err(e) = sweep_grants_for_blob(ctx, &blob).await {
+                    error!("prune: failed to check grants for blob {blob}: {e}");
+                }
+                Ok(())
+            })
+            .await
+    }
 }
 
 struct GrantSweep<'a> {
@@ -99,6 +103,7 @@ struct GrantSweep<'a> {
     metadata_store: &'a Arc<MetadataStore>,
     resolver: &'a Arc<RepositoryResolver>,
     global_policy: Option<&'a RetentionPolicy>,
+    orphans: OrphanNamespaces,
     in_flight_window: Duration,
     /// [`Self::in_flight_window`] in seconds, for the key-age helper.
     in_flight_window_secs: u64,
@@ -131,7 +136,10 @@ async fn sweep_grants_for_blob(ctx: &GrantSweep<'_>, blob: &Digest) -> Result<()
         // sweep, so revoke its grants outright; the executor's re-check still
         // spares a blob a not-yet-cascaded manifest references.
         let repository = ctx.resolver.resolve(&namespace);
-        if repository.is_none() && !ctx.resolver.is_empty() {
+        if repository.is_none()
+            && ctx.orphans == OrphanNamespaces::Cleared
+            && !ctx.resolver.is_empty()
+        {
             ctx.sink
                 .apply(Action::RemoveOrphanBlobGrant {
                     namespace,
@@ -1284,17 +1292,15 @@ mod tests {
             .set_times(FileTimes::new().set_modified(week_ago))
             .unwrap();
 
-        sweep_orphan_grants(
-            &test_case.blob_store(),
-            &metadata_store,
-            &resolver(),
-            Some(&policy(KEEP_NOTHING)),
-            Duration::days(1),
-            &test_executor(test_case.blob_store(), metadata_store.clone()),
-            4,
-        )
-        .await
-        .unwrap();
+        checker(&test_case, Some(KEEP_NOTHING))
+            .sweep_orphan_grants(
+                OrphanNamespaces::Cleared,
+                Duration::days(1),
+                &test_executor(test_case.blob_store(), metadata_store.clone()),
+                4,
+            )
+            .await
+            .unwrap();
 
         assert!(
             metadata_store
@@ -1313,17 +1319,10 @@ mod tests {
             let metadata_store = test_case.metadata_store();
             let executor = test_executor(test_case.blob_store(), metadata_store.clone());
 
-            sweep_orphan_grants(
-                &test_case.blob_store(),
-                &metadata_store,
-                &resolver(),
-                None,
-                Duration::zero(),
-                &executor,
-                4,
-            )
-            .await
-            .unwrap();
+            checker(test_case, None)
+                .sweep_orphan_grants(OrphanNamespaces::Cleared, Duration::zero(), &executor, 4)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
@@ -1337,26 +1336,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unowned_namespace_grant_is_revoked_only_while_orphans_are_cleared() {
+        for_each_backend(async |test_case| {
+            let namespace = Namespace::new("ghost/app").unwrap();
+            let blob = seed_grant_only_blob(test_case, &namespace).await;
+            let metadata_store = test_case.metadata_store();
+            let executor = test_executor(test_case.blob_store(), metadata_store.clone());
+            let checker = checker(test_case, None);
+
+            checker
+                .sweep_orphan_grants(OrphanNamespaces::Kept, Duration::zero(), &executor, 4)
+                .await
+                .unwrap();
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_ok(),
+                "a kept orphan namespace's grant falls to retention, which keeps it"
+            );
+
+            checker
+                .sweep_orphan_grants(OrphanNamespaces::Cleared, Duration::zero(), &executor, 4)
+                .await
+                .unwrap();
+            assert!(
+                metadata_store
+                    .read_blob_index_namespace(&namespace, &blob)
+                    .await
+                    .is_err(),
+                "a cleared orphan namespace's grant must be revoked outright"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn orphan_grant_is_revoked_when_no_rule_retains_it() {
         for_each_backend(async |test_case| {
             let namespace = Namespace::new("test-repo/dropped").unwrap();
             let blob = seed_grant_only_blob(test_case, &namespace).await;
             let metadata_store = test_case.metadata_store();
             let executor = test_executor(test_case.blob_store(), metadata_store.clone());
-            let policy = policy(KEEP_NOTHING);
+            let checker = checker(test_case, Some(KEEP_NOTHING));
 
             // Within the in-flight window: never considered, whatever policy says.
-            sweep_orphan_grants(
-                &test_case.blob_store(),
-                &metadata_store,
-                &resolver(),
-                Some(&policy),
-                Duration::days(1),
-                &executor,
-                4,
-            )
-            .await
-            .unwrap();
+            checker
+                .sweep_orphan_grants(OrphanNamespaces::Cleared, Duration::days(1), &executor, 4)
+                .await
+                .unwrap();
             assert!(
                 metadata_store
                     .read_blob_index_namespace(&namespace, &blob)
@@ -1366,17 +1394,10 @@ mod tests {
             );
 
             // Past the window: the policy decides, and nothing retains it.
-            sweep_orphan_grants(
-                &test_case.blob_store(),
-                &metadata_store,
-                &resolver(),
-                Some(&policy),
-                Duration::zero(),
-                &executor,
-                4,
-            )
-            .await
-            .unwrap();
+            checker
+                .sweep_orphan_grants(OrphanNamespaces::Cleared, Duration::zero(), &executor, 4)
+                .await
+                .unwrap();
             assert!(
                 metadata_store
                     .read_blob_index_namespace(&namespace, &blob)
@@ -1416,17 +1437,15 @@ mod tests {
                     .unwrap();
             }
 
-            sweep_orphan_grants(
-                &test_case.blob_store(),
-                &metadata_store,
-                &resolver(),
-                Some(&policy(KEEP_NOTHING)),
-                Duration::zero(),
-                &test_executor(test_case.blob_store(), metadata_store.clone()),
-                4,
-            )
-            .await
-            .unwrap();
+            checker(test_case, Some(KEEP_NOTHING))
+                .sweep_orphan_grants(
+                    OrphanNamespaces::Cleared,
+                    Duration::zero(),
+                    &test_executor(test_case.blob_store(), metadata_store.clone()),
+                    4,
+                )
+                .await
+                .unwrap();
 
             let holds_grant = async |namespace| {
                 metadata_store
@@ -1454,21 +1473,14 @@ mod tests {
             let blob = seed_grant_only_blob(test_case, &namespace).await;
             let metadata_store = test_case.metadata_store();
             let executor = test_executor(test_case.blob_store(), metadata_store.clone());
-            let policy = policy("image.pushed_at > now() - days(1)");
+            let checker = checker(test_case, Some("image.pushed_at > now() - days(1)"));
 
             // Just-written bytes: `pushed_at > now() - days(1)` retains them
             // even though the in-flight window is zero.
-            sweep_orphan_grants(
-                &test_case.blob_store(),
-                &metadata_store,
-                &resolver(),
-                Some(&policy),
-                Duration::zero(),
-                &executor,
-                4,
-            )
-            .await
-            .unwrap();
+            checker
+                .sweep_orphan_grants(OrphanNamespaces::Cleared, Duration::zero(), &executor, 4)
+                .await
+                .unwrap();
 
             assert!(
                 metadata_store
