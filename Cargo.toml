@@ -71,7 +71,7 @@ zeroize = { version = "1.9.2", features = ["derive"] }
 
 [package]
 name = "angos"
-version = "1.12.4"
+version = "1.13.0"
 edition = "2024"
 
 [profile.release]
