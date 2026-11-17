@@ -51,7 +51,7 @@ Repositories → Namespaces → Manifests → Details
 
 ### Repository List
 
-- Shows all configured repositories
+- Shows all configured repositories, or every first path segment when none is configured
 - Displays namespace counts
 - Shows feature badges (pull-through, immutable tags)
 
