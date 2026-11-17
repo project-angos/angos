@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## 1.13.0 - Unreleased
 
+### Added
+
+- `prune_orphan_namespaces = false` in `[global]` keeps `angos prune` from clearing the namespaces no configured repository owns.
+
 ### Changed
 
 - An idle in-process job loop (no `[global.job_queue]`) backs off from 1 to 15 seconds instead of polling every second; a local enqueue still wakes it at once.

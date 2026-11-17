@@ -70,7 +70,7 @@ Prune first enforces retention policies (see [Configure Retention Policies](conf
 | Orphan S3 multiparts | Aborts in-flight multipart uploads older than the window whose session marker is gone |
 | Grant-only blob ownership | Retention policies decide, like any untagged content (no tag, `pushed_at` = upload time); the `-u` window only shields in-flight pushes, and with no policies configured the grant is retained |
 | Byteless index entries | Removes blob-index entries whose blob bytes never landed |
-| Orphan namespaces | Clears revisions, tags, in-flight uploads, and blob grants of every namespace not owned by any configured repository (always on; see below) |
+| Orphan namespaces | Clears revisions, tags, in-flight uploads, and blob grants of every namespace not owned by any configured repository (on unless `prune_orphan_namespaces = false`; see below) |
 
 These need an age threshold because a structural check cannot distinguish an in-flight push (blob uploaded, manifest seconds away) from an abandoned one; the `-u` window is exactly that upload-lifecycle age. A revision is left alone while its record, or a tag or index naming it, is younger than `gc_grace_secs`, for the same reason: a multi-arch push writes its platform manifests by digest before the index that names them, so a manifest with no tag may simply be mid-push, and a tag may land on an old revision after the run judged it. Deleting a revision never drops a tag younger than that window. The `-u` window must exceed the longest push you expect, since a deleting retention policy revokes grant-only blobs older than it. Run prune against the same configuration file the servers use.
 
@@ -253,13 +253,14 @@ See [Configure Retention Policies](configure-retention-policies.md) for detailed
 
 ### Clearing Orphan Namespaces
 
-Orphan-namespace clearing runs on **every prune**. When a `[repository]` is removed from configuration (or data predates it), the namespaces it held resolve to no repository, yet their manifests, tags, and blobs would linger forever. Prune removes the revisions, tags, and in-flight uploads of every such namespace and reclaims their blob bytes by revoking those blobs' ownership grants when no still-configured namespace shares them, so the blast radius is **every namespace whose owning repository is not in your config**, not just empty ones.
+Orphan-namespace clearing runs on **every prune** unless `prune_orphan_namespaces = false` is set in `[global]`. When a `[repository]` is removed from configuration (or data predates it), the namespaces it held resolve to no repository, yet their manifests, tags, and blobs would linger forever. Prune removes the revisions, tags, and in-flight uploads of every such namespace and reclaims their blob bytes by revoking those blobs' ownership grants when no still-configured namespace shares them, so the blast radius is **every namespace whose owning repository is not in your config**, not just empty ones.
 
 Safeguards apply:
 
 - **Dry-run after config changes.** Run `angos prune --dry-run` after removing or renaming a `[repository]` and confirm the listed deletions only cover namespaces you intend to drop.
 - **Byte reclaim may take a follow-up scrub.** Prune clears the namespace's links and grants; a scrub reclaims blob bytes the cascade freed.
 - **Run with no writers on orphan namespaces.** A client can still push to a namespace that maps to no repository; a later prune mops up anything pushed during the clear.
+- **Opt out.** With `prune_orphan_namespaces = false`, prune leaves namespaces no repository owns alone; the global retention policy still applies to their content.
 - **Empty-config guard.** If no `[repository]` is configured, every namespace would be an orphan, so the clearing is skipped with a warning and nothing is deleted; an emptied config can never wipe the registry.
 
 Cleared namespaces drop out of `_catalog` automatically, since the catalog is derived from stored content.

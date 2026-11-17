@@ -6,13 +6,14 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use futures_util::{StreamExt, TryStreamExt};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use angos_oci::Namespace;
 
 use crate::command::maintenance::Error;
 use crate::command::maintenance::action::Action;
 use crate::command::maintenance::executor::ActionSink;
+use crate::configuration::global::OrphanNamespaces;
 use crate::registry::blob_store::BlobStore;
 use crate::registry::metadata_store::{LIST_PAGE, MetadataStore};
 use crate::registry::repository_resolver::RepositoryResolver;
@@ -25,8 +26,13 @@ pub async fn sweep_orphan_namespaces(
     blob_store: &Arc<BlobStore>,
     metadata_store: &Arc<MetadataStore>,
     resolver: &Arc<RepositoryResolver>,
+    orphans: OrphanNamespaces,
     sink: &dyn ActionSink,
 ) -> Result<(), Error> {
+    if orphans == OrphanNamespaces::Kept {
+        info!("prune: prune_orphan_namespaces is disabled; skipping orphan-namespace clearing");
+        return Ok(());
+    }
     // With no repositories configured every namespace looks like an orphan;
     // refuse to delete the entire registry.
     if resolver.is_empty() {
@@ -138,9 +144,15 @@ mod tests {
                 .unwrap();
 
             let executor = test_executor(blob_store.clone(), metadata_store.clone());
-            sweep_orphan_namespaces(&blob_store, &metadata_store, &resolver(), &executor)
-                .await
-                .unwrap();
+            sweep_orphan_namespaces(
+                &blob_store,
+                &metadata_store,
+                &resolver(),
+                OrphanNamespaces::Cleared,
+                &executor,
+            )
+            .await
+            .unwrap();
 
             let ghost_tags = metadata_store
                 .list_tags(&ghost, 10, None)
@@ -180,9 +192,15 @@ mod tests {
                 RepositoryResolver::new(Arc::new(HashMap::new())).expect("empty resolver"),
             );
             let executor = test_executor(blob_store.clone(), metadata_store.clone());
-            sweep_orphan_namespaces(&blob_store, &metadata_store, &empty, &executor)
-                .await
-                .unwrap();
+            sweep_orphan_namespaces(
+                &blob_store,
+                &metadata_store,
+                &empty,
+                OrphanNamespaces::Cleared,
+                &executor,
+            )
+            .await
+            .unwrap();
 
             let tags = metadata_store
                 .list_tags(&ghost, 10, None)
@@ -194,6 +212,35 @@ mod tests {
                 1,
                 "an emptied config must never clear the registry"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn kept_orphans_are_not_cleared() {
+        for_each_backend(async |test_case| {
+            let metadata_store = test_case.metadata_store();
+            let blob_store = test_case.blob_store();
+            let ghost = Namespace::new("ghost/app").unwrap();
+            seed_manifest(&blob_store, &metadata_store, &ghost).await;
+
+            let executor = test_executor(blob_store.clone(), metadata_store.clone());
+            sweep_orphan_namespaces(
+                &blob_store,
+                &metadata_store,
+                &resolver(),
+                OrphanNamespaces::Kept,
+                &executor,
+            )
+            .await
+            .unwrap();
+
+            let tags = metadata_store
+                .list_tags(&ghost, 10, None)
+                .await
+                .unwrap()
+                .items;
+            assert_eq!(tags.len(), 1, "a kept orphan namespace must be untouched");
         })
         .await;
     }
