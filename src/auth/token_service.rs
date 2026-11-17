@@ -130,7 +130,9 @@ impl TokenIssuer {
         }
 
         Ok(Self {
-            encoding: EncodingKey::from_secret(key),
+            encoding: EncodingKey::from_secret(key).map_err(|e| {
+                Error::Initialization(format!("auth.token_service.secret_key is unusable: {e}"))
+            })?,
             ttl_secs: config.ttl_secs,
             configured_challenge: config.realm.as_deref().map(build_challenge).transpose()?,
             auth: auth.clone(),
@@ -224,7 +226,9 @@ impl TokenValidator {
         validation.validate_aud = false;
 
         Ok(Self {
-            decoding: DecodingKey::from_secret(config.signing_key()?),
+            decoding: DecodingKey::from_secret(config.signing_key()?).map_err(|e| {
+                Error::Initialization(format!("auth.token_service.secret_key is unusable: {e}"))
+            })?,
             validation,
             auth: auth.clone(),
         })

@@ -36,14 +36,14 @@ angos-s3-client = { path = "crates/s3-client" }
 angos-secret = { path = "crates/secret" }
 angos-storage = { path = "crates/storage" }
 angos-transport = { path = "crates/transport" }
-arc-swap = "1.9.3"
+arc-swap = "1.9.5"
 argh = "0.1.19"
 async-trait = "0.1.92"
 base64 = "0.23.1"
 bytes = "1.12.1"
 bytesize = "2.7.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 futures-util = { version = "0.3.34", default-features = false }
 hex = "0.4.3"
 hmac = "0.13.0"
@@ -60,14 +60,14 @@ tempfile = "3.27"
 thiserror = "2.0.21"
 tokio = "1.54.1"
 tokio-util = { version = "0.7.20", features = ["io-util"] }
-toml = "1.1.8"
+toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 url = "2.5.8"
-uuid = { version = "1.29.0", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 wiremock = "0.6.5"
-zeroize = { version = "1.9.1", features = ["derive"] }
+zeroize = { version = "1.9.2", features = ["derive"] }
 
 [package]
 name = "angos"
@@ -111,19 +111,19 @@ humantime = "2.4.0"
 http = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
-jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 mime_guess = "2.0.5"
-notify = "8.2.1"
+notify = "8.2.2"
 opentelemetry = "0.33.1"
 opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.33.1", features = ["grpc-tonic"] }
 prometheus = "0.14"
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-rpassword = "7.5.4"
-rust-embed = "8.13.0"
+rpassword = "7.5.5"
+rust-embed = "8.14.0"
 rustls = { workspace = true, features = ["aws-lc-rs", "logging", "std", "tls12"] }
-rustls-pki-types = "1.15.1"
+rustls-pki-types = "1.16.0"
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
