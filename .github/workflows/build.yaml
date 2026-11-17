@@ -784,6 +784,16 @@ jobs:
     needs:
       - build-container
     steps:
+      - uses: actions/checkout@v7
+        if: startsWith(github.ref, 'refs/tags/v')
+
+      - name: Check tag matches Cargo.toml and CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          grep -A1 '^name = "angos"$' Cargo.toml | grep -qx "version = \"$v\"" || { echo "Cargo.toml is not $v"; exit 1; }
+          grep -qx "## $v" CHANGELOG.md || { echo "CHANGELOG.md has no released '## $v' heading"; exit 1; }
+
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
